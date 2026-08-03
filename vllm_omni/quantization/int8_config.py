@@ -287,6 +287,13 @@ class LazyWeightMixin:
                 # anything
                 layer._already_called_process_weights_after_loading = True
 
+                # This layer's weight is final, so nothing needs it on the
+                # accelerator until inference. Callers that will offload the whole
+                # model afterwards set this flag, and returning the layer now caps
+                # the load-time peak at one layer instead of the whole model.
+                if getattr(layer, "_offload_after_quant", False):
+                    layer.to("cpu")
+
                 # Note that we keep `layer._loaded_numel` around just in case
                 # there is logic added to vllm in the future which calls a
                 # weight loader twice - we do not want to re-initialize in

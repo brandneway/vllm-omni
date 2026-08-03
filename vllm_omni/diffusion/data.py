@@ -1456,12 +1456,38 @@ class AttnQuantSpec:
 
 
 @dataclass
+class RainFusionSpec:
+    """User-facing RainFusion (rf_v2) block-sparse controls for the RAINFUSION_ATTN backend.
+
+    ``sparsity`` is the nominal fraction of key blocks dropped per query block;
+    ``start_step`` keeps the first N denoise steps dense and ``skip_layers`` (an
+    index selector such as "0-3,38") exempts individual DiT blocks. Those two are
+    the accuracy knobs to trade back quality at a fixed ``sparsity``.
+    """
+
+    sparsity: float = 0.8
+    start_step: int = 0
+    inner_precise: int = 0
+    skip_layers: str | list[int] | None = None
+    skip_layer_indices: set[int] | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.sparsity = _in_range(self.sparsity, "rainfusion.sparsity", 0.0, 1.0) or 0.0
+        if self.start_step < 0:
+            raise ValueError(f"rainfusion.start_step must be >= 0; got {self.start_step!r}.")
+        if self.inner_precise not in (0, 1):
+            raise ValueError(f"rainfusion.inner_precise must be 0 or 1; got {self.inner_precise!r}.")
+        self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
+
+
+@dataclass
 class AttentionSpec:
     """Specifies a backend and its typed backend-specific config for one attention role."""
 
     backend: str
     skip_softmax: SkipSoftmaxSpec | None = None
     quant: AttnQuantSpec | None = None
+    rainfusion: RainFusionSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -1469,6 +1495,7 @@ class AttentionSpec:
             raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
+        self.rainfusion = self._coerce(self.rainfusion, RainFusionSpec, "rainfusion")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
@@ -1478,6 +1505,15 @@ class AttentionSpec:
             raise ValueError(
                 f"quant is only supported by the TRTLLM_ATTN and FLASHINFER_ATTN backends, but "
                 f"backend={self.backend!r}. Remove quant or set a supported backend."
+            )
+        if self.backend.upper() == "RAINFUSION_ATTN":
+            # Selecting the backend is the opt-in; without an explicit block the
+            # defaults apply rather than silently running dense.
+            self.rainfusion = self.rainfusion or RainFusionSpec()
+        elif self.rainfusion is not None:
+            raise ValueError(
+                f"rainfusion is only supported by the RAINFUSION_ATTN backend, but backend={self.backend!r}. "
+                f"Remove rainfusion or set backend to RAINFUSION_ATTN."
             )
 
     @staticmethod
@@ -1511,6 +1547,13 @@ class AttentionSpec:
             if q.flashinfer_backend is not None:
                 quant_kw["flashinfer_backend"] = q.flashinfer_backend
             kw["quant"] = quant_kw
+        if self.rainfusion is not None:
+            rf = self.rainfusion
+            kw["sparsity"] = rf.sparsity
+            kw["start_step"] = rf.start_step
+            kw["inner_precise"] = rf.inner_precise
+            if rf.skip_layer_indices:
+                kw["skip_layers"] = sorted(rf.skip_layer_indices)
         return kw or None
 
 
@@ -1580,7 +1623,7 @@ class AttentionConfig:
             normalized[role] = node
             return
 
-        spec_keys = {"backend", "skip_softmax", "quant"}
+        spec_keys = {"backend", "skip_softmax", "quant", "rainfusion"}
         node_dict = dict(node)
         node_keys = set(node_dict)
         if node_keys & spec_keys:

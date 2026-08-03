@@ -23,6 +23,7 @@ The full set of backends and their platform defaults is in the **Backend Options
 | `SAGE_ATTN_3` | Requires `sageattn3` from `SageAttention/sageattention3_blackwell`. CUDA only, intended for Blackwell GPUs, with GQA/MQA requests falling back to PyTorch SDPA. |
 | `FLASH_ATTN_HUB` | FlashAttention 2 from HuggingFace `kernels` library. Useful for train/rollout alignment. |
 | `FLASH_ATTN_3_HUB` | FlashAttention 3 from HuggingFace `kernels` library. CUDA Hopper (sm_90+) only; falls back to `FLASH_ATTN_HUB` on older GPUs. |
+| `RAINFUSION_ATTN` | MindIE-SD **RainFusion** block-sparse video attention — see [below](#rainfusion_attn-backend-and-block-sparse-video-attention). Ascend NPU only; requires `mindiesd`. Delegates to `FLASH_ATTN` for anything that is not a packed video sequence. |
 
 
 ## Configuration
@@ -69,8 +70,9 @@ vllm-omni serve <model> \
     --diffusion-attention-config '{"default":{"backend":"FLASH_ATTN"},"per_role":{"cross":{"backend":"TORCH_SDPA"}}}'
 ```
 
-A backend that needs configuration exposes it as a typed field on the spec. Today the only
-one is `TRTLLM_ATTN`'s Skip-Softmax (see [below](#trtllm_attn-backend-and-skip-softmax)):
+A backend that needs configuration exposes it as a typed field on the spec:
+`TRTLLM_ATTN`'s Skip-Softmax (see [below](#trtllm_attn-backend-and-skip-softmax)) and
+`RAINFUSION_ATTN`'s RainFusion block (see [below](#rainfusion_attn-backend-and-block-sparse-video-attention)):
 
 ```bash
 --diffusion-attention-config.default.backend TRTLLM_ATTN \
@@ -204,10 +206,77 @@ AttentionConfig(
 )
 ```
 
-
 **Requirements.** Needs FlashInfer ≥ 0.6.16rc1. Kernel
 availability is arch-dependent: `fp8_e4m3` QK has kernels on both **SM100** (B200) and **SM103**
 (B300); `int8` QK kernels are compiled for **SM100 only**.
+
+## RAINFUSION_ATTN Backend and Block-Sparse Video Attention
+
+`RAINFUSION_ATTN` runs MindIE-SD's RainFusion (`rf_v2`) kernel on Ascend NPU. It pools each
+128-token block of keys, ranks them per query block, and computes attention against only the
+top-scoring ones. Video tokens are rearranged into `(t, h, w)` order first, so the kept blocks are
+spatiotemporal neighbours rather than arbitrary rows of the packed sequence.
+
+Only the video segment is sparsified. The prefix rows (text, visual conditions, audio) and the
+first-frame blocks are always kept dense, which is why the realized sparsity is lower than the
+nominal `sparsity` you configure. Anything the kernel cannot handle — a warmup denoise step, an
+exempt layer, a sequence with no published video geometry, a video segment under 32 blocks —
+delegates to `FLASH_ATTN`, so a model can select this backend unconditionally.
+
+Enable it through the typed `rainfusion` block on the attention spec:
+
+| Key | Valid values | Meaning |
+|---|---|---|
+| `sparsity` | finite, `[0, 1]` | Nominal fraction of key blocks dropped per query block. `0` disables sparsity. Defaults to `0.8`. |
+| `start_step` | `≥ 0` | Keep the first N denoise steps dense. Layout is decided early, so these steps dominate structural fidelity. |
+| `skip_layers` | index selector, e.g. `"0-3,38"` | DiT blocks that always stay dense. |
+| `inner_precise` | `0` or `1` | `0` = high precision, `1` = high performance. On A5 devices `rf_v2` is routed to `rf_v3`, which forces its own value. |
+
+```bash
+vllm-omni serve MiniMaxAI/MiniMax-H3 \
+  --diffusion-attention-config '{"default": {"backend": "RAINFUSION_ATTN",
+      "rainfusion": {"sparsity": 0.8, "start_step": 0}}}'
+```
+
+Programmatically the same block is a typed `RainFusionSpec` (values validated at construction):
+
+```python
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, RainFusionSpec
+
+AttentionConfig(
+    default=AttentionSpec(
+        backend="RAINFUSION_ATTN",
+        rainfusion=RainFusionSpec(sparsity=0.8, start_step=0, skip_layers="0-1"),
+    ),
+)
+```
+
+**Tune in the order `start_step` → `sparsity` → `skip_layers`.** Raise `start_step` first: it is the
+cheapest way to recover structure, because the early high-noise steps decide global layout while the
+later steps only refine texture. Then walk `sparsity` up to your quality bar. Reach for
+`skip_layers` last, once an A/B against dense at the same seed points at specific blocks.
+
+Requires Ascend NPU with `mindiesd`; selecting it on any other platform raises. It is also
+incompatible with ring sequence parallelism, since `rf_v2` needs the whole key sequence to rank
+blocks — use Ulysses SP (`ring_degree=1`).
+
+### Any resolution runs, but multiples of 256 give the best sparse quality
+
+Grids whose video segment is not a multiple of 128 rows would desynchronize `rf_v2`'s block mask
+from the kernel's own tiling. The backend repairs that by prepending zero rows to the prefix and
+slicing them off again afterwards, so no resolution is rejected; `RAINFUSION_ATTN active` logs the
+`prefix_pad` it chose, at most 255 rows.
+
+What the backend cannot repair is block selection itself. `rf_v2` groups video positions into 8x8
+spatial tiles (two tiles fill one 128-row block), which is what makes a selected block a compact
+patch of the frame. When the latent `h` or `w` is not a multiple of 8, the leftover rows or columns
+are peeled off and appended as a flat run instead of being tiled, so they get pooled with spatially
+distant positions and selection can no longer rank them meaningfully. This is silent, and invisible
+to a `sparsity=0` check, because a fully populated mask does not care how blocks are grouped.
+
+Since the latent grid is `(latent_t, height/32, width/32)`, "multiple of 8" means **width and
+height that are multiples of 256**. Off-grid resolutions still run and still speed up; they just
+lose more fidelity at the same `sparsity`, which you can buy back with `start_step`.
 
 ## End-to-End Benchmark (BF16, sm_120 RTX Pro 6000 Blackwell)
 
