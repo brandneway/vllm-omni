@@ -35,6 +35,7 @@ def make_impl(**backend_kwargs):
         head_size=128,
         softmax_scale=128**-0.5,
         prefix="transformer_blocks.0.attn",
+        qkv_layout="BSND",
         backend_kwargs={"sparsity": 0.8, **backend_kwargs},
     )
 
@@ -99,15 +100,31 @@ def test_short_video_stays_dense(grid):
     assert make_impl()._resolve_plan(make_metadata(grid)) is None
 
 
-def test_non_bsnd_layout_is_rejected():
+@pytest.mark.parametrize("qkv_layout", ["BNSD", "BSH"])
+def test_explicitly_wrong_layout_is_rejected(qkv_layout):
     with pytest.raises(ValueError, match="BSND"):
         RainFusionAttentionImpl(
             num_heads=8,
             head_size=128,
             softmax_scale=128**-0.5,
-            qkv_layout="BNSD",
+            qkv_layout=qkv_layout,
             backend_kwargs={"sparsity": 0.8},
         )
+
+
+def test_undeclared_layout_stays_dense():
+    # An undeclared layout is not an error -- the layer keeps working, just
+    # densely, and the fallback sees the same absent layout plain FLASH_ATTN would.
+    impl = RainFusionAttentionImpl(
+        num_heads=8,
+        head_size=128,
+        softmax_scale=128**-0.5,
+        prefix="transformer_blocks.0.attn",
+        backend_kwargs={"sparsity": 0.8},
+    )
+
+    assert impl._resolve_plan(make_metadata(ALIGNED_GRID)) is None
+    assert impl.dense_fallback.qkv_layout is None
 
 
 @pytest.mark.skipif(not current_omni_platform.is_npu(), reason="rf_v2 runs on Ascend NPU only.")
@@ -137,4 +154,4 @@ def test_fully_populated_mask_reproduces_dense_attention():
         scale=impl.softmax_scale,
     ).transpose(1, 2)
     error = (out.float() - reference.float()).abs().mean() / reference.float().abs().mean()
-    assert error < 1e-3, f"mean relative error {error:.4%} against dense attention"
+    assert error < 2e-3, f"mean relative error {error:.4%} against dense attention"

@@ -172,6 +172,17 @@ class TestNPUQuantMatmulShapeFallback:
     same layer can therefore be quantized at a higher TP degree.
     """
 
+    @pytest.fixture(autouse=True)
+    def _mock_tp(self, mocker):
+        # The fallback delegates to UnquantizedLinearMethod, which reads the TP
+        # group; stand one in so the shape gating can be tested without a
+        # distributed init.
+        mock_group = mocker.Mock()
+        mock_group.rank_in_group = 0
+        mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=1)
+        mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_rank", return_value=0)
+        mocker.patch("vllm.distributed.parallel_state.get_tp_group", return_value=mock_group)
+
     @pytest.fixture
     def quant_config(self):
         from vllm_omni.quantization.int8_config import DiffusionInt8Config

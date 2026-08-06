@@ -126,10 +126,11 @@ class RainFusionAttentionImpl(AttentionImpl):
 
     Sparsity applies only to the video segment of a packed multimodal sequence,
     whose extent the model publishes as ``AttentionMetadata.video_layout``. Every
-    other case — warmup denoise steps, exempt layers, sequences without a
-    published video segment, video segments too short to pay for block selection
-    or not aligned to the kernel's block size — delegates to FlashAttention, so a
-    model can select this backend unconditionally.
+    other case — warmup denoise steps, exempt layers, a layer that does not declare
+    ``qkv_layout="BSND"``, sequences without a published video segment, video
+    segments too short to pay for block selection or not aligned to the kernel's
+    block size — delegates to FlashAttention, so a model can select this backend
+    unconditionally.
     """
 
     def __init__(
@@ -160,8 +161,7 @@ class RainFusionAttentionImpl(AttentionImpl):
                     "blocks by pooled relevance and cannot express a causal mask. Select "
                     "FLASH_ATTN for causal roles."
                 )
-            layout = (qkv_layout or _INPUT_LAYOUT).upper()
-            if layout != _INPUT_LAYOUT:
+            if qkv_layout is not None and qkv_layout.upper() != _INPUT_LAYOUT:
                 raise ValueError(
                     f"RAINFUSION_ATTN needs {_INPUT_LAYOUT} tensors to locate the video segment along "
                     f"the sequence axis, but this layer declares qkv_layout={qkv_layout!r}. Select "
@@ -234,6 +234,19 @@ class RainFusionAttentionImpl(AttentionImpl):
             step_idx = get_forward_context().denoise_step_idx
             if step_idx is not None and step_idx < rf.start_step:
                 return None
+        if self.qkv_layout is None:
+            # The sparse path reads the sequence off dim 1, which the tensors alone
+            # do not establish, and the dense fallback resolves an absent layout its
+            # own way. Sparsifying on an assumption would put the two paths on
+            # different axes, so an undeclared layout stays dense.
+            logger.warning_once(
+                "RAINFUSION_ATTN staying dense: this layer does not declare qkv_layout, and rf_v2 "
+                "needs %s to locate the video segment along the sequence axis. Set qkv_layout=%r on "
+                "the Attention layer to enable sparsity.",
+                _INPUT_LAYOUT,
+                _INPUT_LAYOUT,
+            )
+            return None
 
         if attn_metadata is None:
             return None
