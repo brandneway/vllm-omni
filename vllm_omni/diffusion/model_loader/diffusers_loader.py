@@ -395,10 +395,11 @@ class DiffusersPipelineLoader:
                     logger.debug("Loading weights on %s ...", load_device)
                     if offload_after_quant:
                         marked = self._request_offload_after_quant(model)
-                        logger.info(
-                            "Online quantization will return each of %d layers to CPU as it is quantized",
-                            marked,
-                        )
+                        if marked:
+                            logger.info(
+                                "Online quantization will return each of %d layers to CPU as it is quantized",
+                                marked,
+                            )
                     if load_format == "diffusers":
                         cast(DiffusersAdapterPipeline, model).load_weights()
                     else:
@@ -423,14 +424,15 @@ class DiffusersPipelineLoader:
         beside a resident TP-sharded text encoder — even though layer-wise
         offload means none of it is supposed to be resident at inference time.
 
-        Only layers whose quant method materializes weights lazily can do this,
-        since they are the ones that know when a layer is finished.
+        Only quant methods that advertise ``supports_offload_after_quant`` are
+        asked, since the implementation has to know when a layer is finished.
+        Deferring materialization to the ``meta`` device does not imply that.
         """
         marked = 0
         for module in model.modules():
             quant_method = getattr(module, "quant_method", None)
-            if getattr(quant_method, "uses_meta_device", False):
-                module._offload_after_quant = True
+            if getattr(quant_method, "supports_offload_after_quant", False):
+                quant_method.enable_offload_after_quant()
                 marked += 1
         return marked
 

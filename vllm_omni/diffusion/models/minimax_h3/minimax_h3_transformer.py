@@ -26,7 +26,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
@@ -82,12 +82,6 @@ _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
 
-# Ascend's quantized matmul (QuantBatchMatmulV3) refuses a weight whose last
-# dimension exceeds this, and it fails at the first denoise step rather than at
-# load time. The per-block AdaLN projection is the only layer here wide enough
-# to trip it.
-_NPU_QUANT_MATMUL_MAX_OUT_FEATURES = 65535
-
 MINIMAX_H3_FP32_PARAM_NAMES = frozenset(
     {
         "video_patch_proj.weight",
@@ -138,7 +132,7 @@ _FORWARD_SUPPORTED_KWARGS = frozenset(
         "img_pos_for_infer_output_info",
         "packed_seq_params",
         "refiner_packed_seq_params",
-        "sparse_attn_params",
+        "video_token_layout",
     }
 )
 
@@ -256,6 +250,8 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         self,
         arch: MiniMaxH3DiTArchConfig,
         quant_config: QuantizationConfig | None,
+        *,
+        prefix: str = "time_embedder",
     ) -> None:
         super().__init__()
         self.frequency_embedding_size = arch.timestep_input_dim
@@ -268,6 +264,7 @@ class MiniMaxH3TimeEmbedder(nn.Module):
             gather_output=True,
             params_dtype=_FP32_DTYPE,
             quant_config=None,
+            prefix=f"{prefix}.proj_in",
         )
         self.proj_out = RowParallelLinear(
             arch.time_embed_hidden_size,
@@ -276,6 +273,7 @@ class MiniMaxH3TimeEmbedder(nn.Module):
             input_is_parallel=False,
             params_dtype=_FP32_DTYPE,
             quant_config=None,
+            prefix=f"{prefix}.proj_out",
         )
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
@@ -348,6 +346,7 @@ class MiniMaxH3Attention(nn.Module):
             bias=False,
             params_dtype=_BF16_DTYPE,
             quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
             return_bias=True,
         )
         self.num_heads = self.qkv_proj.num_heads
@@ -362,6 +361,7 @@ class MiniMaxH3Attention(nn.Module):
             input_is_parallel=True,
             params_dtype=_BF16_DTYPE,
             quant_config=quant_config,
+            prefix=f"{prefix}.out_proj",
         )
         self.attention = Attention(
             num_heads=self.num_heads,
@@ -369,6 +369,8 @@ class MiniMaxH3Attention(nn.Module):
             head_size=self.head_dim,
             softmax_scale=self.softmax_scale,
             causal=False,
+            # Packed rows reach the impl as [B, S, N, D].
+            qkv_layout="BSND",
             skip_sequence_parallel=skip_sequence_parallel,
             role="self",
             prefix=prefix,
@@ -401,7 +403,7 @@ class MiniMaxH3Attention(nn.Module):
         *,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
-        sparse_params: dict[str, Any] | None = None,
+        video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -415,16 +417,16 @@ class MiniMaxH3Attention(nn.Module):
         attn_mask = None
         if used < packed_total:
             attn_mask = torch.arange(packed_total, device=q.device)[None] < used
-        extra: dict[str, Any] = {
-            "cu_seqlens_q": cu_seqlens,
-            "cu_seqlens_k": cu_seqlens,
-            "max_seqlen_q": max_seqlen,
-            "max_seqlen_k": max_seqlen,
-        }
-        if sparse_params is not None:
-            extra["rainfusion_prefix_len"] = sparse_params["video_row_start"]
-            extra["rainfusion_latent_grid"] = sparse_params["latent_grid"]
-        metadata = AttentionMetadata(attn_mask=attn_mask, extra=extra)
+        metadata = AttentionMetadata(
+            attn_mask=attn_mask,
+            extra={
+                "cu_seqlens_q": cu_seqlens,
+                "cu_seqlens_k": cu_seqlens,
+                "max_seqlen_q": max_seqlen,
+                "max_seqlen_k": max_seqlen,
+            },
+            video_layout=video_layout,
+        )
         return self.attention(
             q.unsqueeze(0),
             k.unsqueeze(0),
@@ -440,7 +442,7 @@ class MiniMaxH3Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         sp_seq_lens: list[int] | None = None,
-        sparse_params: dict[str, Any] | None = None,
+        video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -476,7 +478,7 @@ class MiniMaxH3Attention(nn.Module):
             v,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
-            sparse_params=sparse_params,
+            video_layout=video_layout,
         )
         out = out.reshape(total, self.num_heads * self.head_dim)
         out, _ = self.out_proj(out)
@@ -488,6 +490,8 @@ class MiniMaxH3MLP(nn.Module):
         self,
         arch: MiniMaxH3DiTArchConfig,
         quant_config: QuantizationConfig | None,
+        *,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.fc1 = MergedColumnParallelLinear(
@@ -497,6 +501,7 @@ class MiniMaxH3MLP(nn.Module):
             gather_output=False,
             params_dtype=_BF16_DTYPE,
             quant_config=quant_config,
+            prefix=f"{prefix}.fc1",
         )
         self._install_fc1_weight_loader()
         # Chunk the fused fc1 output as [gate, up], then compute
@@ -508,6 +513,7 @@ class MiniMaxH3MLP(nn.Module):
             input_is_parallel=True,
             params_dtype=_BF16_DTYPE,
             quant_config=quant_config,
+            prefix=f"{prefix}.fc2",
         )
 
     def _install_fc1_weight_loader(self) -> None:
@@ -550,6 +556,7 @@ class MiniMaxH3AdalnProj(nn.Module):
         *,
         expand_ratio: int,
         modality_num: int,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if out_features != expand_ratio * arch.hidden_size * modality_num:
@@ -559,16 +566,6 @@ class MiniMaxH3AdalnProj(nn.Module):
         self.expand_ratio = expand_ratio
         self.modality_num = modality_num
         self.hidden_size = arch.hidden_size
-        if quant_config is not None and out_features > _NPU_QUANT_MATMUL_MAX_OUT_FEATURES:
-            # Barely any FLOPs are lost — this runs on a handful of timestep rows
-            # rather than the token sequence — but it is 43% of the DiT's linear
-            # weights, so the memory saving from quantization is roughly halved.
-            logger.warning_once(
-                "AdaLN projection is %d wide, past the %d limit of the quantized matmul; keeping it unquantized",
-                out_features,
-                _NPU_QUANT_MATMUL_MAX_OUT_FEATURES,
-            )
-            quant_config = None
         self.linear = ColumnParallelLinear(
             arch.time_embed_dim,
             out_features,
@@ -576,6 +573,7 @@ class MiniMaxH3AdalnProj(nn.Module):
             gather_output=True,
             params_dtype=_BF16_DTYPE,
             quant_config=quant_config,
+            prefix=f"{prefix}.linear",
         )
 
     def forward(self, t_emb: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -599,6 +597,8 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         self,
         arch: MiniMaxH3DiTArchConfig,
         quant_config: QuantizationConfig | None,
+        *,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
@@ -610,8 +610,9 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             arch,
             quant_config,
             skip_sequence_parallel=True,
+            prefix=f"{prefix}.attn",
         )
-        self.mlp = MiniMaxH3MLP(arch, quant_config)
+        self.mlp = MiniMaxH3MLP(arch, quant_config, prefix=f"{prefix}.mlp")
 
     def forward(
         self,
@@ -635,10 +636,15 @@ class MiniMaxH3TokenRefiner(nn.Module):
         self,
         arch: MiniMaxH3DiTArchConfig,
         quant_config: QuantizationConfig | None,
+        *,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.blocks = nn.ModuleList(
-            [MiniMaxH3TokenRefinerBlock(arch, quant_config) for _ in range(arch.token_refiner_num_layers)]
+            [
+                MiniMaxH3TokenRefinerBlock(arch, quant_config, prefix=f"{prefix}.blocks.{i}")
+                for i in range(arch.token_refiner_num_layers)
+            ]
         )
         self.final_norm = _norm(arch.hidden_size, eps=arch.final_norm_eps)
 
@@ -660,20 +666,22 @@ class MiniMaxH3DiTBlock(nn.Module):
         arch: MiniMaxH3DiTArchConfig,
         quant_config: QuantizationConfig | None,
         *,
-        layer_idx: int,
+        prefix: str,
     ) -> None:
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
-        # The prefix is how RAINFUSION_ATTN recovers the block index for skip_layers.
-        self.attn = MiniMaxH3Attention(arch, quant_config, prefix=f"blocks.{layer_idx}.attn")
-        self.mlp = MiniMaxH3MLP(arch, quant_config)
+        # The prefix also carries the block index that block-sparse attention
+        # backends match against their skip_layers selector.
+        self.attn = MiniMaxH3Attention(arch, quant_config, prefix=f"{prefix}.attn")
+        self.mlp = MiniMaxH3MLP(arch, quant_config, prefix=f"{prefix}.mlp")
         self.adaln_proj = MiniMaxH3AdalnProj(
             arch,
             arch.adaln_out_features,
             quant_config,
             expand_ratio=6,
             modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
+            prefix=f"{prefix}.adaln_proj",
         )
 
     def forward(
@@ -686,7 +694,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         sp_seq_lens: list[int] | None = None,
-        sparse_params: dict[str, Any] | None = None,
+        video_layout: VideoTokenLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -713,7 +721,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             sp_seq_lens=sp_seq_lens,
-            sparse_params=sparse_params,
+            video_layout=video_layout,
         )
         x = _modulate_gate(residual, gate_msa, h, combined_indices, dtype=_BF16_DTYPE)
 
@@ -729,6 +737,8 @@ class MiniMaxH3FinalLayer(nn.Module):
         self,
         arch: MiniMaxH3DiTArchConfig,
         quant_config: QuantizationConfig | None,
+        *,
+        prefix: str = "final_layer",
     ) -> None:
         super().__init__()
         video_patch_dim = arch.latents_dim * arch.patch_size[0] * arch.patch_size[1] * arch.patch_size[2]
@@ -739,6 +749,7 @@ class MiniMaxH3FinalLayer(nn.Module):
             quant_config,
             expand_ratio=2,
             modality_num=1,
+            prefix=f"{prefix}.adaln_proj",
         )
         # Unpatchify heads are kept full precision (quant_config=None) — FP32 by
         # checkpoint contract, and the dynamic-quant kernels take FP16/BF16 only.
@@ -749,6 +760,7 @@ class MiniMaxH3FinalLayer(nn.Module):
             gather_output=True,
             params_dtype=_FP32_DTYPE,
             quant_config=None,
+            prefix=f"{prefix}.video_out",
         )
         self.audio_out = ColumnParallelLinear(
             arch.hidden_size,
@@ -757,6 +769,7 @@ class MiniMaxH3FinalLayer(nn.Module):
             gather_output=True,
             params_dtype=_FP32_DTYPE,
             quant_config=None,
+            prefix=f"{prefix}.audio_out",
         )
 
     def forward(
@@ -843,6 +856,10 @@ class MiniMaxH3DiTModel(nn.Module):
         },
         "sp_gather": SequenceParallelOutput(gather_dim=0, expected_dims=2),
     }
+    # The checkpoint already stores qkv and the MLP gate/up as single tensors
+    # (see the weight loaders on MiniMaxH3Attention and MiniMaxH3MLP), so there
+    # are no unfused names for quantization or LoRA to map onto. Address the
+    # fused layers directly, e.g. ignored_layers=["blocks.0.attn.qkv_proj"].
     packed_modules_mapping = {}
 
     def _validate_tp_config(self, *, arch: MiniMaxH3DiTArchConfig, tp_size: int) -> None:
@@ -905,6 +922,7 @@ class MiniMaxH3DiTModel(nn.Module):
             gather_output=True,
             params_dtype=_FP32_DTYPE,
             quant_config=None,
+            prefix="video_patch_proj",
         )
         self.audio_patch_proj = ColumnParallelLinear(
             arch.audio_latents_dim,
@@ -913,6 +931,7 @@ class MiniMaxH3DiTModel(nn.Module):
             gather_output=True,
             params_dtype=_FP32_DTYPE,
             quant_config=None,
+            prefix="audio_patch_proj",
         )
         self.condition_proj = ColumnParallelLinear(
             arch.text_dim,
@@ -921,16 +940,17 @@ class MiniMaxH3DiTModel(nn.Module):
             gather_output=True,
             params_dtype=_BF16_DTYPE,
             quant_config=quant_config,
+            prefix="condition_proj",
         )
-        self.time_embedder = MiniMaxH3TimeEmbedder(arch, quant_config)
+        self.time_embedder = MiniMaxH3TimeEmbedder(arch, quant_config, prefix="time_embedder")
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
-        self.token_refiner = MiniMaxH3TokenRefiner(arch, quant_config)
+        self.token_refiner = MiniMaxH3TokenRefiner(arch, quant_config, prefix="token_refiner")
         self.blocks = nn.ModuleList(
-            [MiniMaxH3DiTBlock(arch, quant_config, layer_idx=i) for i in range(arch.num_layers)]
+            [MiniMaxH3DiTBlock(arch, quant_config, prefix=f"blocks.{i}") for i in range(arch.num_layers)]
         )
         self.sp_prepare = MiniMaxH3SPPrepare()
         self.sp_gather = MiniMaxH3SPGather()
-        self.final_layer = MiniMaxH3FinalLayer(arch, quant_config)
+        self.final_layer = MiniMaxH3FinalLayer(arch, quant_config, prefix="final_layer")
         self._mark_missing_params_required()
 
     def _mark_missing_params_required(self) -> None:
@@ -1070,7 +1090,7 @@ class MiniMaxH3DiTModel(nn.Module):
         refiner_psp = _required_kwarg(kwargs, "refiner_packed_seq_params")
         refiner_cu = self._psp_field(refiner_psp, "refiner_packed_seq_params", "cu_seqlens_q").to(torch.int32)
         refiner_max = int(self._psp_field(refiner_psp, "refiner_packed_seq_params", "max_seqlen_q"))
-        sparse_params = kwargs.get("sparse_attn_params")
+        video_layout = kwargs.get("video_token_layout")
 
         if x.dim() != 3 or x.shape[0] != 1:
             raise ValueError(f"x must be [1, S, C], got {list(x.shape)}")
@@ -1118,7 +1138,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 rope_freqs=block_rope,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
-                sparse_params=sparse_params,
+                video_layout=video_layout,
             )
         hidden = self.sp_gather(hidden)
 

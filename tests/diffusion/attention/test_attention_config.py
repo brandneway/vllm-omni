@@ -90,35 +90,34 @@ class TestAttentionSpec:
         with pytest.raises(ValueError, match=match):
             AttentionSpec(**spec)
 
-    def test_rainfusion_defaults_applied_when_backend_selected(self):
+    def test_block_sparse_defaults_applied_when_backend_selected(self):
         spec = AttentionSpec(backend="RAINFUSION_ATTN")
-        assert spec.rainfusion.sparsity == 0.8
-        assert spec.backend_kwargs() == {"sparsity": 0.8, "start_step": 0, "inner_precise": 0}
+        assert spec.block_sparse.sparsity == 0.8
+        assert spec.backend_kwargs() == {"sparsity": 0.8, "start_step": 0}
 
-    def test_rainfusion_skip_layers_selector_expanded(self):
+    def test_block_sparse_skip_layers_selector_expanded(self):
         spec = AttentionSpec(
             backend="RAINFUSION_ATTN",
-            rainfusion={"sparsity": 0.9, "start_step": 12, "skip_layers": "0-2,38"},
+            block_sparse={"sparsity": 0.9, "start_step": 12, "skip_layers": "0-2,38"},
         )
-        assert spec.rainfusion.skip_layer_indices == {0, 1, 2, 38}
+        assert spec.block_sparse.skip_layer_indices == {0, 1, 2, 38}
         assert spec.backend_kwargs() == {
             "sparsity": 0.9,
             "start_step": 12,
-            "inner_precise": 0,
             "skip_layers": [0, 1, 2, 38],
         }
 
-    def test_rainfusion_rejected_on_non_rainfusion_backend(self):
-        with pytest.raises(ValueError, match="only supported by the RAINFUSION_ATTN"):
-            AttentionSpec(backend="FLASH_ATTN", rainfusion={"sparsity": 0.8})
+    def test_block_sparse_rejected_on_dense_backend(self):
+        with pytest.raises(ValueError, match="block_sparse is only supported by"):
+            AttentionSpec(backend="FLASH_ATTN", block_sparse={"sparsity": 0.8})
 
     @pytest.mark.parametrize(
-        "rainfusion",
-        [{"sparsity": 1.5}, {"start_step": -1}, {"inner_precise": 2}],
+        "block_sparse",
+        [{"sparsity": 1.5}, {"start_step": -1}],
     )
-    def test_rainfusion_invalid_values(self, rainfusion):
+    def test_block_sparse_invalid_values(self, block_sparse):
         with pytest.raises(ValueError):
-            AttentionSpec(backend="RAINFUSION_ATTN", rainfusion=rainfusion)
+            AttentionSpec(backend="RAINFUSION_ATTN", block_sparse=block_sparse)
 
 
 class TestAttentionConfig:

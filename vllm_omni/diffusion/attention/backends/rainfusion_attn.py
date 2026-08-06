@@ -29,71 +29,26 @@ _BLOCK_SIZE = 128
 # cost more than the QK work it removes, so stay dense.
 _MIN_VIDEO_BLOCKS = 32
 
-# vLLM-Omni diffusion attention always hands the impl [B, S, N, D].
+# rf_v2's ``input_layout`` describes the caller's tensors, and everything below
+# slices the sequence on dim 1. vLLM-Omni diffusion attention hands the impl
+# [B, S, N, D], so that is the only layout this backend accepts.
 _INPUT_LAYOUT = "BSND"
 
-# Packed video geometry the model must publish in AttentionMetadata.extra. These
-# are plain ints so resolving a plan never forces a device-to-host sync.
-#   "rainfusion_prefix_len": rows before the video segment (text + cond + audio),
-#     which rf_v2 keeps dense.
-#   "rainfusion_latent_grid": (t, h, w) of the video segment, used to restore
-#     spatiotemporal locality before block selection.
-#   "max_seqlen_q": length of packed document 0.
-#
-# Publishing these keys asserts that the sequence is laid out as
-# [prefix | t*h*w video rows | right padding] and that any attn_mask only masks
-# that trailing padding, which this backend reproduces by slicing to
-# prefix_len + t*h*w. A model with a richer mask must not publish them.
-_REQUIRED_EXTRA = ("max_seqlen_q", "rainfusion_prefix_len", "rainfusion_latent_grid")
+# rf_v2 precision mode: 0 = high precision, 1 = high performance. Kept at the
+# precise setting because the sparsity knob is the intended perf lever, and on
+# A5 devices the kernel is routed to rf_v3, which overrides this anyway.
+_INNER_PRECISE = 0
 
 _WRONG_PLATFORM = (
     "RAINFUSION_ATTN runs the MindIE-SD rf_v2 kernel and is available on Ascend NPU only. "
     "Select FLASH_ATTN or TORCH_SDPA on this platform."
 )
 
-
-def _prefix_pad_rows(video_len: int, prefix_len: int) -> int:
-    """Rows to prepend so rf_v2 treats a whole video segment plus a whole prefix.
-
-    rf_v2 reorders the sequence to [video | prefix] and lets the kernel tile it
-    into ceil((video + prefix) / 128) blocks, but it builds the mask from the
-    two segments pooled apart, i.e. ceil(video / 128) + ceil(prefix / 128).
-    Write video = 128a + r and prefix = 128b + s. Two things go wrong once
-    r != 0, and padding the prefix has to answer both:
-
-    1. The counts disagree when s is also nonzero and r + s <= 128. The surplus
-       block is a prefix column, which is force-selected for every query, so it
-       indexes past the end of the sequence and corrupts every row.
-    2. Kernel block a straddles the seam: it holds the r leftover video rows
-       *and* the 128 - r rows that follow them. Pooling assigns that block to
-       the video, so block selection may drop it -- while every block pooled as
-       prefix is forced on. Any real prefix row landing there loses the dense
-       treatment the prefix is supposed to get, and it is the *front* of the
-       prefix that lands there, which for MiniMax-H3 is the text embedding.
-
-    Padding at least 128 - r rows fills the seam block with pad instead, so the
-    only rows that can be dropped are zeros. The loop then walks up to the first
-    pad that also satisfies (1). Both conditions together cost under 255 rows.
-
-    Padding the video instead would fix the grouping outright, but latent_shape
-    must satisfy t*h*w == video length, so the pad would have to be a whole
-    frame or column plane -- thousands of rows, and measurably worse, because
-    padded keys cannot be masked off and so take a share of the softmax mass
-    (see _forward_sparse_npu).
-    """
-    video_rem = video_len % _BLOCK_SIZE
-    if video_rem == 0:
-        # The video already ends on a block boundary, so the pooled blocks and
-        # the kernel's tiles are the same rows and the prefix starts a tile.
-        return 0
-    min_pad = _BLOCK_SIZE - video_rem
-    for pad in range(min_pad, min_pad + _BLOCK_SIZE):
-        prefix_rem = (prefix_len + pad) % _BLOCK_SIZE
-        if prefix_rem == 0 or video_rem + prefix_rem > _BLOCK_SIZE:
-            return pad
-    raise AssertionError(  # unreachable: pad sweeps every residue mod 128
-        f"no prefix pad reconciles video_len={video_len} prefix_len={prefix_len}"
-    )
+_MISSING_MINDIESD = (
+    "RAINFUSION_ATTN requires MindIE-SD. Please install MindIE-SD to enable RainFusion sparse "
+    "attention on Ascend NPU. For installation details, see https://gitcode.com/Ascend/MindIE-SD "
+    "Otherwise, use FlashAttention by setting DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN"
+)
 
 
 def _try_extract_layer_index(prefix: str) -> int | None:
@@ -117,7 +72,6 @@ class RainFusionConfig:
 
     sparsity: float = 0.0
     start_step: int = 0
-    inner_precise: int = 0
     skip_layers: frozenset[int] = frozenset()
 
     @classmethod
@@ -126,7 +80,6 @@ class RainFusionConfig:
         return cls(
             sparsity=float(bk.get("sparsity", 0.0)),
             start_step=int(bk.get("start_step", 0)),
-            inner_precise=int(bk.get("inner_precise", 0)),
             skip_layers=frozenset(bk.get("skip_layers") or ()),
         )
 
@@ -142,11 +95,18 @@ class RainFusionPlan:
     prefix_len: int
     used_len: int
     latent_shape: list[int]
-    prefix_pad: int = 0
 
 
 class RainFusionAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supported_platforms: tuple[str, ...] = ("npu",)
+
+    @classmethod
+    def validate_available(cls) -> None:
+        from importlib.util import find_spec
+
+        if find_spec("mindiesd") is None:
+            raise ValueError(_MISSING_MINDIESD)
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
@@ -164,15 +124,12 @@ class RainFusionAttentionBackend(AttentionBackend):
 class RainFusionAttentionImpl(AttentionImpl):
     """Block-sparse video attention via MindIE-SD RainFusion (rf_v2) on Ascend NPU.
 
-    Sparsity applies only to the video segment of a packed multimodal sequence.
-    Every other case — warmup denoise steps, exempt layers, sequences without
-    published video geometry, video segments too short to pay for block
-    selection — delegates to FlashAttention, so a model can select this backend
-    unconditionally.
-
-    Resolution is unconstrained. Geometries that would desynchronize rf_v2's
-    block mask from the kernel's tiling are brought back into step by padding
-    the prefix; see ``_prefix_pad_rows``.
+    Sparsity applies only to the video segment of a packed multimodal sequence,
+    whose extent the model publishes as ``AttentionMetadata.video_layout``. Every
+    other case — warmup denoise steps, exempt layers, sequences without a
+    published video segment, video segments too short to pay for block selection
+    or not aligned to the kernel's block size — delegates to FlashAttention, so a
+    model can select this backend unconditionally.
     """
 
     def __init__(
@@ -202,6 +159,13 @@ class RainFusionAttentionImpl(AttentionImpl):
                     "RAINFUSION_ATTN does not support causal attention: rf_v2 selects key "
                     "blocks by pooled relevance and cannot express a causal mask. Select "
                     "FLASH_ATTN for causal roles."
+                )
+            layout = (qkv_layout or _INPUT_LAYOUT).upper()
+            if layout != _INPUT_LAYOUT:
+                raise ValueError(
+                    f"RAINFUSION_ATTN needs {_INPUT_LAYOUT} tensors to locate the video segment along "
+                    f"the sequence axis, but this layer declares qkv_layout={qkv_layout!r}. Select "
+                    "FLASH_ATTN for this role."
                 )
 
         self.dense_fallback = FlashAttentionBackend.get_impl_cls()(
@@ -274,32 +238,36 @@ class RainFusionAttentionImpl(AttentionImpl):
         if attn_metadata is None:
             return None
 
-        extra = attn_metadata.extra
-        missing = [key for key in _REQUIRED_EXTRA if key not in extra]
-        if missing:
+        layout = attn_metadata.video_layout
+        if layout is None:
             logger.warning_once(
-                "RAINFUSION_ATTN staying dense: attention metadata is missing %s. The model must "
-                "publish the packed video geometry (see _REQUIRED_EXTRA in rainfusion_attn.py).",
-                # warning_once memoizes on the args, so they must be hashable.
-                ", ".join(missing),
+                "RAINFUSION_ATTN staying dense: this attention role carries no video segment. The "
+                "model must publish AttentionMetadata.video_layout for the sequence to be sparsified."
+            )
+            return None
+        max_seqlen_q = attn_metadata.extra.get("max_seqlen_q")
+        if max_seqlen_q is None:
+            logger.warning_once(
+                "RAINFUSION_ATTN staying dense: attention metadata is missing max_seqlen_q, so the "
+                "video segment cannot be confirmed to be the tail of packed document 0."
             )
             return None
 
-        prefix_len = int(extra["rainfusion_prefix_len"])
-        latent_shape = [int(dim) for dim in extra["rainfusion_latent_grid"]]
+        prefix_len = int(layout.prefix_len)
+        latent_shape = [int(dim) for dim in layout.latent_grid]
         # rf_v2 splits the sequence as [prefix | t*h*w video rows]. Document 0 of
         # the packed sequence holds those rows; anything past it is alignment
         # padding that rf_v2 must not see.
         video_len = math.prod(latent_shape)
         used_len = prefix_len + video_len
 
-        if used_len != int(extra["max_seqlen_q"]):
+        if used_len != int(max_seqlen_q):
             logger.warning_once(
                 "RAINFUSION_ATTN staying dense: prefix (%d) plus latent grid %s does not fill "
                 "packed document 0 (%d rows). rf_v2 requires the video segment to be its tail.",
                 prefix_len,
                 tuple(latent_shape),
-                int(extra["max_seqlen_q"]),
+                int(max_seqlen_q),
             )
             return None
         if video_len < _MIN_VIDEO_BLOCKS * _BLOCK_SIZE:
@@ -311,25 +279,40 @@ class RainFusionAttentionImpl(AttentionImpl):
                 _MIN_VIDEO_BLOCKS,
             )
             return None
+        if video_len % _BLOCK_SIZE != 0:
+            # rf_v2 tiles the sequence into ceil((video + prefix) / 128) blocks but
+            # builds its block mask from the two segments pooled apart. The counts
+            # only agree when the video segment ends on a block boundary; otherwise
+            # a prefix block is forced on out of range, and the block straddling the
+            # seam holds real prefix rows that selection may drop. Padding the
+            # sequence to realign it is not an option because rf_v2 ignores
+            # attn_mask, so pad keys would take a share of every softmax denominator.
+            logger.warning_once(
+                "RAINFUSION_ATTN staying dense: latent grid %s gives %d video rows, which is not a "
+                "multiple of the %d-row kernel block. Choose a geometry whose latent_t * h * w is a "
+                "multiple of %d to enable sparsity.",
+                tuple(latent_shape),
+                video_len,
+                _BLOCK_SIZE,
+                _BLOCK_SIZE,
+            )
+            return None
 
-        prefix_pad = _prefix_pad_rows(video_len, prefix_len)
         logger.info_once(
             "RAINFUSION_ATTN active: sparsity=%.2f, start_step=%d, exempt_layers=%d, "
-            "latent_grid=%s, prefix_rows=%d, video_rows=%d, prefix_pad=%d. Realized sparsity is "
-            "lower than nominal because prefix and first-frame blocks are always kept.",
+            "latent_grid=%s, prefix_rows=%d, video_rows=%d. Realized sparsity is lower than nominal "
+            "because prefix and first-frame blocks are always kept.",
             rf.sparsity,
             rf.start_step,
             len(rf.skip_layers),
             tuple(latent_shape),
             prefix_len,
             video_len,
-            prefix_pad,
         )
         return RainFusionPlan(
             prefix_len=prefix_len,
             used_len=used_len,
             latent_shape=latent_shape,
-            prefix_pad=prefix_pad,
         )
 
     def _forward_sparse_npu(
@@ -342,29 +325,10 @@ class RainFusionAttentionImpl(AttentionImpl):
         try:
             from mindiesd import sparse_attention
         except ImportError:
-            raise ImportError(
-                "RAINFUSION_ATTN requires MindIE-SD. Please install MindIE-SD to enable "
-                "RainFusion sparse attention on Ascend NPU. For installation details, see "
-                "https://gitcode.com/Ascend/MindIE-SD "
-                "Otherwise, use FlashAttention by setting DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN"
-            )
+            raise ImportError(_MISSING_MINDIESD)
 
         used = plan.used_len
-        pad = plan.prefix_pad
         q, k, v = (tensor[:, :used] for tensor in (query, key, value))
-        if pad:
-            # The pad goes in front of the prefix so the video rows stay
-            # contiguous and keep their (t, h, w) order. rf_v2 ignores attn_mask
-            # and reads actual_seq_lengths off the tensor, so these rows are
-            # attended: zeroing the values keeps them out of the numerator, and
-            # at a couple hundred rows against tens of thousands the share of
-            # the softmax denominator they take stays negligible. Measured on
-            # Ascend 910 at sparsity=0, where the mask is fully populated and
-            # the kernel must reproduce dense attention: padded grids land at
-            # 0.06-0.16% mean relative error against 0.06% for grids that need
-            # no pad, and 4-5% for the unpadded mismatch.
-            head = query.new_zeros((query.shape[0], pad, *query.shape[2:]))
-            q, k, v = (torch.cat((head, tensor), dim=1) for tensor in (q, k, v))
         # Ulysses has already gathered the full sequence onto this rank and split
         # the heads, so read the head count off the tensor rather than num_heads.
         out = sparse_attention(
@@ -374,16 +338,14 @@ class RainFusionAttentionImpl(AttentionImpl):
             scale=self.softmax_scale,
             head_num=query.shape[-2],
             input_layout=_INPUT_LAYOUT,
-            inner_precise=self.rainfusion.inner_precise,
+            inner_precise=_INNER_PRECISE,
             sparse_type="rf_v2",
-            txt_len=plan.prefix_len + pad,
+            txt_len=plan.prefix_len,
             block_size=_BLOCK_SIZE,
             latent_shape_q=plan.latent_shape,
             latent_shape_k=plan.latent_shape,
             sparsity=self.rainfusion.sparsity,
         )
-        if pad:
-            out = out[:, pad:].contiguous()
         if used == query.shape[1]:
             return out
         padded = torch.zeros_like(query)

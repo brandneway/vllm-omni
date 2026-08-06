@@ -223,30 +223,30 @@ nominal `sparsity` you configure. Anything the kernel cannot handle — a warmup
 exempt layer, a sequence with no published video geometry, a video segment under 32 blocks —
 delegates to `FLASH_ATTN`, so a model can select this backend unconditionally.
 
-Enable it through the typed `rainfusion` block on the attention spec:
+Enable it through the typed `block_sparse` block on the attention spec, shared by every
+block-sparse backend:
 
 | Key | Valid values | Meaning |
 |---|---|---|
 | `sparsity` | finite, `[0, 1]` | Nominal fraction of key blocks dropped per query block. `0` disables sparsity. Defaults to `0.8`. |
 | `start_step` | `≥ 0` | Keep the first N denoise steps dense. Layout is decided early, so these steps dominate structural fidelity. |
 | `skip_layers` | index selector, e.g. `"0-3,38"` | DiT blocks that always stay dense. |
-| `inner_precise` | `0` or `1` | `0` = high precision, `1` = high performance. On A5 devices `rf_v2` is routed to `rf_v3`, which forces its own value. |
 
 ```bash
 vllm-omni serve MiniMaxAI/MiniMax-H3 \
   --diffusion-attention-config '{"default": {"backend": "RAINFUSION_ATTN",
-      "rainfusion": {"sparsity": 0.8, "start_step": 0}}}'
+      "block_sparse": {"sparsity": 0.8, "start_step": 0}}}'
 ```
 
-Programmatically the same block is a typed `RainFusionSpec` (values validated at construction):
+Programmatically the same block is a typed `BlockSparseSpec` (values validated at construction):
 
 ```python
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, RainFusionSpec
+from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, BlockSparseSpec
 
 AttentionConfig(
     default=AttentionSpec(
         backend="RAINFUSION_ATTN",
-        rainfusion=RainFusionSpec(sparsity=0.8, start_step=0, skip_layers="0-1"),
+        block_sparse=BlockSparseSpec(sparsity=0.8, start_step=0, skip_layers="0-1"),
     ),
 )
 ```
@@ -260,23 +260,25 @@ Requires Ascend NPU with `mindiesd`; selecting it on any other platform raises. 
 incompatible with ring sequence parallelism, since `rf_v2` needs the whole key sequence to rank
 blocks — use Ulysses SP (`ring_degree=1`).
 
-### Any resolution runs, but multiples of 256 give the best sparse quality
+### Which geometries run sparse
 
-Grids whose video segment is not a multiple of 128 rows would desynchronize `rf_v2`'s block mask
-from the kernel's own tiling. The backend repairs that by prepending zero rows to the prefix and
-slicing them off again afterwards, so no resolution is rejected; `RAINFUSION_ATTN active` logs the
-`prefix_pad` it chose, at most 255 rows.
+Sparsity is only applied when the video segment is a **multiple of 128 rows**, where the row count
+is `latent_t × (height / 32) × (width / 32)`. Otherwise `rf_v2`'s block mask and the kernel's own
+tiling disagree on the block count, and the block straddling the seam mixes video and prefix rows
+that selection may then drop. Any resolution still runs — an unaligned geometry falls back to dense
+attention and logs `RAINFUSION_ATTN staying dense` with the row count it computed — but it gets no
+speedup, so pick an aligned geometry when you want one.
 
-What the backend cannot repair is block selection itself. `rf_v2` groups video positions into 8x8
+Alignment is necessary, not sufficient, for good quality. `rf_v2` groups video positions into 8x8
 spatial tiles (two tiles fill one 128-row block), which is what makes a selected block a compact
 patch of the frame. When the latent `h` or `w` is not a multiple of 8, the leftover rows or columns
 are peeled off and appended as a flat run instead of being tiled, so they get pooled with spatially
 distant positions and selection can no longer rank them meaningfully. This is silent, and invisible
 to a `sparsity=0` check, because a fully populated mask does not care how blocks are grouped.
 
-Since the latent grid is `(latent_t, height/32, width/32)`, "multiple of 8" means **width and
-height that are multiples of 256**. Off-grid resolutions still run and still speed up; they just
-lose more fidelity at the same `sparsity`, which you can buy back with `start_step`.
+"Multiple of 8" on the latent grid means **width and height that are multiples of 256**. Aligned
+resolutions off that grid still run sparse; they just lose more fidelity at the same `sparsity`,
+which you can buy back with `start_step`.
 
 ## End-to-End Benchmark (BF16, sm_120 RTX Pro 6000 Blackwell)
 

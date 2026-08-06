@@ -14,6 +14,7 @@ from typing import Any
 
 import torch
 
+from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 
 from .scheduling_minimax_h3_euler_ancestral import (
@@ -89,13 +90,13 @@ class MiniMaxH3DenoiseBranch:
                 "max_seqlen_q": text_len,
             },
         }
-        # Video-segment geometry for block-sparse attention backends. Resolved to
-        # plain ints here so the attention layers never sync on it per step.
-        if "latent_grid" in packed and "video_row_start" in packed:
-            self.static_kwargs["sparse_attn_params"] = {
-                "latent_grid": tuple(packed["latent_grid"].tolist()),
-                "video_row_start": int(packed["video_row_start"]),
-            }
+        # Where the video segment sits in the packed sequence. Resolved to plain
+        # ints here so the attention layers never sync on it per step.
+        grid = packed["latent_grid"].tolist()
+        self.static_kwargs["video_token_layout"] = VideoTokenLayout(
+            prefix_len=int(packed["video_row_start"]),
+            latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
+        )
 
     def forward_kwargs(
         self,
