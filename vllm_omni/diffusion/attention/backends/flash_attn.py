@@ -67,10 +67,6 @@ class FlashAttentionImpl(AttentionImpl):
         "npu": {"fp8"},
     }
 
-    # Set when the MINDIE_SD_FA_TYPE-selected op (e.g. ascend_laser_attention)
-    # fails at runtime; subsequent slice-path calls bypass the env override.
-    _npu_env_op_broken: bool = False
-
     def __init__(
         self,
         num_heads: int,
@@ -439,7 +435,7 @@ class FlashAttentionImpl(AttentionImpl):
         #     slicing via mindiesd attention_forward (so the env-selected op
         #     type is honored; the TND varlen op cannot be).
         extra = attn_metadata.extra if attn_metadata else {}
-        if extra.get("npu_attn_varlen"):
+        if extra.get("npu_attn_varlen", False):
             if os.environ.get("MINDIE_SD_FA_TYPE") == "ascend_laser_attention":
                 out = self._forward_prefix_kv_slice_npu(query, key, value, extra)
             else:
@@ -447,7 +443,7 @@ class FlashAttentionImpl(AttentionImpl):
             if out is not None:
                 return out
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
-        if attention_mask is None and extra.get("npu_attn_varlen"):
+        if attention_mask is None and extra.get("npu_attn_varlen", False):
             # Models skip mask construction when this opt-in is set
             # (FlashAttentionBackend.supports_packed_mask_free). The packed
             # paths above declined (contract mismatch), so rebuild the padding
@@ -537,8 +533,16 @@ class FlashAttentionImpl(AttentionImpl):
         if resolved is None:
             return None
         seq_q, seq_k = resolved
-        from mindiesd import attention_forward_varlen
 
+        try:
+            from mindiesd import attention_forward_varlen
+        except ImportError:
+            raise ImportError(
+                "FlashAttentionBackend NPU implementation requires MindIE-SD. "
+                "Please install MindIE-SD to enable NPU attention support. "
+                "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
+                "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
+            )
         q = query.squeeze(0)  # [T, N, D] == TND
         k = key.squeeze(0)
         v = value.squeeze(0)
@@ -571,10 +575,6 @@ class FlashAttentionImpl(AttentionImpl):
 
         Used when MINDIE_SD_FA_TYPE=ascend_laser_attention: the TND varlen op
         cannot honor the env-selected op type, while attention_forward can.
-        If the env-selected op is unusable in this runtime (e.g. the soc has
-        no LaserAttention binary), fall back to mindiesd's runtime dispatch
-        (which ignores MINDIE_SD_FA_TYPE) and remember the failure for the
-        rest of the process.
 
         The laser kernel stores unscaled S=QK^T in an fp16 GM workspace, so
         bf16 activations with large outliers overflow 65504 into ±inf and the
@@ -582,17 +582,27 @@ class FlashAttentionImpl(AttentionImpl):
         pre-scaling via extra["laser_input_scale"] (see abstract.py): q/k/v
         are divided by the factor, the kernel scale_value is multiplied by its
         square, and the output is scaled back. Absent or invalid factor means
-        no pre-scaling. The compensation is mathematically transparent to the
-        runtime-dispatch fallback op as well.
+        no pre-scaling.
         """
         resolved = self._resolve_packed_seq_npu(query, key, extra)
         if resolved is None:
             return None
         _, seq_k = resolved
         used_k = seq_k[0]  # real document length (first cumulative end)
-        from mindiesd import attention_forward
 
-        layout = self.qkv_layout or "BNSD"
+        try:
+            from mindiesd import attention_forward
+        except ImportError:
+            raise ImportError(
+                "FlashAttentionBackend NPU implementation requires MindIE-SD. "
+                "Please install MindIE-SD to enable NPU attention support. "
+                "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
+                "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
+            )
+        # mindiesd always takes BSND input regardless of `layout`; the arg
+        # selects the op-internal layout and laser only supports BNSD, so do
+        # NOT forward the model's qkv_layout ("BSND" for MiniMax-H3) here.
+        layout = "BNSD"
         key = key[:, :used_k]
         value = value[:, :used_k]
 
@@ -609,36 +619,14 @@ class FlashAttentionImpl(AttentionImpl):
         def _postprocess(out: torch.Tensor) -> torch.Tensor:
             return out * input_scale if preserve_input_range else out
 
-        if not FlashAttentionImpl._npu_env_op_broken:
-            try:
-                return _postprocess(
-                    attention_forward(
-                        query,
-                        key,
-                        value,
-                        attn_mask=None,
-                        opt_mode="manual",
-                        op_type="fused_attn_score",  # MINDIE_SD_FA_TYPE env overrides this
-                        layout=layout,
-                        scale=scale,
-                    )
-                )
-            except RuntimeError as e:
-                FlashAttentionImpl._npu_env_op_broken = True
-                logger.warning(
-                    "MINDIE_SD_FA_TYPE=%s attention op failed (%s); falling back to "
-                    "runtime dispatch (fused_attn_score) for the rest of this process.",
-                    os.environ.get("MINDIE_SD_FA_TYPE"),
-                    str(e).splitlines()[0] if str(e) else type(e).__name__,
-                )
-        # "runtime" mode ignores MINDIE_SD_FA_TYPE and picks a supported op.
         return _postprocess(
             attention_forward(
                 query,
                 key,
                 value,
                 attn_mask=None,
-                opt_mode="runtime",
+                opt_mode="manual",
+                op_type="fused_attn_score",  # MINDIE_SD_FA_TYPE env overrides this
                 layout=layout,
                 scale=scale,
             )
