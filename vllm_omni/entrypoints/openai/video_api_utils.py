@@ -480,9 +480,13 @@ def _coerce_video_to_uint8_frames(video: Any) -> np.ndarray:
     # Fast path: a payload that is already uint8 HWC frames (e.g. MiniMax-H3
     # on-device quantized decode) skips the float normalization round-trip
     # entirely — a ~8x postprocess speedup for long videos.
-    if isinstance(video, np.ndarray) and video.dtype == np.uint8 and video.ndim == 4:
+    if isinstance(video, np.ndarray) and video.dtype == np.uint8 and video.ndim == 4 and video.shape[-1] == 3:
         return np.ascontiguousarray(video)
-    if isinstance(video, list) and video and all(isinstance(f, np.ndarray) and f.dtype == np.uint8 for f in video):
+    if (
+        isinstance(video, list)
+        and video
+        and all(isinstance(f, np.ndarray) and f.dtype == np.uint8 and f.ndim == 3 and f.shape[-1] == 3 for f in video)
+    ):
         return np.ascontiguousarray(np.stack(video, axis=0))
 
     frames = _coerce_video_to_frames(video)
