@@ -113,6 +113,42 @@ def test_channel_first_video_tensor_is_converted_to_channel_last():
     np.testing.assert_array_equal(frames, video.permute(1, 2, 3, 0).numpy())
 
 
+def test_channel_first_uint8_ndarray_is_not_treated_as_rgb_hwc():
+    video = np.arange(3 * 5 * 2 * 6, dtype=np.uint8).reshape(3, 5, 2, 6)
+
+    frames = video_api_utils._coerce_video_to_uint8_frames(video)
+
+    assert frames.shape == (5, 2, 6, 3)
+    np.testing.assert_array_equal(frames, np.transpose(video, (1, 2, 3, 0)))
+
+
+def test_rgba_uint8_ndarray_is_normalized_before_fast_path():
+    video = np.arange(2 * 4 * 5 * 4, dtype=np.uint8).reshape(2, 4, 5, 4)
+
+    frames = video_api_utils._coerce_video_to_uint8_frames(video)
+
+    assert frames.shape == (2, 4, 5, 3)
+    np.testing.assert_array_equal(frames, video[..., :3])
+
+
+def test_channel_first_uint8_frame_list_is_not_treated_as_rgb_hwc():
+    video = [np.arange(3 * 4 * 5, dtype=np.uint8).reshape(3, 4, 5)]
+
+    frames = video_api_utils._coerce_video_to_uint8_frames(video)
+
+    assert frames.shape == (1, 4, 5, 3)
+    np.testing.assert_array_equal(frames[0], np.transpose(video[0], (1, 2, 0)))
+
+
+def test_rgba_uint8_frame_list_is_normalized_before_fast_path():
+    video = [np.arange(4 * 5 * 4, dtype=np.uint8).reshape(4, 5, 4)]
+
+    frames = video_api_utils._coerce_video_to_uint8_frames(video)
+
+    assert frames.shape == (1, 4, 5, 3)
+    np.testing.assert_array_equal(frames[0], video[0][..., :3])
+
+
 def test_fragmented_mp4_video_encoder_reuses_single_muxer(monkeypatch):
     muxers = []
 

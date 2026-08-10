@@ -267,6 +267,15 @@ class OmniPlatform(Platform):
             return nullcontext()
 
     @classmethod
+    def can_disable_vae_autocast_cache(cls) -> bool:
+        """Whether tiled VAE decode may disable autocast's weight cache.
+
+        This is deliberately fail-closed. A platform must opt in only after
+        validating the cache-off cost model for its tiled VAE implementation.
+        """
+        return False
+
+    @classmethod
     def supports_cpu_offload(cls) -> bool:
         return True
 

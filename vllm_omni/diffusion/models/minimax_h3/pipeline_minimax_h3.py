@@ -1564,7 +1564,7 @@ class MiniMaxH3Pipeline(
                 device_type=self.device.type,
                 dtype=torch.float16,
                 enabled=True,
-                cache_enabled=False,
+                cache_enabled=not current_omni_platform.can_disable_vae_autocast_cache(),
             ):
                 video = self.video_vae.decode_latent(video_latent)
         video = video[..., :height, :width]

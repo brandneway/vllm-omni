@@ -223,22 +223,42 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         return device_props.total_memory
 
     @classmethod
-    def create_autocast_context(cls, *, device_type, dtype, enabled=True):
+    def create_autocast_context(cls, *, device_type, dtype, enabled=True, cache_enabled=True):
         if device_type != "npu":
             return super().create_autocast_context(
                 device_type=device_type,
                 dtype=dtype,
                 enabled=enabled,
+                cache_enabled=cache_enabled,
             )
         if not enabled:
             return nullcontext()
 
         # NPU-specific fallback
         try:
-            return torch.npu.amp.autocast(dtype=dtype)
-        except (RuntimeError, TypeError, ValueError) as exc:
+            return torch.npu.amp.autocast(
+                dtype=dtype,
+                enabled=enabled,
+                cache_enabled=cache_enabled,
+            )
+        except TypeError:
+            # Retain AMP when the backend cannot control the cast cache.
+            try:
+                return torch.npu.amp.autocast(dtype=dtype)
+            except (RuntimeError, TypeError, ValueError) as exc:
+                logger.warning(
+                    "autocast unavailable for device_type=%s dtype=%s: %s",
+                    device_type,
+                    dtype,
+                    exc,
+                )
+        except (RuntimeError, ValueError) as exc:
             logger.warning("autocast unavailable for device_type=%s dtype=%s: %s", device_type, dtype, exc)
         return nullcontext()
+
+    @classmethod
+    def can_disable_vae_autocast_cache(cls) -> bool:
+        return True
 
     @classmethod
     def get_profiler_cls(cls) -> str:

@@ -311,15 +311,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         """Memory-lean equivalent of ``processor.revert_tensor``.
 
         Channel-wise denormalize via the processor's torchvision ``Normalize``
-        (1 unavoidable copy), then clamp in place and reshape — skipping the
-        separate clamp copy and the final contiguous that ``revert_tensor``
-        allocates.
+        (1 unavoidable copy), then clamp in place and restore layout —
+        skipping the separate clamp copy and the final contiguous that
+        ``revert_tensor`` allocates.
         """
         transform_rev = self.model.processor.transform_rev
         if decoded.ndim == 5:
-            B, C, T, H, W = decoded.shape
-            flat = decoded.reshape(B * T, C, H, W)
-            return transform_rev(flat).clamp_(0, 1).reshape(B, C, T, H, W)
+            # Normalize treats the third-to-last dimension as channels. Move
+            # C next to H/W without materializing a (B*T,C,H,W) copy.
+            frames = decoded.movedim(1, 2)
+            return transform_rev(frames).clamp_(0, 1).movedim(2, 1)
         # 4D NCHW
         return transform_rev(decoded).clamp_(0, 1)
 
