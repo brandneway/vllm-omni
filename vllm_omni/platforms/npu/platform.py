@@ -139,10 +139,13 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
                 )
                 backend_upper = "FLASH_ATTN"
 
-            if backend_upper == "FLASH_ATTN" and find_spec("mindiesd"):
-                # The NPU FLASH_ATTN backend imports mindiesd lazily at first
-                # forward, but CANN snapshots the custom-op registry at the
-                # first custom-op regInfo lookup in the process (e.g. a
+            if find_spec("mindiesd"):
+                # NPU diffusion backends reach mindiesd lazily at first
+                # forward -- FLASH_ATTN directly, and RAINFUSION_ATTN via
+                # its dense FlashAttention fallback (used before start_step
+                # and on any layer without a sparsifiable video segment).
+                # CANN snapshots the custom-op registry at the first
+                # custom-op regInfo lookup in the process (e.g. a
                 # vllm-ascend custom op during model load/warmup). Import
                 # mindiesd here so its env.py prepends the mindiesd vendor
                 # dirs (aie_ascendc etc.) to ASCEND_CUSTOM_OPP_PATH before
