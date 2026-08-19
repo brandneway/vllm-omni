@@ -608,7 +608,9 @@ class FlashAttentionImpl(AttentionImpl):
                     softmax_scale=self.softmax_scale,
                 )
             )
-        return torch.cat(outs, dim=1)
+        # Keep the output contiguous like the unsplit call: models .view()
+        # the attention output right after returning from the layer.
+        return torch.cat(outs, dim=1).contiguous()
 
     def _forward_prefix_kv_slice_npu(
         self,
