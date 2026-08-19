@@ -528,6 +528,10 @@ class FlashAttentionImpl(AttentionImpl):
 
         Returns None (caller falls back to the mask path) when the packed
         contract does not hold; see _resolve_packed_seq_npu.
+
+        MINDIE_SD_FREQ (truthy) switches to the headwise path
+        (_forward_varlen_packed_headwise_npu) as an NPU power-management
+        workaround.
         """
         resolved = self._resolve_packed_seq_npu(query, key, extra)
         if resolved is None:
@@ -548,15 +552,63 @@ class FlashAttentionImpl(AttentionImpl):
         v = value.squeeze(0)
         # attention_forward_varlen wants cu_seqlens as host lists of cumulative
         # offsets and forwards cu[1:] as actual_seq_qlen/actual_seq_kvlen.
-        out = attention_forward_varlen(
-            q,
-            k,
-            v,
-            [0, *seq_q],
-            [0, *seq_k],
-            softmax_scale=self.softmax_scale,
-        )
+        cu_seqlens_q = [0, *seq_q]
+        cu_seqlens_k = [0, *seq_k]
+        if os.environ.get("MINDIE_SD_FREQ", "False").strip().lower() in ("1", "true", "yes", "on"):
+            out = self._forward_varlen_packed_headwise_npu(
+                attention_forward_varlen,
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+            )
+        else:
+            out = attention_forward_varlen(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                softmax_scale=self.softmax_scale,
+            )
         return out.unsqueeze(0)
+
+    def _forward_varlen_packed_headwise_npu(
+        self,
+        attention_forward_varlen,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: list[int],
+        cu_seqlens_k: list[int],
+    ) -> torch.Tensor:
+        """Single-head varlen attention slices concatenated along head_num.
+
+        One wide-head_num call concentrates the whole attention as a single
+        burst of instantaneous compute; when that bursts past the power
+        envelope the NPU power management downclocks the chip and the (and
+        subsequent) operators run far below the stable frequency. Single-head
+        calls keep each op's instantaneous compute small so the clock
+        sustains. Attention heads are independent, so the concatenated
+        result is identical to the unsplit call.
+        """
+        num_q_heads = q.shape[1]
+        group_size = num_q_heads // k.shape[1]  # q heads per kv head; 1 for MHA
+        outs = []
+        for i in range(num_q_heads):
+            kv = i // group_size
+            outs.append(
+                attention_forward_varlen(
+                    q[:, i : i + 1].contiguous(),  # [T, 1, D] slice of TND
+                    k[:, kv : kv + 1].contiguous(),
+                    v[:, kv : kv + 1].contiguous(),
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    softmax_scale=self.softmax_scale,
+                )
+            )
+        return torch.cat(outs, dim=1)
 
     def _forward_prefix_kv_slice_npu(
         self,

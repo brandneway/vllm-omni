@@ -638,6 +638,89 @@ def test_prefix_kv_slice_no_scaling_without_factor(monkeypatch):
     torch.testing.assert_close(out, torch.ones(1, 8, 2, 4))
 
 
+# --- Test group D: MINDIE_SD_FREQ headwise split (_forward_varlen_packed_npu) -
+
+
+def _packed_varlen_extra() -> dict:
+    cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+    return {"cu_seqlens_q": cu, "cu_seqlens_k": cu, "max_seqlen_q": 5, "max_seqlen_k": 5}
+
+
+@pytest.mark.parametrize("freq", [None, "0", "False", "false", "no", "off"])
+def test_varlen_packed_freq_falsy_keeps_single_wide_call(monkeypatch, freq):
+    """MINDIE_SD_FREQ unset or explicitly falsy: one full-width varlen call."""
+    if freq is None:
+        monkeypatch.delenv("MINDIE_SD_FREQ", raising=False)
+    else:
+        monkeypatch.setenv("MINDIE_SD_FREQ", freq)
+    varlen = Mock(return_value=torch.zeros(8, 2, 4))
+    _fake_mindiesd(monkeypatch, attention_forward_varlen=varlen)
+    impl = _npu_impl()
+    q = torch.randn(1, 8, 2, 4)
+
+    out = impl._forward_varlen_packed_npu(q, q, q, _packed_varlen_extra())
+
+    varlen.assert_called_once()
+    assert varlen.call_args.args[0].shape == (8, 2, 4)  # full head_num, TND
+    assert varlen.call_args.args[3] == [0, 5, 8]
+    assert varlen.call_args.kwargs["softmax_scale"] == pytest.approx(0.5)
+    assert out.shape == (1, 8, 2, 4)
+
+
+@pytest.mark.parametrize("freq", ["1", "True", "true", "yes", "on"])
+def test_varlen_packed_freq_truthy_splits_per_head(monkeypatch, freq):
+    """MINDIE_SD_FREQ truthy: one single-head call per head, outputs concatenated
+    along head_num in head order."""
+    monkeypatch.setenv("MINDIE_SD_FREQ", freq)
+    calls: list = []
+
+    def fake_varlen(q, k, v, cu_q, cu_k, *, softmax_scale):
+        calls.append((q, k, v, cu_q, cu_k, softmax_scale))
+        return torch.full_like(q, float(len(calls)))  # 1.0 first head, 2.0 second
+
+    _fake_mindiesd(monkeypatch, attention_forward_varlen=fake_varlen)
+    impl = _npu_impl()
+    q = torch.randn(1, 8, 2, 4)
+
+    out = impl._forward_varlen_packed_npu(q, q, q, _packed_varlen_extra())
+
+    assert len(calls) == 2  # num_heads == 2
+    for i, (q_i, k_i, v_i, cu_q, cu_k, scale) in enumerate(calls):
+        assert q_i.shape == k_i.shape == v_i.shape == (8, 1, 4)
+        assert q_i.is_contiguous()
+        torch.testing.assert_close(q_i, q[0, :, i : i + 1].contiguous())
+        assert cu_q == [0, 5, 8]
+        assert cu_k == [0, 5, 8]
+        assert scale == pytest.approx(0.5)
+    # concatenated along head_num in head order
+    assert out.shape == (1, 8, 2, 4)
+    torch.testing.assert_close(out[0, :, 0], torch.full((8, 4), 1.0))
+    torch.testing.assert_close(out[0, :, 1], torch.full((8, 4), 2.0))
+
+
+def test_varlen_packed_freq_headwise_maps_gqa_kv_heads(monkeypatch):
+    """GQA: q head i attends with kv head i // (Nq/Nkv), matching the mapping
+    the fused op applies internally."""
+    monkeypatch.setenv("MINDIE_SD_FREQ", "1")
+    kv_slices: list = []
+
+    def fake_varlen(q, k, v, cu_q, cu_k, *, softmax_scale):
+        kv_slices.append(k)
+        return torch.zeros_like(q)
+
+    _fake_mindiesd(monkeypatch, attention_forward_varlen=fake_varlen)
+    impl = _npu_impl()
+    q = torch.randn(1, 8, 4, 4)  # 4 q heads
+    kv = torch.randn(1, 8, 2, 4)  # 2 kv heads -> group size 2
+
+    impl._forward_varlen_packed_npu(q, kv, kv, _packed_varlen_extra())
+
+    assert len(kv_slices) == 4
+    for i, k_i in enumerate(kv_slices):
+        assert k_i.shape == (8, 1, 4)
+        torch.testing.assert_close(k_i, kv[0, :, i // 2 : i // 2 + 1].contiguous())
+
+
 if __name__ == "__main__":
     print("Running FlashAttention Padding Tests...")
     print("=" * 60)
