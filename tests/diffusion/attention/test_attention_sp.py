@@ -24,12 +24,16 @@ This makes the test self-contained and suitable for standalone CI runs that
 do not exercise the full model-registry pipeline.
 """
 
+import json
 import os
 import pickle
+import socket
 import tempfile
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.nn.functional as F
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, QueryRange
@@ -37,6 +41,7 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
     AllGatherKVParallelAttention,
 )
+from vllm_omni.diffusion.attention.parallel.ulysses import UlyssesParallelAttention
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
@@ -408,6 +413,182 @@ def test_allgather_kv_keeps_gathered_kv_compressed_for_gqa():
     expected_value = torch.cat(value_chunks, dim=1)
     torch.testing.assert_close(k_full, expected_key)
     torch.testing.assert_close(v_full, expected_value)
+
+
+# --- Ulysses head-chunked interleave (forward_interleaved) ------------------
+#
+# forward_interleaved replaces the pre_attention -> kernel -> post_attention
+# flow with per-head-chunk all-to-all -> attention -> all-to-all loops. The
+# equivalence tests spawn real 2-rank gloo processes — all_to_all_single is
+# emulated on top of gloo isend/irecv, which gloo lacks natively — and verify
+# that the chunked scheme, the pre-apply scheme, and a single-rank
+# ground-truth attention all produce the same per-rank output. The remaining
+# tests cover the eligibility gating, which involves no communication.
+
+
+class _MockUlyssesSPGroup:
+    def __init__(self, *, world_size: int = 2, ring_world_size: int = 1, pg=None) -> None:
+        self.ulysses_group = pg
+        self.ulysses_world_size = world_size
+        self.ulysses_rank = 0
+        self.ring_group = None
+        self.ring_world_size = ring_world_size
+
+
+def _ref_attention(query, key, value, attn_metadata=None):
+    """Per-head reference attention (GQA-aware), standing in for the kernel."""
+    if key.shape[2] != query.shape[2]:
+        rep = query.shape[2] // key.shape[2]
+        key = key.repeat_interleave(rep, dim=2)
+        value = value.repeat_interleave(rep, dim=2)
+    scale = query.shape[-1] ** -0.5
+    out = F.scaled_dot_product_attention(
+        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), scale=scale
+    )
+    return out.transpose(1, 2).contiguous()
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _ulysses_equivalence_worker(rank, world_size, num_q_heads, num_kv_heads, port, verdict_dir):
+    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size)
+
+    def gloo_all_to_all_single(output, input, *args, group=None, **kwargs):
+        """all_to_all_single with equal splits, on gloo point-to-point."""
+        ws = dist.get_world_size(group)
+        n = input.shape[0] // ws
+        reqs = [dist.isend(input[d * n : (d + 1) * n].contiguous(), dst=d, group=group) for d in range(ws) if d != rank]
+        reqs += [
+            dist.irecv(output[s * n : (s + 1) * n].contiguous(), src=s, group=group)
+            for s in range(ws)
+            if s != rank
+        ]
+        for req in reqs:
+            req.wait()
+        output[rank * n : (rank + 1) * n] = input[rank * n : (rank + 1) * n]
+
+    # ulysses.py/comm.py resolve dist.all_to_all_single at call time.
+    torch.distributed.all_to_all_single = gloo_all_to_all_single
+    try:
+        torch.manual_seed(42)
+        seq_len, head_dim = 8, 4
+        s_local = seq_len // world_size
+        full_q = torch.randn(1, seq_len, num_q_heads, head_dim)
+        full_k = torch.randn(1, seq_len, num_kv_heads, head_dim)
+        full_v = torch.randn(1, seq_len, num_kv_heads, head_dim)
+        query = full_q[:, rank * s_local : (rank + 1) * s_local].contiguous()
+        key = full_k[:, rank * s_local : (rank + 1) * s_local].contiguous()
+        value = full_v[:, rank * s_local : (rank + 1) * s_local].contiguous()
+        ground = _ref_attention(full_q, full_k, full_v)[:, rank * s_local : (rank + 1) * s_local]
+
+        sp_group = _MockUlyssesSPGroup(world_size=world_size, pg=dist.group.WORLD)
+        sp_group.ulysses_rank = rank
+        strategy = UlyssesParallelAttention(sp_group, scatter_idx=2, gather_idx=1, use_sync=False)
+
+        # Current pre-apply scheme: one big all-to-all around the kernel.
+        q_a, k_a, v_a, _, ctx = strategy.pre_attention(query, key, value, None)
+        out_pre_apply = strategy.post_attention(_ref_attention(q_a, k_a, v_a), ctx)
+
+        # Head-chunked interleave.
+        out_interleaved = strategy.forward_interleaved(query, key, value, None, _ref_attention)
+
+        assert out_interleaved is not None
+        assert out_interleaved.shape == out_pre_apply.shape == ground.shape
+        torch.testing.assert_close(out_pre_apply, ground)
+        torch.testing.assert_close(out_interleaved, ground)
+        verdict = {
+            "rank": rank,
+            "ok": True,
+            "maxdiff_pre_apply": float((out_pre_apply - ground).abs().max()),
+            "maxdiff_interleaved": float((out_interleaved - ground).abs().max()),
+        }
+        with open(os.path.join(verdict_dir, f"rank{rank}.json"), "w") as f:
+            json.dump(verdict, f)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    ("num_q_heads", "num_kv_heads"),
+    [
+        (8, 8),  # MHA: 4 chunks of 2 heads
+        (8, 4),  # GQA (group 2): 2 chunks of 4 q / 2 kv heads
+    ],
+    ids=["mha", "gqa"],
+)
+def test_ulysses_interleaved_matches_pre_apply_and_single_rank(monkeypatch, num_q_heads, num_kv_heads, tmp_path):
+    """On every rank: chunked interleave == pre-apply scheme == single-rank truth."""
+    monkeypatch.delenv("ALLTOALL_PRE_APPLY", raising=False)
+    # Surface worker logs even though spawn children don't inherit -u.
+    monkeypatch.setenv("PYTHONUNBUFFERED", "1")
+    try:
+        torch.multiprocessing.spawn(
+            _ulysses_equivalence_worker,
+            args=(2, num_q_heads, num_kv_heads, _free_port(), str(tmp_path)),
+            nprocs=2,
+        )
+    except Exception:
+        # Some NPU containers abort spawned children during interpreter
+        # teardown (after the checks below already ran); the per-rank verdict
+        # files are the authoritative result either way.
+        print("ulysses equivalence spawn reported an error; trusting verdict files")
+    verdicts = []
+    for rank in range(2):
+        verdict_file = tmp_path / f"rank{rank}.json"
+        assert verdict_file.exists(), (
+            f"rank {rank} wrote no verdict; the worker crashed or failed an assertion before finishing"
+        )
+        verdicts.append(json.loads(verdict_file.read_text()))
+    assert all(v["ok"] for v in verdicts)
+    assert all(v["maxdiff_pre_apply"] == 0.0 for v in verdicts), verdicts
+    assert all(v["maxdiff_interleaved"] == 0.0 for v in verdicts), verdicts
+
+
+def _ulysses_strategy(*, world_size=2, ring_world_size=1) -> UlyssesParallelAttention:
+    return UlyssesParallelAttention(
+        _MockUlyssesSPGroup(world_size=world_size, ring_world_size=ring_world_size),
+        scatter_idx=2,
+        gather_idx=1,
+        use_sync=False,
+    )
+
+
+@pytest.mark.parametrize("env", ["true", "True", "1", "yes", "on"])
+def test_ulysses_interleaved_env_opts_out_to_pre_apply(monkeypatch, env):
+    monkeypatch.setenv("ALLTOALL_PRE_APPLY", env)
+    strategy = _ulysses_strategy()
+    query = torch.randn(1, 4, 8, 4)
+
+    assert strategy.forward_interleaved(query, query, query, None, _ref_attention) is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["joint_tensors", "ring_hybrid", "heads_not_chunkable", "single_chunk"],
+)
+def test_ulysses_interleaved_declines_ineligible_layouts(monkeypatch, case):
+    monkeypatch.delenv("ALLTOALL_PRE_APPLY", raising=False)
+    strategy = _ulysses_strategy(world_size=2, ring_world_size=2 if case == "ring_hybrid" else 1)
+    query = torch.randn(1, 4, 8, 4)
+    key = torch.randn(1, 4, 8, 4)
+    metadata = None
+    if case == "joint_tensors":
+        metadata = AttentionMetadata(joint_query=query, joint_key=key, joint_value=key)
+    elif case == "heads_not_chunkable":
+        # group_size=2 -> q_chunk=4; 6 % 4 != 0.
+        query = torch.randn(1, 4, 6, 4)
+        key = torch.randn(1, 4, 3, 4)
+    elif case == "single_chunk":
+        # q_chunk == world_size == num_heads: nothing to interleave.
+        query = torch.randn(1, 4, 2, 4)
+        key = torch.randn(1, 4, 2, 4)
+
+    assert strategy.forward_interleaved(query, key, key, metadata, _ref_attention) is None
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=4)

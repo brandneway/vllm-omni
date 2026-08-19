@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -489,3 +491,100 @@ class UlyssesParallelAttention:
                 use_sync=ctx.use_sync,
             )
         return SeqAllToAll4D.apply(ctx.ulysses_pg, attn_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync)
+
+    def forward_interleaved(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+        attn_fn: Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor, AttentionMetadata | None],
+            torch.Tensor,
+        ],
+    ) -> torch.Tensor | None:
+        """Head-chunked Ulysses: all-to-all -> attention -> all-to-all per chunk.
+
+        The default scheme reshards ALL heads with one big all-to-all before
+        the attention kernel and one after it. The high-frequency FA op then
+        runs as a single burst of instantaneous compute, which can push the
+        NPU past its power envelope: power management downclocks the chip and
+        the (and subsequent) operators run far below the stable frequency.
+        On this NPU the all-to-all is driven from the host (CPU-bound, low
+        frequency), so interleaving chunks of heads — all-to-all, attention,
+        reverse all-to-all per chunk, concatenating along head_num at the end
+        — inserts low-frequency breathing room between attention launches.
+        Attention heads are independent, so the concatenated result is
+        identical to the pre-apply scheme.
+
+        Each loop iteration handles `ulysses_degree * group_size` query heads
+        (`group_size` = q heads per kv head, 1 for MHA) and `ulysses_degree`
+        kv heads, i.e. `group_size` local heads per rank with the full
+        sequence — the same per-head math the unchunked kernel performs.
+
+        Returns None when this forward cannot run chunked, and the caller
+        falls back to pre_attention -> kernel -> post_attention:
+          - ALLTOALL_PRE_APPLY is truthy (explicit opt-out to the current
+            pre-apply scheme);
+          - hybrid Ulysses+Ring, advanced_uaa mode, or joint (cross-attn)
+            tensors are involved;
+          - head counts are not chunkable, or there is only a single chunk.
+        """
+        if os.environ.get("ALLTOALL_PRE_APPLY", "False").strip().lower() in ("1", "true", "yes", "on"):
+            return None
+
+        world_size = self._sp_group.ulysses_world_size
+        if world_size <= 1 or self._sp_group.ring_world_size > 1:
+            return None
+        if get_ulysses_mode(default="strict") != "strict":
+            return None
+        if (self._scatter_idx, self._gather_idx) != (2, 1):
+            return None
+        if attn_metadata is not None and attn_metadata.joint_query is not None:
+            return None
+
+        num_q_heads = int(query.shape[2])
+        num_kv_heads = int(key.shape[2])
+        if num_q_heads % num_kv_heads != 0:
+            return None
+        group_size = num_q_heads // num_kv_heads
+        q_chunk = world_size * group_size
+        kv_chunk = world_size
+        # More than one chunk is required, otherwise this is exactly the
+        # pre-apply scheme and the original path handles it (incl. its
+        # metadata handling).
+        if num_q_heads % q_chunk != 0 or num_kv_heads % kv_chunk != 0 or num_q_heads <= q_chunk:
+            return None
+
+        outs = []
+        for q_lo in range(0, num_q_heads, q_chunk):
+            kv_lo = q_lo // group_size
+            q_c = SeqAllToAll4D.apply(
+                self._ulysses_pg,
+                query[:, :, q_lo : q_lo + q_chunk],
+                self._scatter_idx,
+                self._gather_idx,
+                self._use_sync,
+            )
+            k_c = SeqAllToAll4D.apply(
+                self._ulysses_pg,
+                key[:, :, kv_lo : kv_lo + kv_chunk],
+                self._scatter_idx,
+                self._gather_idx,
+                self._use_sync,
+            )
+            v_c = SeqAllToAll4D.apply(
+                self._ulysses_pg,
+                value[:, :, kv_lo : kv_lo + kv_chunk],
+                self._scatter_idx,
+                self._gather_idx,
+                self._use_sync,
+            )
+            o_c = attn_fn(q_c, k_c, v_c, attn_metadata)
+            outs.append(
+                SeqAllToAll4D.apply(self._ulysses_pg, o_c, self._gather_idx, self._scatter_idx, self._use_sync)
+            )
+        # cat along an interior dim yields a non-contiguous tensor; the
+        # pre-apply path returns contiguous outputs and downstream models
+        # rely on that (e.g. .view() right after the attention).
+        return torch.cat(outs, dim=self._scatter_idx).contiguous()

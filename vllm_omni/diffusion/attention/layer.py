@@ -312,6 +312,17 @@ class Attention(nn.Module):
         # Get the appropriate parallel strategy based on SP active state
         strategy = self._get_active_parallel_strategy()
 
+        # Ulysses head-chunked interleave (NPU power-management workaround):
+        # run all-to-all -> attention -> reverse all-to-all per head chunk
+        # instead of resharding everything up front. The strategy declines
+        # (returns None) when the layout does not fit or ALLTOALL_PRE_APPLY
+        # opts out; the flow below is then unchanged.
+        interleaved = getattr(strategy, "forward_interleaved", None)
+        if interleaved is not None:
+            out = interleaved(query, key, value, self._with_kv_cache_dtype(attn_metadata), self._run_local_attention)
+            if out is not None:
+                return out
+
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
