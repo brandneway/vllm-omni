@@ -638,6 +638,123 @@ def test_prefix_kv_slice_no_scaling_without_factor(monkeypatch):
     torch.testing.assert_close(out, torch.ones(1, 8, 2, 4))
 
 
+# --- Test group E: FP8 varlen routing in forward_npu --------------------------
+
+
+def _packed_extra(**overrides) -> dict:
+    cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+    extra = {
+        "cu_seqlens_q": cu,
+        "cu_seqlens_k": cu,
+        "max_seqlen_q": 5,
+        "max_seqlen_k": 5,
+        "npu_attn_varlen": True,
+    }
+    extra.update(overrides)
+    return extra
+
+
+def _fake_fp8_varlen(monkeypatch, captured: dict, return_head_dim: int = 2):
+    """Stub kv_quant_npu.fp8_rotate_quant_fa_varlen; records each call."""
+    import vllm_omni.platforms.npu.quant.kv_quant_npu as kv_quant_npu
+
+    def fake_varlen(q, k, v, cu_q, cu_k, *, softmax_scale=None):
+        captured.setdefault("calls", []).append(
+            {
+                "q_shape": tuple(q.shape),
+                "k_shape": tuple(k.shape),
+                "v_shape": tuple(v.shape),
+                "cu_q": list(cu_q),
+                "cu_k": list(cu_k),
+                "softmax_scale": softmax_scale,
+            }
+        )
+        return torch.zeros(q.shape[0], q.shape[1], return_head_dim)
+
+    monkeypatch.setattr(kv_quant_npu, "fp8_rotate_quant_fa_varlen", fake_varlen)
+
+
+def test_npu_fp8_varlen_routes_to_quant_varlen(monkeypatch):
+    _fake_mindiesd(monkeypatch)
+    impl = _npu_impl()
+    impl._forward_varlen_packed_quant_npu = Mock(return_value=torch.tensor([2.0]))
+    impl.forward_fa_npu = Mock(return_value=torch.tensor([3.0]))
+    impl.forward_fa_quant_npu = Mock(return_value=torch.tensor([4.0]))
+    metadata = AttentionMetadata(extra=_packed_extra(kv_cache_dtype="fp8"))
+
+    out = impl.forward_npu(torch.randn(1, 8, 2, 4), *[torch.randn(1, 8, 2, 4)] * 2, metadata)
+
+    impl._forward_varlen_packed_quant_npu.assert_called_once()
+    impl.forward_fa_quant_npu.assert_not_called()
+    impl.forward_fa_npu.assert_not_called()
+    assert out.item() == 2.0
+
+
+def test_npu_fp8_varlen_contract_failure_falls_back_unquantized(monkeypatch):
+    _fake_mindiesd(monkeypatch)
+    impl = _npu_impl()
+    impl._forward_varlen_packed_quant_npu = Mock(return_value=None)
+    impl.forward_fa_npu = Mock(return_value=torch.tensor([3.0]))
+    impl.forward_fa_quant_npu = Mock(return_value=torch.tensor([4.0]))
+    metadata = AttentionMetadata(extra=_packed_extra(kv_cache_dtype="fp8"))
+
+    out = impl.forward_npu(torch.randn(1, 8, 2, 4), *[torch.randn(1, 8, 2, 4)] * 2, metadata)
+
+    # Dense FP8 must not run: it would ignore document boundaries.
+    impl.forward_fa_quant_npu.assert_not_called()
+    impl.forward_fa_npu.assert_called_once()
+    assert out.item() == 3.0
+
+
+def test_npu_fp8_without_varlen_uses_dense_quant(monkeypatch):
+    _fake_mindiesd(monkeypatch)
+    impl = _npu_impl()
+    impl._forward_varlen_packed_quant_npu = Mock(return_value=torch.tensor([2.0]))
+    impl.forward_fa_npu = Mock(return_value=torch.tensor([3.0]))
+    impl.forward_fa_quant_npu = Mock(return_value=torch.tensor([4.0]))
+    metadata = AttentionMetadata(extra={"kv_cache_dtype": "fp8"})  # no npu_attn_varlen
+
+    out = impl.forward_npu(torch.randn(1, 8, 2, 4), *[torch.randn(1, 8, 2, 4)] * 2, metadata)
+
+    impl.forward_fa_quant_npu.assert_called_once()
+    impl._forward_varlen_packed_quant_npu.assert_not_called()
+    assert out.item() == 4.0
+
+
+def test_npu_fp8_varlen_single_call_when_freq_off(monkeypatch):
+    monkeypatch.delenv("MINDIE_SD_FREQ", raising=False)
+    _fake_mindiesd(monkeypatch)
+    captured: dict = {}
+    _fake_fp8_varlen(monkeypatch, captured, return_head_dim=4)
+    impl = _npu_impl()
+    q = torch.randn(1, 8, 2, 4)
+
+    out = impl._forward_varlen_packed_quant_npu(q, q, q, _packed_extra())
+
+    assert len(captured["calls"]) == 1
+    assert captured["calls"][0]["q_shape"] == (8, 2, 4)
+    assert captured["calls"][0]["cu_q"] == [0, 5, 8]
+    assert captured["calls"][0]["softmax_scale"] == pytest.approx(0.5)
+    assert out.shape == (1, 8, 2, 4)
+
+
+def test_npu_fp8_varlen_freq_truthy_splits_per_head(monkeypatch):
+    monkeypatch.setenv("MINDIE_SD_FREQ", "1")
+    _fake_mindiesd(monkeypatch)
+    captured: dict = {}
+    _fake_fp8_varlen(monkeypatch, captured, return_head_dim=4)
+    impl = _npu_impl()
+    q = torch.randn(1, 8, 2, 4)
+
+    out = impl._forward_varlen_packed_quant_npu(q, q, q, _packed_extra())
+
+    # One call per head, single-head TND slices, GQA maps kv head per group.
+    assert len(captured["calls"]) == 2
+    assert [call["q_shape"] for call in captured["calls"]] == [(8, 1, 4), (8, 1, 4)]
+    assert [call["k_shape"] for call in captured["calls"]] == [(8, 1, 4), (8, 1, 4)]
+    assert out.shape == (1, 8, 2, 4)
+
+
 if __name__ == "__main__":
     print("Running FlashAttention Padding Tests...")
     print("=" * 60)

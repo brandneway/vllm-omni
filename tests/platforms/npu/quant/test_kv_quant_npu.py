@@ -99,6 +99,7 @@ class TestKVQuantNPUUnit:
     def fake_quant_ops(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         captured: dict[str, Any] = {
             "fa_calls": [],
+            "varlen_fa_calls": [],
             "npu_kwargs": None,
             "out_shape": None,
         }
@@ -106,12 +107,11 @@ class TestKVQuantNPUUnit:
         class FakeTorchNPU:
             float8_e4m3fn = "fp8_marker"
 
-            @staticmethod
-            def npu_fused_infer_attention_score_v2(q, k, v, **kwargs):
-                del q, k, v
-                captured["npu_kwargs"] = kwargs
-                out_shape = captured["out_shape"]
-                return (torch.ones(out_shape, dtype=torch.float32),)
+        def fake_fia_v2(q, k, v, **kwargs):
+            del q, k, v
+            captured["npu_kwargs"] = kwargs
+            out_shape = captured["out_shape"]
+            return (torch.ones(out_shape, dtype=torch.float32),)
 
         def fake_fa_block_quant_preprocess(x, block_size, dst_type, layout):
             captured["fa_calls"].append(
@@ -119,6 +119,17 @@ class TestKVQuantNPUUnit:
                     "block_size": block_size,
                     "layout": layout,
                     "dst_type": dst_type,
+                    "shape": tuple(x.shape),
+                }
+            )
+            scale = torch.full((1,), float(block_size), dtype=torch.float32)
+            return x, scale
+
+        def fake_fa_block_quant_preprocess_varlen(x, cu_seq_lens, block_size, dst_type):
+            captured["varlen_fa_calls"].append(
+                {
+                    "block_size": block_size,
+                    "cu_seq_lens": list(cu_seq_lens),
                     "shape": tuple(x.shape),
                 }
             )
@@ -135,7 +146,14 @@ class TestKVQuantNPUUnit:
         monkeypatch.setattr(
             kv_quant_npu,
             "_load_quant_ops",
-            lambda: (FakeTorchNPU, fake_fa_block_quant_preprocess, fake_qua_rot_mode, fake_create_rot),
+            lambda: (
+                FakeTorchNPU,
+                fake_fia_v2,
+                fake_fa_block_quant_preprocess,
+                fake_fa_block_quant_preprocess_varlen,
+                fake_qua_rot_mode,
+                fake_create_rot,
+            ),
         )
 
         return captured
@@ -186,6 +204,61 @@ class TestKVQuantNPUUnit:
         with pytest.raises(ValueError, match="unsupported layout"):
             kv_quant_npu.fp8_rotate_quant_fa(query, key, value, layout="INVALID")
 
+    def test_fp8_rotate_quant_fa_varlen_ntd_contract(self, fake_quant_ops) -> None:
+        total_len, num_heads, head_dim = 8, 2, 4
+        query = torch.randn(total_len, num_heads, head_dim, dtype=torch.float32)
+        key = torch.randn(total_len, num_heads, head_dim, dtype=torch.float32)
+        value = torch.randn(total_len, num_heads, head_dim, dtype=torch.float32)
+        cu = [5, 8]
+        # The op hands back NTD; the wrapper must normalize to the caller's TND.
+        fake_quant_ops["out_shape"] = (num_heads, total_len, head_dim)
+
+        out = kv_quant_npu.fp8_rotate_quant_fa_varlen(
+            query, key, value, cu, cu, softmax_scale=0.125
+        )
+
+        assert out.shape == query.shape
+        kwargs = fake_quant_ops["npu_kwargs"]
+        assert kwargs["input_layout"] == "NTD"
+        assert kwargs["num_query_heads"] == num_heads
+        assert kwargs["num_key_value_heads"] == num_heads
+        assert kwargs["actual_seq_qlen"] == cu
+        assert kwargs["actual_seq_kvlen"] == cu
+        assert kwargs["sparse_mode"] == 0
+        assert kwargs["query_quant_mode"] == 7
+        assert kwargs["key_quant_mode"] == 7
+        assert kwargs["value_quant_mode"] == 7
+        assert kwargs["softmax_scale"] == 0.125
+        # Varlen quantization runs on the NTD view and never crosses docs.
+        assert [call["shape"] for call in fake_quant_ops["varlen_fa_calls"]] == [
+            (num_heads, total_len, head_dim),
+            (num_heads, total_len, head_dim),
+            (num_heads, total_len, head_dim),
+        ]
+        assert [call["cu_seq_lens"] for call in fake_quant_ops["varlen_fa_calls"]] == [cu, cu, cu]
+        assert [call["block_size"] for call in fake_quant_ops["varlen_fa_calls"]] == [128, 256, 256]
+
+    def test_fp8_rotate_quant_fa_varlen_gqa_kv_heads(self, fake_quant_ops) -> None:
+        total_len, num_heads, num_kv_heads, head_dim = 8, 4, 2, 4
+        query = torch.randn(total_len, num_heads, head_dim, dtype=torch.float32)
+        key = torch.randn(total_len, num_kv_heads, head_dim, dtype=torch.float32)
+        value = torch.randn(total_len, num_kv_heads, head_dim, dtype=torch.float32)
+        fake_quant_ops["out_shape"] = (num_heads, total_len, head_dim)
+
+        out = kv_quant_npu.fp8_rotate_quant_fa_varlen(query, key, value, [8], [8])
+
+        assert out.shape == query.shape
+        assert fake_quant_ops["npu_kwargs"]["num_query_heads"] == num_heads
+        assert fake_quant_ops["npu_kwargs"]["num_key_value_heads"] == num_kv_heads
+
+    def test_fp8_rotate_quant_fa_varlen_invalid_dim_raises(self, fake_quant_ops) -> None:
+        query = torch.randn(1, 2, 3, 4, dtype=torch.float32)
+        key = torch.randn(1, 2, 3, 4, dtype=torch.float32)
+        value = torch.randn(1, 2, 3, 4, dtype=torch.float32)
+
+        with pytest.raises(ValueError, match="expected packed TND 3D tensors"):
+            kv_quant_npu.fp8_rotate_quant_fa_varlen(query, key, value, [4], [4])
+
 
 @npu_smoke
 class TestKVQuantNPUSmoke:
@@ -203,5 +276,20 @@ class TestKVQuantNPUSmoke:
         value = torch.randn(1, 2, 4, 64, dtype=torch.float16, device="npu")
 
         out = kv_quant_npu.fp8_rotate_quant_fa(query, key, value, layout="BNSD")
+        assert out.shape == query.shape
+        assert out.dtype == query.dtype
+
+    def test_fp8_rotate_quant_fa_varlen_real_npu_shape_contract(self):
+        try:
+            kv_quant_npu._load_quant_ops.cache_clear()
+            kv_quant_npu._load_quant_ops()
+        except ImportError:
+            pytest.skip("NPU quant dependencies are not fully installed.")
+
+        query = torch.randn(8, 2, 64, dtype=torch.float16, device="npu")
+        key = torch.randn(8, 2, 64, dtype=torch.float16, device="npu")
+        value = torch.randn(8, 2, 64, dtype=torch.float16, device="npu")
+
+        out = kv_quant_npu.fp8_rotate_quant_fa_varlen(query, key, value, [5, 8], [5, 8])
         assert out.shape == query.shape
         assert out.dtype == query.dtype

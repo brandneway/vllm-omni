@@ -20,8 +20,23 @@ dynamically quantized before the attention operator. It does not quantize model
 weights and is separate from [FP8 W8A8](fp8.md), [Int8 W8A8](int8.md), or
 pre-quantized checkpoint formats.
 
+On Ascend NPU the path dispatches to the MindIE-SD FIA operator in two forms:
+dense batched attention (BNSD/BSND) and **packed varlen attention** (NTD with
+`cu_seqlens` document boundaries, as emitted by MiniMax-H3 style packed
+pipelines). Both quantize Q/K/V per block (Q 128, K/V 256) to `float8_e4m3fn`.
+Varlen quantization never crosses document boundaries, and attention stays
+full (non-causal) within each document. The MindIE-SD FIA FP8 operator
+requires an FP8-capable Ascend NPU (A5 class); on other NPU generations the
+first request fails with an `aclnnDynamicBlockQuant` error.
+
 If `diffusion_kv_cache_dtype` is not set, behavior is unchanged and attention
 runs in the native dtype.
+
+When FP8 is enabled but an attention layer's packed varlen metadata does not
+match the packed contract (see `_resolve_packed_seq_npu` in
+`vllm_omni/diffusion/attention/backends/flash_attn.py`), the layer falls back
+to **unquantized** attention instead of running dense FP8 across document
+boundaries, and a warning is logged once.
 
 ## Hardware Support
 
@@ -45,6 +60,7 @@ and fall back to native dtype execution.
 | Model | Scope | Status | Notes |
 |-------|-------|--------|-------|
 | Wan2.2 | Eligible DiT full-attention FA on Ascend NPU | Tested | Compare quality and latency against a BF16 baseline before production use |
+| MiniMax-H3 | Packed varlen FA (NTD + cu_seqlens) on Ascend NPU | Experimental | Runs per-block FP8 per document via the MindIE-SD FIA operator; requires an FP8-capable NPU (A5 class). Headwise split under `MINDIE_SD_FREQ` is supported |
 | Other diffusion models | Eligible DiT full-attention FA on Ascend NPU | Not tested | You can try `diffusion_kv_cache_dtype="fp8"`; tune `diffusion_kv_cache_skip_steps` and `diffusion_kv_cache_skip_layers` when higher precision is needed |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)

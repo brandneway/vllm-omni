@@ -5,6 +5,11 @@
 Provides per-tensor dynamic quantization of Q/K/V tensors to
 float8_e4m3fn format. Designed for diffusion models where Q/K/V are
 computed fresh each forward pass (no persistent KV cache).
+
+Two entry points dispatch to the MindIE-SD FIA operator:
+``fp8_rotate_quant_fa`` for dense batched layouts (BNSD/BSND) and
+``fp8_rotate_quant_fa_varlen`` for packed varlen TND tensors with
+cu_seqlens document boundaries.
 """
 
 from __future__ import annotations
@@ -32,14 +37,25 @@ def is_quantized_kv_cache(kv_cache_dtype: str | None) -> bool:
 def _load_quant_ops():
     try:
         import torch_npu
-        from mindiesd.layers.quant.block_quant import fa_block_quant_preprocess
+        from mindiesd.layers.flash_attn.fused_infer_attention_score import fused_infer_attention_score_v2
+        from mindiesd.layers.quant.block_quant import (
+            fa_block_quant_preprocess,
+            fa_block_quant_preprocess_varlen,
+        )
         from msmodelslim.processor.quarot.common.quarot_utils import QuaRotMode, create_rot
     except ImportError as e:
         raise ImportError(
             "fp8_rotate_quant_fa requires torch_npu, MindIE-SD (mindiesd), and MSModelSlim. "
             "See https://gitcode.com/Ascend/MindIE-SD and https://gitcode.com/Ascend/msmodelslim"
         ) from e
-    return torch_npu, fa_block_quant_preprocess, QuaRotMode, create_rot
+    return (
+        torch_npu,
+        fused_infer_attention_score_v2,
+        fa_block_quant_preprocess,
+        fa_block_quant_preprocess_varlen,
+        QuaRotMode,
+        create_rot,
+    )
 
 
 def _get_rot_matrix(
@@ -78,7 +94,7 @@ def fp8_rotate_quant_fa(
     Returns:
         Attention output in the same layout as inputs.
     """
-    torch_npu, fa_block_quant_preprocess, qua_rot_mode, create_rot = _load_quant_ops()
+    torch_npu, fia_v2, fa_block_quant_preprocess, _varlen_quant, qua_rot_mode, create_rot = _load_quant_ops()
 
     out_dtype = query.dtype
     device = query.device
@@ -100,7 +116,7 @@ def fp8_rotate_quant_fa(
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(d)
 
-    out = torch_npu.npu_fused_infer_attention_score_v2(
+    out = fia_v2(
         q,
         k,
         v,
@@ -125,3 +141,92 @@ def fp8_rotate_quant_fa(
             out = out[:, :s, :, :]
 
     return out
+
+
+def fp8_rotate_quant_fa_varlen(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens_q: list[int],
+    cu_seqlens_k: list[int],
+    *,
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    """Run packed varlen NPU fused attention with dynamic FP8 Q/K/V.
+
+    Inputs are packed TND ``(total_tokens, num_heads, head_dim)`` tensors.
+    ``cu_seqlens_q``/``cu_seqlens_k`` are host lists of cumulative document
+    ends (``[doc1_end, doc2_end, ...]``); documents attend fully within
+    themselves and never across boundaries (non-causal varlen semantics,
+    matching mindiesd ``attention_forward_varlen``).
+
+    The TND tensors are viewed as NTD for the MindIE-SD FIA operator (the
+    only varlen layout its FP8 per-block path accepts) and quantized with
+    :func:`fa_block_quant_preprocess_varlen` so quantization blocks never
+    cross document boundaries.
+
+    Returns the attention output in the same TND layout as the inputs.
+    """
+    torch_npu, fia_v2, _dense_quant, fa_block_quant_preprocess_varlen, qua_rot_mode, create_rot = _load_quant_ops()
+
+    if query.dim() != 3 or key.dim() != 3 or value.dim() != 3:
+        raise ValueError(
+            f"fp8_rotate_quant_fa_varlen: expected packed TND 3D tensors, got "
+            f"{query.dim()}D/{key.dim()}D/{value.dim()}D."
+        )
+    total_len, num_heads, head_dim = query.shape
+    num_kv_heads = key.shape[1]
+    out_dtype = query.dtype
+    device = query.device
+
+    rot = _get_rot_matrix(device, query.dtype, head_dim, qua_rot_mode, create_rot)
+    q_f = torch.matmul(query, rot)
+    k_f = torch.matmul(key, rot)
+
+    # TND -> NTD view: [N, T, D] is the FIA varlen layout and matches the
+    # [N, S, D] expectation of the block-quant kernel.
+    q_ntd = q_f.transpose(0, 1)
+    k_ntd = k_f.transpose(0, 1)
+    v_ntd = value.transpose(0, 1)
+
+    q, q_scale = fa_block_quant_preprocess_varlen(
+        q_ntd, cu_seqlens_q, block_size=128, dst_type=torch_npu.float8_e4m3fn
+    )
+    k, k_scale = fa_block_quant_preprocess_varlen(
+        k_ntd, cu_seqlens_k, block_size=256, dst_type=torch_npu.float8_e4m3fn
+    )
+    v, v_scale = fa_block_quant_preprocess_varlen(
+        v_ntd, cu_seqlens_k, block_size=256, dst_type=torch_npu.float8_e4m3fn
+    )
+
+    scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
+
+    out = fia_v2(
+        q,
+        k,
+        v,
+        input_layout="NTD",
+        num_query_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        softmax_scale=scale,
+        pre_tokens=2147483647,  # INT32_MAX: full attention within each document.
+        next_tokens=2147483647,
+        sparse_mode=0,
+        actual_seq_qlen=list(cu_seqlens_q),
+        actual_seq_kvlen=list(cu_seqlens_k),
+        query_quant_mode=7,
+        key_quant_mode=7,
+        value_quant_mode=7,
+        dequant_scale_query=q_scale,
+        dequant_scale_key=k_scale,
+        dequant_scale_value=v_scale,
+        out_dtype=out_dtype,
+    )[0]
+
+    # The op may hand back either [N, T, D] or a token-major [T, N, D];
+    # normalize to the caller's TND layout.
+    if out.shape[0] == num_heads and out.shape[0] != out.shape[1]:
+        out = out.transpose(0, 1)
+    if out.shape[0] != total_len:
+        out = out[:total_len]
+    return out.contiguous()
