@@ -251,6 +251,26 @@ class TestKVQuantNPUUnit:
         assert fake_quant_ops["npu_kwargs"]["num_query_heads"] == num_heads
         assert fake_quant_ops["npu_kwargs"]["num_key_value_heads"] == num_kv_heads
 
+    def test_fp8_rotate_quant_fa_varlen_strips_leading_zero_cu(self, fake_quant_ops) -> None:
+        """Regression: callers pass cu_seqlens with a leading zero; the op
+        contract (actual_seq = cu[1:]) must receive the stripped ends."""
+        total_len, num_heads, head_dim = 26, 2, 4
+        query = torch.randn(total_len, num_heads, head_dim, dtype=torch.float32)
+        key = torch.randn(total_len, num_heads, head_dim, dtype=torch.float32)
+        value = torch.randn(total_len, num_heads, head_dim, dtype=torch.float32)
+        fake_quant_ops["out_shape"] = (num_heads, total_len, head_dim)
+
+        out = kv_quant_npu.fp8_rotate_quant_fa_varlen(query, key, value, [0, total_len], [0, total_len])
+
+        assert out.shape == query.shape
+        assert fake_quant_ops["npu_kwargs"]["actual_seq_qlen"] == [total_len]
+        assert fake_quant_ops["npu_kwargs"]["actual_seq_kvlen"] == [total_len]
+        assert [call["cu_seq_lens"] for call in fake_quant_ops["varlen_fa_calls"]] == [
+            [total_len],
+            [total_len],
+            [total_len],
+        ]
+
     def test_fp8_rotate_quant_fa_varlen_invalid_dim_raises(self, fake_quant_ops) -> None:
         query = torch.randn(1, 2, 3, 4, dtype=torch.float32)
         key = torch.randn(1, 2, 3, 4, dtype=torch.float32)

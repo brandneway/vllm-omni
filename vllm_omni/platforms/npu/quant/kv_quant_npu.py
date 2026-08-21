@@ -156,9 +156,10 @@ def fp8_rotate_quant_fa_varlen(
 
     Inputs are packed TND ``(total_tokens, num_heads, head_dim)`` tensors.
     ``cu_seqlens_q``/``cu_seqlens_k`` are host lists of cumulative document
-    ends (``[doc1_end, doc2_end, ...]``); documents attend fully within
-    themselves and never across boundaries (non-causal varlen semantics,
-    matching mindiesd ``attention_forward_varlen``).
+    ends (``[doc1_end, doc2_end, ...]``); a cu_seqlens-style leading zero is
+    accepted and stripped. Documents attend fully within themselves and
+    never across boundaries (non-causal varlen semantics, matching mindiesd
+    ``attention_forward_varlen``).
 
     The TND tensors are viewed as NTD for the MindIE-SD FIA operator (the
     only varlen layout its FP8 per-block path accepts) and quantized with
@@ -174,6 +175,14 @@ def fp8_rotate_quant_fa_varlen(
             f"fp8_rotate_quant_fa_varlen: expected packed TND 3D tensors, got "
             f"{query.dim()}D/{key.dim()}D/{value.dim()}D."
         )
+    # Normalize to per-document cumulative ends: the op contract is
+    # actual_seq = cu_seqlens[1:], so strip a leading zero when present.
+    ends_q = list(cu_seqlens_q)
+    ends_k = list(cu_seqlens_k)
+    if ends_q and ends_q[0] == 0:
+        ends_q = ends_q[1:]
+    if ends_k and ends_k[0] == 0:
+        ends_k = ends_k[1:]
     total_len, num_heads, head_dim = query.shape
     num_kv_heads = key.shape[1]
     out_dtype = query.dtype
@@ -190,13 +199,13 @@ def fp8_rotate_quant_fa_varlen(
     v_ntd = value.transpose(0, 1)
 
     q, q_scale = fa_block_quant_preprocess_varlen(
-        q_ntd, cu_seqlens_q, block_size=128, dst_type=torch_npu.float8_e4m3fn
+        q_ntd, ends_q, block_size=128, dst_type=torch_npu.float8_e4m3fn
     )
     k, k_scale = fa_block_quant_preprocess_varlen(
-        k_ntd, cu_seqlens_k, block_size=256, dst_type=torch_npu.float8_e4m3fn
+        k_ntd, ends_k, block_size=256, dst_type=torch_npu.float8_e4m3fn
     )
     v, v_scale = fa_block_quant_preprocess_varlen(
-        v_ntd, cu_seqlens_k, block_size=256, dst_type=torch_npu.float8_e4m3fn
+        v_ntd, ends_k, block_size=256, dst_type=torch_npu.float8_e4m3fn
     )
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
@@ -212,8 +221,8 @@ def fp8_rotate_quant_fa_varlen(
         pre_tokens=2147483647,  # INT32_MAX: full attention within each document.
         next_tokens=2147483647,
         sparse_mode=0,
-        actual_seq_qlen=list(cu_seqlens_q),
-        actual_seq_kvlen=list(cu_seqlens_k),
+        actual_seq_qlen=list(ends_q),
+        actual_seq_kvlen=list(ends_k),
         query_quant_mode=7,
         key_quant_mode=7,
         value_quant_mode=7,
