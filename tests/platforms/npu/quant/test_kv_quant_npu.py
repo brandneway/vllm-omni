@@ -219,7 +219,7 @@ class TestKVQuantNPUUnit:
 
         assert out.shape == query.shape
         kwargs = fake_quant_ops["npu_kwargs"]
-        assert kwargs["input_layout"] == "NTD"
+        assert kwargs["input_layout"] == "NTD_TND"
         assert kwargs["num_query_heads"] == num_heads
         assert kwargs["num_key_value_heads"] == num_heads
         assert kwargs["actual_seq_qlen"] == cu

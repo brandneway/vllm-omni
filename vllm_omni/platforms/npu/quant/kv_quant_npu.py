@@ -161,10 +161,11 @@ def fp8_rotate_quant_fa_varlen(
     never across boundaries (non-causal varlen semantics, matching mindiesd
     ``attention_forward_varlen``).
 
-    The TND tensors are viewed as NTD for the MindIE-SD FIA operator (the
-    only varlen layout its FP8 per-block path accepts) and quantized with
-    :func:`fa_block_quant_preprocess_varlen` so quantization blocks never
-    cross document boundaries.
+    The TND tensors are viewed as NTD and dispatched with the combined
+    ``NTD_TND`` layout (NTD query packing, token-major TND output) — the
+    only varlen form the MindIE-SD FIA operator's FP8 per-block path accepts
+    — and quantized with :func:`fa_block_quant_preprocess_varlen` so
+    quantization blocks never cross document boundaries.
 
     Returns the attention output in the same TND layout as the inputs.
     """
@@ -214,7 +215,7 @@ def fp8_rotate_quant_fa_varlen(
         q,
         k,
         v,
-        input_layout="NTD",
+        input_layout="NTD_TND",  # NTD query packing, token-major TND output
         num_query_heads=num_heads,
         num_key_value_heads=num_kv_heads,
         softmax_scale=scale,
