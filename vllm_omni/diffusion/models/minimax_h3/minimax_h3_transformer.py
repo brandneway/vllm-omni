@@ -405,6 +405,10 @@ class MiniMaxH3Attention(nn.Module):
             role=role,
             role_category=role_category,
             skip_sequence_parallel=skip_sequence_parallel,
+            # FP8 FA targets the core DiT blocks only: the token refiner runs
+            # on short replicated text rows (tiny packed T) where block FP8
+            # buys nothing, so opt it out of kv quantization.
+            disable_kv_quant=role == "minimax_h3.token_refiner",
             prefix=prefix,
         )
 
