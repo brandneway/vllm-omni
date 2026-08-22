@@ -199,13 +199,13 @@ def fp8_rotate_quant_fa_varlen(
     k_ntd = k_f.transpose(0, 1)
     v_ntd = value.transpose(0, 1)
 
-    q, q_scale = fa_block_quant_preprocess_varlen(
+    q, q_scale, q_aligned_ends = fa_block_quant_preprocess_varlen(
         q_ntd, ends_q, block_size=128, dst_type=torch_npu.float8_e4m3fn
     )
-    k, k_scale = fa_block_quant_preprocess_varlen(
+    k, k_scale, kv_aligned_ends = fa_block_quant_preprocess_varlen(
         k_ntd, ends_k, block_size=256, dst_type=torch_npu.float8_e4m3fn
     )
-    v, v_scale = fa_block_quant_preprocess_varlen(
+    v, v_scale, _ = fa_block_quant_preprocess_varlen(
         v_ntd, ends_k, block_size=256, dst_type=torch_npu.float8_e4m3fn
     )
 
@@ -222,8 +222,8 @@ def fp8_rotate_quant_fa_varlen(
         pre_tokens=2147483647,  # INT32_MAX: full attention within each document.
         next_tokens=2147483647,
         sparse_mode=0,
-        actual_seq_qlen=list(ends_q),
-        actual_seq_kvlen=list(ends_k),
+        actual_seq_qlen=list(q_aligned_ends),
+        actual_seq_kvlen=list(kv_aligned_ends),
         query_quant_mode=7,
         key_quant_mode=7,
         value_quant_mode=7,
@@ -234,9 +234,18 @@ def fp8_rotate_quant_fa_varlen(
     )[0]
 
     # The op may hand back either [N, T, D] or a token-major [T, N, D];
-    # normalize to the caller's TND layout.
+    # normalize to token-major first.
     if out.shape[0] == num_heads and out.shape[0] != out.shape[1]:
         out = out.transpose(0, 1)
-    if out.shape[0] != total_len:
-        out = out[:total_len]
+    # Documents were padded to block multiples inside the packing; gather the
+    # real rows of each document back into the original packed layout.
+    real_starts = [0, *ends_q[:-1]]
+    aligned_starts = [0, *q_aligned_ends[:-1]]
+    out = torch.cat(
+        [
+            out[a : a + (e - s)]
+            for (s, e), a in zip(zip(real_starts, ends_q), aligned_starts)
+        ],
+        dim=0,
+    )
     return out.contiguous()

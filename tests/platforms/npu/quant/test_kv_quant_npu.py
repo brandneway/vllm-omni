@@ -134,7 +134,14 @@ class TestKVQuantNPUUnit:
                 }
             )
             scale = torch.full((1,), float(block_size), dtype=torch.float32)
-            return x, scale
+            aligned = []
+            acc = 0
+            prev = 0
+            for end in cu_seq_lens:
+                acc += (end - prev + block_size - 1) // block_size * block_size
+                prev = end
+                aligned.append(acc)
+            return x, scale, aligned
 
         fake_qua_rot_mode = SimpleNamespace(HADAMARD="hadamard")
 
@@ -210,8 +217,9 @@ class TestKVQuantNPUUnit:
         key = torch.randn(total_len, num_heads, head_dim, dtype=torch.float32)
         value = torch.randn(total_len, num_heads, head_dim, dtype=torch.float32)
         cu = [5, 8]
-        # The op hands back NTD; the wrapper must normalize to the caller's TND.
-        fake_quant_ops["out_shape"] = (num_heads, total_len, head_dim)
+        # Docs pad to 128 (q) / 256 (kv) multiples: q aligned total 256, kv 512.
+        # The op hands back [N, T, D]; the wrapper transposes and gathers.
+        fake_quant_ops["out_shape"] = (num_heads, 256, head_dim)
 
         out = kv_quant_npu.fp8_rotate_quant_fa_varlen(
             query, key, value, cu, cu, softmax_scale=0.125
@@ -222,8 +230,8 @@ class TestKVQuantNPUUnit:
         assert kwargs["input_layout"] == "NTD_TND"
         assert kwargs["num_query_heads"] == num_heads
         assert kwargs["num_key_value_heads"] == num_heads
-        assert kwargs["actual_seq_qlen"] == cu
-        assert kwargs["actual_seq_kvlen"] == cu
+        assert kwargs["actual_seq_qlen"] == [128, 256]
+        assert kwargs["actual_seq_kvlen"] == [256, 512]
         assert kwargs["sparse_mode"] == 0
         assert kwargs["query_quant_mode"] == 7
         assert kwargs["key_quant_mode"] == 7
@@ -243,7 +251,7 @@ class TestKVQuantNPUUnit:
         query = torch.randn(total_len, num_heads, head_dim, dtype=torch.float32)
         key = torch.randn(total_len, num_kv_heads, head_dim, dtype=torch.float32)
         value = torch.randn(total_len, num_kv_heads, head_dim, dtype=torch.float32)
-        fake_quant_ops["out_shape"] = (num_heads, total_len, head_dim)
+        fake_quant_ops["out_shape"] = (num_heads, 128, head_dim)
 
         out = kv_quant_npu.fp8_rotate_quant_fa_varlen(query, key, value, [8], [8])
 
@@ -258,13 +266,13 @@ class TestKVQuantNPUUnit:
         query = torch.randn(total_len, num_heads, head_dim, dtype=torch.float32)
         key = torch.randn(total_len, num_heads, head_dim, dtype=torch.float32)
         value = torch.randn(total_len, num_heads, head_dim, dtype=torch.float32)
-        fake_quant_ops["out_shape"] = (num_heads, total_len, head_dim)
+        fake_quant_ops["out_shape"] = (num_heads, 128, head_dim)
 
         out = kv_quant_npu.fp8_rotate_quant_fa_varlen(query, key, value, [0, total_len], [0, total_len])
 
         assert out.shape == query.shape
-        assert fake_quant_ops["npu_kwargs"]["actual_seq_qlen"] == [total_len]
-        assert fake_quant_ops["npu_kwargs"]["actual_seq_kvlen"] == [total_len]
+        assert fake_quant_ops["npu_kwargs"]["actual_seq_qlen"] == [128]
+        assert fake_quant_ops["npu_kwargs"]["actual_seq_kvlen"] == [256]
         assert [call["cu_seq_lens"] for call in fake_quant_ops["varlen_fa_calls"]] == [
             [total_len],
             [total_len],
