@@ -24,6 +24,7 @@ from vllm_omni.diffusion.distributed.parallel_state import get_world_group
 from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
 
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .vae_processor_fastpath import apply_vae_processor_fastpath
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
@@ -137,6 +138,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 pin_memory=True,
             )
         self.model = self.remote.model
+        # The checkpoint's processor stages pixels on the host; swap in the
+        # device-side fast paths (uint8-first H2D, in-place clamp) without
+        # touching the trust_remote_code files in the checkpoint directory.
+        apply_vae_processor_fastpath(getattr(self.model, "processor", None))
         self.use_tiling = True
         self.use_slicing = False
         self.parallel_size = 1
