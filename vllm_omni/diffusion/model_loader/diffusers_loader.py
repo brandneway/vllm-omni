@@ -587,18 +587,22 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                             planned_weights=self.host_weight_plan.bindings,
                         )
                 else:
-                    if _dist_offload and _use_ag and _has_online_quant:
+                    if _dist_offload and _use_ag and _dlo_group_size > 1 and _has_online_quant:
+                        # An effective DLO group size of one performs no weight
+                        # collective, so the AllGather layout allowlist does not
+                        # apply there even with dlo_use_allgather=True.
                         unsupported_methods = self._unsupported_dlo_allgather_online_quant_methods(model)
                         if unsupported_methods:
                             raise ValueError(
                                 "DLO+AllGather supports online quantization only for "
-                                "per-tensor FP8 linears; unsupported online methods: "
-                                f"{', '.join(unsupported_methods)}. Please use "
+                                "per-tensor FP8 and INT8 linears; unsupported online "
+                                f"methods: {', '.join(unsupported_methods)}. Please use "
                                 "--dlo-no-use-allgather or disable online quantization."
                             )
                         logger.info(
-                            "Online per-tensor FP8 with DLO+AllGather: using the "
-                            "ordinary loader before sharding finalized weights and scales"
+                            "Validated online methods (per-tensor FP8, INT8) with "
+                            "DLO+AllGather: using the ordinary loader before sharding "
+                            "finalized weights and scales"
                         )
                     if _dist_offload and plan_result is not None:
                         logger.info(
@@ -694,14 +698,30 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
     def _unsupported_dlo_allgather_online_quant_methods(model: nn.Module) -> tuple[str, ...]:
         """Return unsupported online-quant methods for DLO AllGather.
 
-        Per-tensor online FP8 is safe after the ordinary loader has finalized
-        its weight and scale parameters. DLO shards those runtime tensors by
-        dtype and reconstructs their recorded shapes and strides before the
-        kernel consumes them. Other online methods may create different scale,
-        packing, or aliasing layouts and remain fail-closed until validated.
+        Per-tensor online FP8 and online INT8 are safe after the ordinary
+        loader has finalized their weight and scale parameters. DLO shards
+        those runtime tensors by dtype and reconstructs their recorded shapes
+        and strides before the kernel consumes them. Online INT8 keeps plain
+        transportable dtypes (int8 weight plus fp32 scale) with either a
+        contiguous (NPU, pre-transposed (K, N)) or a transposed-view (CUDA,
+        stride (1, K)) weight, both already covered by the physical-order
+        packing that online FP8 requires. Other online methods may create
+        different scale, packing, or aliasing layouts (e.g. NPU-private
+        e8m0/fp4 scale dtypes, swizzled or NZ hardware formats) and remain
+        fail-closed until validated.
         """
         from vllm.model_executor.layers.quantization.online.fp8 import (
             Fp8PerTensorOnlineLinearMethod,
+        )
+        from vllm_omni.quantization.int8_config import (
+            Int8OnlineLinearMethod,
+            NPUInt8OnlineLinearMethod,
+        )
+
+        allowed_online_methods: tuple[type, ...] = (
+            Fp8PerTensorOnlineLinearMethod,
+            Int8OnlineLinearMethod,
+            NPUInt8OnlineLinearMethod,
         )
 
         unsupported: set[str] = set()
@@ -709,7 +729,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             quant_method = getattr(module, "quant_method", None)
             if not getattr(quant_method, "uses_meta_device", False):
                 continue
-            if not isinstance(quant_method, Fp8PerTensorOnlineLinearMethod):
+            if not isinstance(quant_method, allowed_online_methods):
                 unsupported.add(type(quant_method).__name__)
         return tuple(sorted(unsupported))
 
