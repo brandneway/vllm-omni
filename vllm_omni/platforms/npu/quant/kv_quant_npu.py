@@ -84,8 +84,15 @@ def _load_quant_ops():
     )
 
 
-# Dedicated stream and reused events for AI-core frequency regulation
-# (FLUX-style device-side ordering; created lazily on first use).
+@lru_cache(maxsize=1)
+def _freq_stream_mode() -> bool:
+    """Truthy MINDIESD_SET_FREQ_STREAM dispatches the op on a dedicated stream."""
+    enabled = os.environ.get("MINDIESD_SET_FREQ_STREAM", "false").strip().lower()
+    return enabled in ("1", "true", "yes", "on")
+
+
+# Dedicated stream and reused events for the opt-in stream dispatch mode
+# (created lazily on first use).
 _FREQ_STREAM: torch.npu.Stream | None = None
 _FREQ_COMPUTE_DONE: torch.npu.Event | None = None  # compute stream → freq stream
 _FREQ_REG_DONE: torch.npu.Event | None = None  # freq stream → compute stream
@@ -101,17 +108,22 @@ def _get_freq_stream() -> tuple[torch.npu.Stream, torch.npu.Event, torch.npu.Eve
 
 
 def _freq_cap_before_fia(frequency_regulator, freq: int) -> None:
-    """Cap the AI-core frequency on a dedicated stream, ordered before FIA.
+    """Cap the AI-core frequency before the FIA call.
 
-    The aclnn op's host-side executor runs on a background AICPU thread that
-    outlives the dispatch, and its storage block is reclaimed by the stream
-    completion callback while that thread may still reference it. Dispatching
-    on a dedicated stream keeps (a) the host non-blocking — ordering with the
-    compute stream is enforced device-side with events — and (b) the block in
-    the dedicated stream's allocator pool, where compute-stream allocations
-    never reuse it; only the next frequency call, a full attention layer
-    later, can.
+    Default dispatch is a plain call on the compute stream: the op-side
+    lifetime fix keeps the async executor's storage alive, and the kernel
+    serializes with the surrounding compute work. The op enqueues its kernel
+    from a background AICPU thread, so exact enqueue position is not
+    guaranteed — acceptable for a power knob.
+
+    With MINDIESD_SET_FREQ_STREAM truthy, dispatch on a dedicated stream
+    instead (host never blocks; ordering enforced device-side with events),
+    which lets the frequency kernel run concurrently with compute-stream
+    work.
     """
+    if not _freq_stream_mode():
+        frequency_regulator(freq)
+        return
     stream, compute_done, reg_done = _get_freq_stream()
     cur = torch.npu.current_stream()
     compute_done.record(cur)  # engage the cap only after current compute work
@@ -123,7 +135,10 @@ def _freq_cap_before_fia(frequency_regulator, freq: int) -> None:
 
 
 def _freq_restore_after_fia(frequency_regulator, freq: int) -> None:
-    """Restore the AI-core frequency on the dedicated stream, after FIA."""
+    """Restore the AI-core frequency after the FIA call."""
+    if not _freq_stream_mode():
+        frequency_regulator(freq)
+        return
     stream, compute_done, _ = _get_freq_stream()
     cur = torch.npu.current_stream()
     compute_done.record(cur)  # restore only once the FIA work has completed
@@ -245,9 +260,9 @@ def fp8_rotate_quant_fa_varlen(
 
     When MINDIESD_SET_FREQ_MANUAL is truthy, the AI-core frequency is
     capped to 1400 MHz before the FIA call and restored to 1650 MHz after
-    via mindiesd ``frequency_regulator`` dispatched on a dedicated stream
-    with event-based ordering, to keep the FIA compute burst inside the NPU
-    power envelope.
+    via mindiesd ``frequency_regulator`` (dispatched on the compute stream;
+    set MINDIESD_SET_FREQ_STREAM for a dedicated-stream dispatch), to keep
+    the FIA compute burst inside the NPU power envelope.
 
     Returns the attention output in the same TND layout as the inputs.
     """

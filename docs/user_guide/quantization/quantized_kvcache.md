@@ -60,7 +60,7 @@ and fall back to native dtype execution.
 | Model | Scope | Status | Notes |
 |-------|-------|--------|-------|
 | Wan2.2 | Eligible DiT full-attention FA on Ascend NPU | Tested | Compare quality and latency against a BF16 baseline before production use |
-| MiniMax-H3 | Packed varlen FA (NTD + cu_seqlens) on Ascend NPU | Experimental | Runs per-block FP8 per document via the MindIE-SD FIA operator; requires an FP8-capable NPU (A5 class). `MINDIESD_SET_FREQ_MANUAL=true` caps the AI-core frequency to 1400 MHz around each FIA call and restores 1650 MHz after |
+| MiniMax-H3 | Packed varlen FA (NTD + cu_seqlens) on Ascend NPU | Experimental | Runs per-block FP8 per document via the MindIE-SD FIA operator; requires an FP8-capable NPU (A5 class). `MINDIESD_SET_FREQ_MANUAL=true` caps the AI-core frequency to 1400 MHz around each FIA call and restores 1650 MHz after; `MINDIESD_SET_FREQ_STREAM=true` additionally dispatches the regulator on a dedicated stream |
 | Other diffusion models | Eligible DiT full-attention FA on Ascend NPU | Not tested | You can try `diffusion_kv_cache_dtype="fp8"`; tune `diffusion_kv_cache_skip_steps` and `diffusion_kv_cache_skip_layers` when higher precision is needed |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
