@@ -113,6 +113,10 @@ class TestKVQuantNPUUnit:
             out_shape = captured["out_shape"]
             return (torch.ones(out_shape, dtype=torch.float32),)
 
+        def fake_frequency_regulator(freq: int):
+            del freq
+            return torch.empty((1,), dtype=torch.int64)
+
         def fake_fa_block_quant_preprocess(x, block_size, dst_type, layout):
             captured["fa_calls"].append(
                 {
@@ -160,6 +164,7 @@ class TestKVQuantNPUUnit:
                 fake_fa_block_quant_preprocess_varlen,
                 fake_qua_rot_mode,
                 fake_create_rot,
+                fake_frequency_regulator,
             ),
         )
 

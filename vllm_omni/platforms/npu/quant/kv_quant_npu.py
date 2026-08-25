@@ -9,12 +9,15 @@ computed fresh each forward pass (no persistent KV cache).
 Two entry points dispatch to the MindIE-SD FIA operator:
 ``fp8_rotate_quant_fa`` for dense batched layouts (BNSD/BSND) and
 ``fp8_rotate_quant_fa_varlen`` for packed varlen TND tensors with
-cu_seqlens document boundaries.
+cu_seqlens document boundaries. Setting ``MINDIESD_SET_FREQ_MANUAL`` to
+a truthy value caps the AI-core frequency around the varlen FIA call
+via mindiesd ``frequency_regulator``.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import threading
 from functools import lru_cache
 
@@ -27,6 +30,14 @@ _ROT_MATRIX_LOCK = threading.Lock()
 
 _FP8_KV_LABELS = frozenset({"fp8"})
 
+# AI-core frequency caps (MHz) applied around the varlen FIA call when
+# MINDIESD_SET_FREQ_MANUAL is truthy: one wide-head_num FIA call is a burst
+# of instantaneous compute that can trip NPU power management into
+# downclocking the chip. Capping the frequency before the call keeps the
+# burst inside the power envelope; the cap is lifted right after.
+_FREQ_CAP_BEFORE_VARLEN_FIA = 1400
+_FREQ_RESTORE_AFTER_VARLEN_FIA = 1650
+
 
 def is_quantized_kv_cache(kv_cache_dtype: str | None) -> bool:
     """True if config requests FP8-style KV / QKV quantization for the NPU FA path."""
@@ -34,9 +45,23 @@ def is_quantized_kv_cache(kv_cache_dtype: str | None) -> bool:
 
 
 @lru_cache(maxsize=1)
+def _varlen_freq_caps() -> tuple[int | None, int | None]:
+    """(before, after) AI-core frequency caps for the varlen FIA call.
+
+    Returns (None, None) unless MINDIESD_SET_FREQ_MANUAL is truthy
+    (``1``/``true``/``yes``/``on``). The env var is read once per process.
+    """
+    enabled = os.environ.get("MINDIESD_SET_FREQ_MANUAL", "false").strip().lower()
+    if enabled in ("1", "true", "yes", "on"):
+        return _FREQ_CAP_BEFORE_VARLEN_FIA, _FREQ_RESTORE_AFTER_VARLEN_FIA
+    return None, None
+
+
+@lru_cache(maxsize=1)
 def _load_quant_ops():
     try:
         import torch_npu
+        from mindiesd import frequency_regulator
         from mindiesd.layers.flash_attn.fused_infer_attention_score import fused_infer_attention_score_v2
         from mindiesd.layers.quant.block_quant import (
             fa_block_quant_preprocess,
@@ -55,7 +80,56 @@ def _load_quant_ops():
         fa_block_quant_preprocess_varlen,
         QuaRotMode,
         create_rot,
+        frequency_regulator,
     )
+
+
+# Dedicated stream and reused events for AI-core frequency regulation
+# (FLUX-style device-side ordering; created lazily on first use).
+_FREQ_STREAM: torch.npu.Stream | None = None
+_FREQ_COMPUTE_DONE: torch.npu.Event | None = None  # compute stream → freq stream
+_FREQ_REG_DONE: torch.npu.Event | None = None  # freq stream → compute stream
+
+
+def _get_freq_stream() -> tuple[torch.npu.Stream, torch.npu.Event, torch.npu.Event]:
+    global _FREQ_STREAM, _FREQ_COMPUTE_DONE, _FREQ_REG_DONE
+    if _FREQ_STREAM is None:
+        _FREQ_STREAM = torch.npu.Stream()
+        _FREQ_COMPUTE_DONE = torch.npu.Event()
+        _FREQ_REG_DONE = torch.npu.Event()
+    return _FREQ_STREAM, _FREQ_COMPUTE_DONE, _FREQ_REG_DONE
+
+
+def _freq_cap_before_fia(frequency_regulator, freq: int) -> None:
+    """Cap the AI-core frequency on a dedicated stream, ordered before FIA.
+
+    The aclnn op's host-side executor runs on a background AICPU thread that
+    outlives the dispatch, and its storage block is reclaimed by the stream
+    completion callback while that thread may still reference it. Dispatching
+    on a dedicated stream keeps (a) the host non-blocking — ordering with the
+    compute stream is enforced device-side with events — and (b) the block in
+    the dedicated stream's allocator pool, where compute-stream allocations
+    never reuse it; only the next frequency call, a full attention layer
+    later, can.
+    """
+    stream, compute_done, reg_done = _get_freq_stream()
+    cur = torch.npu.current_stream()
+    compute_done.record(cur)  # engage the cap only after current compute work
+    stream.wait_event(compute_done)
+    with torch.npu.stream(stream):
+        frequency_regulator(freq)
+    reg_done.record(stream)
+    cur.wait_event(reg_done)  # the following FIA waits until the cap is set
+
+
+def _freq_restore_after_fia(frequency_regulator, freq: int) -> None:
+    """Restore the AI-core frequency on the dedicated stream, after FIA."""
+    stream, compute_done, _ = _get_freq_stream()
+    cur = torch.npu.current_stream()
+    compute_done.record(cur)  # restore only once the FIA work has completed
+    stream.wait_event(compute_done)
+    with torch.npu.stream(stream):
+        frequency_regulator(freq)
 
 
 def _get_rot_matrix(
@@ -94,7 +168,9 @@ def fp8_rotate_quant_fa(
     Returns:
         Attention output in the same layout as inputs.
     """
-    torch_npu, fia_v2, fa_block_quant_preprocess, _varlen_quant, qua_rot_mode, create_rot = _load_quant_ops()
+    torch_npu, fia_v2, fa_block_quant_preprocess, _varlen_quant, qua_rot_mode, create_rot, _frequency_regulator = (
+        _load_quant_ops()
+    )
 
     out_dtype = query.dtype
     device = query.device
@@ -167,9 +243,23 @@ def fp8_rotate_quant_fa_varlen(
     — and quantized with :func:`fa_block_quant_preprocess_varlen` so
     quantization blocks never cross document boundaries.
 
+    When MINDIESD_SET_FREQ_MANUAL is truthy, the AI-core frequency is
+    capped to 1400 MHz before the FIA call and restored to 1650 MHz after
+    via mindiesd ``frequency_regulator`` dispatched on a dedicated stream
+    with event-based ordering, to keep the FIA compute burst inside the NPU
+    power envelope.
+
     Returns the attention output in the same TND layout as the inputs.
     """
-    torch_npu, fia_v2, _dense_quant, fa_block_quant_preprocess_varlen, qua_rot_mode, create_rot = _load_quant_ops()
+    (
+        torch_npu,
+        fia_v2,
+        _dense_quant,
+        fa_block_quant_preprocess_varlen,
+        qua_rot_mode,
+        create_rot,
+        frequency_regulator,
+    ) = _load_quant_ops()
 
     if query.dim() != 3 or key.dim() != 3 or value.dim() != 3:
         raise ValueError(
@@ -211,6 +301,9 @@ def fp8_rotate_quant_fa_varlen(
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
 
+    freq_cap, freq_restore = _varlen_freq_caps()
+    if freq_cap is not None:
+        _freq_cap_before_fia(frequency_regulator, freq_cap)
     out = fia_v2(
         q,
         k,
@@ -232,6 +325,8 @@ def fp8_rotate_quant_fa_varlen(
         dequant_scale_value=v_scale,
         out_dtype=out_dtype,
     )[0]
+    if freq_restore is not None:
+        _freq_restore_after_fia(frequency_regulator, freq_restore)
 
     # The op may hand back either [N, T, D] or a token-major [T, N, D];
     # normalize to token-major first.
