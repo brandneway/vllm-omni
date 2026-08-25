@@ -112,20 +112,23 @@ def _freq_sync_mode() -> bool:
     return enabled in ("1", "true", "yes", "on")
 
 
-# Dedicated stream and reused events for the opt-in stream dispatch mode
-# (created lazily on first use).
+# Dedicated stream, its reusable stream context, and reused events for the
+# opt-in stream dispatch mode — all created lazily exactly once per process;
+# per-call work is only the context enter/exit and event record/wait.
 _FREQ_STREAM: torch.npu.Stream | None = None
+_FREQ_STREAM_CTX = None  # torch.npu.stream(_FREQ_STREAM), reusable
 _FREQ_COMPUTE_DONE: torch.npu.Event | None = None  # compute stream → freq stream
 _FREQ_REG_DONE: torch.npu.Event | None = None  # freq stream → compute stream
 
 
-def _get_freq_stream() -> tuple[torch.npu.Stream, torch.npu.Event, torch.npu.Event]:
-    global _FREQ_STREAM, _FREQ_COMPUTE_DONE, _FREQ_REG_DONE
+def _get_freq_stream() -> tuple[torch.npu.Stream, object, torch.npu.Event, torch.npu.Event]:
+    global _FREQ_STREAM, _FREQ_STREAM_CTX, _FREQ_COMPUTE_DONE, _FREQ_REG_DONE
     if _FREQ_STREAM is None:
         _FREQ_STREAM = torch.npu.Stream()
+        _FREQ_STREAM_CTX = torch.npu.stream(_FREQ_STREAM)
         _FREQ_COMPUTE_DONE = torch.npu.Event()
         _FREQ_REG_DONE = torch.npu.Event()
-    return _FREQ_STREAM, _FREQ_COMPUTE_DONE, _FREQ_REG_DONE
+    return _FREQ_STREAM, _FREQ_STREAM_CTX, _FREQ_COMPUTE_DONE, _FREQ_REG_DONE
 
 
 def _freq_cap_before_fia(frequency_regulator, freq: int) -> None:
@@ -149,13 +152,13 @@ def _freq_cap_before_fia(frequency_regulator, freq: int) -> None:
         if _freq_sync_mode():
             torch.npu.current_stream().synchronize()
         return
-    stream, compute_done, reg_done = _get_freq_stream()
+    _, freq_ctx, compute_done, reg_done = _get_freq_stream()
     cur = torch.npu.current_stream()
     compute_done.record(cur)  # engage the cap only after current compute work
-    stream.wait_event(compute_done)
-    with torch.npu.stream(stream):
+    _FREQ_STREAM.wait_event(compute_done)
+    with freq_ctx:
         frequency_regulator(freq)
-    reg_done.record(stream)
+    reg_done.record(_FREQ_STREAM)
     cur.wait_event(reg_done)  # the following FIA waits until the cap is set
     if _freq_sync_mode():
         cur.synchronize()
@@ -168,14 +171,14 @@ def _freq_restore_after_fia(frequency_regulator, freq: int) -> None:
         if _freq_sync_mode():
             torch.npu.current_stream().synchronize()
         return
-    stream, compute_done, _ = _get_freq_stream()
+    _, freq_ctx, compute_done, _ = _get_freq_stream()
     cur = torch.npu.current_stream()
     compute_done.record(cur)  # restore only once the FIA work has completed
-    stream.wait_event(compute_done)
-    with torch.npu.stream(stream):
+    _FREQ_STREAM.wait_event(compute_done)
+    with freq_ctx:
         frequency_regulator(freq)
     if _freq_sync_mode():
-        torch.npu.current_stream().synchronize()
+        cur.synchronize()
 
 
 def _get_rot_matrix(
