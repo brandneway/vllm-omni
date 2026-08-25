@@ -44,17 +44,31 @@ def is_quantized_kv_cache(kv_cache_dtype: str | None) -> bool:
     return kv_cache_dtype in _FP8_KV_LABELS
 
 
+def _freq_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError as e:
+        raise ValueError(f"{name} must be an integer frequency in MHz, got {raw!r}") from e
+
+
 @lru_cache(maxsize=1)
 def _varlen_freq_caps() -> tuple[int | None, int | None]:
     """(before, after) AI-core frequency caps for the varlen FIA call.
 
     Returns (None, None) unless MINDIESD_SET_FREQ_MANUAL is truthy
-    (``1``/``true``/``yes``/``on``). The env var is read once per process.
+    (``1``/``true``/``yes``/``on``). Override the default 1400/1650 MHz via
+    MINDIESD_SET_FREQ_CAP / MINDIESD_SET_FREQ_RESTORE. Env vars are read
+    once per process.
     """
     enabled = os.environ.get("MINDIESD_SET_FREQ_MANUAL", "false").strip().lower()
-    if enabled in ("1", "true", "yes", "on"):
-        return _FREQ_CAP_BEFORE_VARLEN_FIA, _FREQ_RESTORE_AFTER_VARLEN_FIA
-    return None, None
+    if enabled not in ("1", "true", "yes", "on"):
+        return None, None
+    cap = _freq_env_int("MINDIESD_SET_FREQ_CAP", _FREQ_CAP_BEFORE_VARLEN_FIA)
+    restore = _freq_env_int("MINDIESD_SET_FREQ_RESTORE", _FREQ_RESTORE_AFTER_VARLEN_FIA)
+    return cap, restore
 
 
 @lru_cache(maxsize=1)
@@ -91,6 +105,13 @@ def _freq_stream_mode() -> bool:
     return enabled in ("1", "true", "yes", "on")
 
 
+@lru_cache(maxsize=1)
+def _freq_sync_mode() -> bool:
+    """Truthy MINDIESD_SET_FREQ_SYNC blocks on the current stream after each call."""
+    enabled = os.environ.get("MINDIESD_SET_FREQ_SYNC", "false").strip().lower()
+    return enabled in ("1", "true", "yes", "on")
+
+
 # Dedicated stream and reused events for the opt-in stream dispatch mode
 # (created lazily on first use).
 _FREQ_STREAM: torch.npu.Stream | None = None
@@ -119,10 +140,14 @@ def _freq_cap_before_fia(frequency_regulator, freq: int) -> None:
     With MINDIESD_SET_FREQ_STREAM truthy, dispatch on a dedicated stream
     instead (host never blocks; ordering enforced device-side with events),
     which lets the frequency kernel run concurrently with compute-stream
-    work.
+    work. With MINDIESD_SET_FREQ_SYNC truthy, block on the current stream
+    after each call (diagnostic; approximates ASCEND_LAUNCH_BLOCKING for
+    this op only).
     """
     if not _freq_stream_mode():
         frequency_regulator(freq)
+        if _freq_sync_mode():
+            torch.npu.current_stream().synchronize()
         return
     stream, compute_done, reg_done = _get_freq_stream()
     cur = torch.npu.current_stream()
@@ -132,12 +157,16 @@ def _freq_cap_before_fia(frequency_regulator, freq: int) -> None:
         frequency_regulator(freq)
     reg_done.record(stream)
     cur.wait_event(reg_done)  # the following FIA waits until the cap is set
+    if _freq_sync_mode():
+        cur.synchronize()
 
 
 def _freq_restore_after_fia(frequency_regulator, freq: int) -> None:
     """Restore the AI-core frequency after the FIA call."""
     if not _freq_stream_mode():
         frequency_regulator(freq)
+        if _freq_sync_mode():
+            torch.npu.current_stream().synchronize()
         return
     stream, compute_done, _ = _get_freq_stream()
     cur = torch.npu.current_stream()
@@ -145,6 +174,8 @@ def _freq_restore_after_fia(frequency_regulator, freq: int) -> None:
     stream.wait_event(compute_done)
     with torch.npu.stream(stream):
         frequency_regulator(freq)
+    if _freq_sync_mode():
+        torch.npu.current_stream().synchronize()
 
 
 def _get_rot_matrix(
