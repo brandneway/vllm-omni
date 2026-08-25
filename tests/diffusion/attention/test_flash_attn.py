@@ -721,8 +721,7 @@ def test_npu_fp8_without_varlen_uses_dense_quant(monkeypatch):
     assert out.item() == 4.0
 
 
-def test_npu_fp8_varlen_single_call_when_freq_off(monkeypatch):
-    monkeypatch.delenv("MINDIE_SD_FREQ", raising=False)
+def test_npu_fp8_varlen_single_call(monkeypatch):
     _fake_mindiesd(monkeypatch)
     captured: dict = {}
     _fake_fp8_varlen(monkeypatch, captured, return_head_dim=4)
@@ -735,23 +734,6 @@ def test_npu_fp8_varlen_single_call_when_freq_off(monkeypatch):
     assert captured["calls"][0]["q_shape"] == (8, 2, 4)
     assert captured["calls"][0]["cu_q"] == [0, 5, 8]
     assert captured["calls"][0]["softmax_scale"] == pytest.approx(0.5)
-    assert out.shape == (1, 8, 2, 4)
-
-
-def test_npu_fp8_varlen_freq_truthy_splits_per_head(monkeypatch):
-    monkeypatch.setenv("MINDIE_SD_FREQ", "1")
-    _fake_mindiesd(monkeypatch)
-    captured: dict = {}
-    _fake_fp8_varlen(monkeypatch, captured, return_head_dim=4)
-    impl = _npu_impl()
-    q = torch.randn(1, 8, 2, 4)
-
-    out = impl._forward_varlen_packed_quant_npu(q, q, q, _packed_extra())
-
-    # One call per head, single-head TND slices, GQA maps kv head per group.
-    assert len(captured["calls"]) == 2
-    assert [call["q_shape"] for call in captured["calls"]] == [(8, 1, 4), (8, 1, 4)]
-    assert [call["k_shape"] for call in captured["calls"]] == [(8, 1, 4), (8, 1, 4)]
     assert out.shape == (1, 8, 2, 4)
 
 

@@ -582,13 +582,6 @@ class FlashAttentionImpl(AttentionImpl):
 
         Returns None (caller falls back to the unquantized varlen path) when
         the packed contract does not hold; see _resolve_packed_seq_npu.
-
-        MINDIE_SD_FREQ (truthy) switches to the headwise path as an NPU
-        power-management workaround: one wide-head_num call concentrates the
-        whole attention as a single burst of instantaneous compute; when that
-        bursts past the power envelope the NPU power management downclocks
-        the chip. Single-head calls keep each op's instantaneous compute
-        small so the clock sustains.
         """
         resolved = self._resolve_packed_seq_npu(query, key, extra)
         if resolved is None:
@@ -604,57 +597,15 @@ class FlashAttentionImpl(AttentionImpl):
         # cumulative offsets and forwards them as actual_seq_qlen/kvlen.
         cu_seqlens_q = [0, *seq_q]
         cu_seqlens_k = [0, *seq_k]
-        if os.environ.get("MINDIE_SD_FREQ", "False").strip().lower() in ("1", "true", "yes", "on"):
-            out = self._forward_varlen_packed_quant_headwise_npu(
-                fp8_rotate_quant_fa_varlen,
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_k,
-            )
-        else:
-            out = fp8_rotate_quant_fa_varlen(
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                softmax_scale=self.softmax_scale,
-            )
+        out = fp8_rotate_quant_fa_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            softmax_scale=self.softmax_scale,
+        )
         return out.unsqueeze(0)
-
-    def _forward_varlen_packed_quant_headwise_npu(
-        self,
-        fp8_varlen_fn,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        cu_seqlens_q: list[int],
-        cu_seqlens_k: list[int],
-    ) -> torch.Tensor:
-        """Single-head varlen FP8 attention slices concatenated along head_num.
-
-        Attention heads are independent, so the concatenated result is
-        identical to the unsplit call. Output stays contiguous because models
-        .view() the attention output right after returning from the layer.
-        """
-        num_q_heads = q.shape[1]
-        group_size = num_q_heads // k.shape[1]  # q heads per kv head; 1 for MHA
-        outs = []
-        for i in range(num_q_heads):
-            kv = i // group_size
-            outs.append(
-                fp8_varlen_fn(
-                    q[:, i : i + 1].contiguous(),  # [T, 1, D] slice of TND
-                    k[:, kv : kv + 1].contiguous(),
-                    v[:, kv : kv + 1].contiguous(),
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                    softmax_scale=self.softmax_scale,
-                )
-            )
-        return torch.cat(outs, dim=1).contiguous()
 
     def _forward_prefix_kv_slice_npu(
         self,
