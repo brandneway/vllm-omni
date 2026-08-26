@@ -67,6 +67,17 @@ def test_is_quantized_kv_cache() -> None:
     assert not kv_quant_npu.is_quantized_kv_cache("int8")
 
 
+def test_fp8_kv_slice_enabled_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MINDIESD_FP8_KV_SLICE", raising=False)
+    assert not kv_quant_npu.fp8_kv_slice_enabled()
+    monkeypatch.setenv("MINDIESD_FP8_KV_SLICE", "1")
+    assert kv_quant_npu.fp8_kv_slice_enabled()
+    monkeypatch.setenv("MINDIESD_FP8_KV_SLICE", "true")
+    assert kv_quant_npu.fp8_kv_slice_enabled()
+    monkeypatch.setenv("MINDIESD_FP8_KV_SLICE", "0")
+    assert not kv_quant_npu.fp8_kv_slice_enabled()
+
+
 class TestKVQuantNPUUnit:
     @pytest.fixture(autouse=True)
     def clear_rot_cache(self):
@@ -292,6 +303,66 @@ class TestKVQuantNPUUnit:
         with pytest.raises(ValueError, match="expected packed TND 3D tensors"):
             kv_quant_npu.fp8_rotate_quant_fa_varlen(query, key, value, [4], [4])
 
+    @pytest.mark.parametrize(
+        "layout,input_shape,expected_quant_shapes",
+        [
+            ("BSND", (1, 8, 2, 4), [(1, 8, 2, 4), (1, 5, 2, 4), (1, 5, 2, 4)]),
+            ("BNSD", (1, 2, 8, 4), [(1, 2, 8, 4), (1, 2, 5, 4), (1, 2, 5, 4)]),
+        ],
+    )
+    def test_fp8_rotate_quant_kv_slice_dense_contract(
+        self,
+        fake_quant_ops: dict[str, Any],
+        layout: str,
+        input_shape: tuple[int, int, int, int],
+        expected_quant_shapes: list[tuple[int, int, int, int]],
+    ) -> None:
+        query, key, value = self._make_qkv(input_shape)
+        fake_quant_ops["out_shape"] = input_shape
+
+        out = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 5, layout=layout, softmax_scale=0.125)
+
+        assert out.shape == query.shape
+        # Q is quantized at full length; K/V are sliced to kv_len BEFORE quant.
+        assert [call["shape"] for call in fake_quant_ops["fa_calls"]] == expected_quant_shapes
+        assert [call["layout"] for call in fake_quant_ops["fa_calls"]] == [layout] * 3
+        assert [call["block_size"] for call in fake_quant_ops["fa_calls"]] == [128, 256, 256]
+        assert fake_quant_ops["varlen_fa_calls"] == []
+        kwargs = fake_quant_ops["npu_kwargs"]
+        assert kwargs["input_layout"] == layout
+        # Dense dispatch: the FIA varlen feature stays off.
+        assert "actual_seq_qlen" not in kwargs
+        assert "actual_seq_kvlen" not in kwargs
+        assert kwargs["query_quant_mode"] == 7
+        assert kwargs["key_quant_mode"] == 7
+        assert kwargs["value_quant_mode"] == 7
+        assert kwargs["softmax_scale"] == 0.125
+        expected_heads = input_shape[1] if layout == "BNSD" else input_shape[2]
+        assert kwargs["num_query_heads"] == expected_heads
+        assert kwargs["num_key_value_heads"] == expected_heads
+
+    def test_fp8_rotate_quant_kv_slice_full_length_kv_is_noop_slice(self, fake_quant_ops) -> None:
+        query, key, value = self._make_qkv((1, 8, 2, 4))
+        fake_quant_ops["out_shape"] = (1, 8, 2, 4)
+
+        out = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 8, layout="BSND")
+
+        assert out.shape == query.shape
+        assert [call["shape"] for call in fake_quant_ops["fa_calls"]] == [(1, 8, 2, 4)] * 3
+
+    @pytest.mark.parametrize("kv_len", [0, -1, 9, 5.0])
+    def test_fp8_rotate_quant_kv_slice_invalid_kv_len_raises(self, fake_quant_ops, kv_len) -> None:
+        query, key, value = self._make_qkv((1, 8, 2, 4))
+
+        with pytest.raises(ValueError, match="kv_len"):
+            kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, kv_len, layout="BSND")
+
+    def test_fp8_rotate_quant_kv_slice_invalid_layout_raises(self, fake_quant_ops) -> None:
+        query, key, value = self._make_qkv((1, 8, 2, 4))
+
+        with pytest.raises(ValueError, match="unsupported layout"):
+            kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 5, layout="INVALID")
+
 
 @npu_smoke
 class TestKVQuantNPUSmoke:
@@ -324,5 +395,20 @@ class TestKVQuantNPUSmoke:
         value = torch.randn(8, 2, 64, dtype=torch.float16, device="npu")
 
         out = kv_quant_npu.fp8_rotate_quant_fa_varlen(query, key, value, [5, 8], [5, 8])
+        assert out.shape == query.shape
+        assert out.dtype == query.dtype
+
+    def test_fp8_rotate_quant_kv_slice_real_npu_shape_contract(self):
+        try:
+            kv_quant_npu._load_quant_ops.cache_clear()
+            kv_quant_npu._load_quant_ops()
+        except ImportError:
+            pytest.skip("NPU quant dependencies are not fully installed.")
+
+        query = torch.randn(1, 8, 2, 64, dtype=torch.float16, device="npu")
+        key = torch.randn(1, 8, 2, 64, dtype=torch.float16, device="npu")
+        value = torch.randn(1, 8, 2, 64, dtype=torch.float16, device="npu")
+
+        out = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 5, layout="BSND")
         assert out.shape == query.shape
         assert out.dtype == query.dtype

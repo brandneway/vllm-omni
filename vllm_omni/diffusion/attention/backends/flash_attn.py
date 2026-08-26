@@ -472,7 +472,15 @@ class FlashAttentionImpl(AttentionImpl):
         if kv_cache_dtype is not None:
             extra = attn_metadata.extra if attn_metadata else {}
             if extra.get("npu_attn_varlen", False):
-                out = self._forward_varlen_packed_quant_npu(query, key, value, extra)
+                # MINDIESD_FP8_KV_SLICE selects the dense-FIA variant: K/V are
+                # sliced to the valid prefix outside the operator instead of
+                # using the operator's TND varlen feature.
+                from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_kv_slice_enabled
+
+                if fp8_kv_slice_enabled():
+                    out = self._forward_prefix_kv_slice_quant_npu(query, key, value, extra)
+                else:
+                    out = self._forward_varlen_packed_quant_npu(query, key, value, extra)
                 if out is not None:
                     return out
                 # Packed contract failed. Dense FP8 would ignore document
@@ -762,4 +770,42 @@ class FlashAttentionImpl(AttentionImpl):
                 layout=layout,
                 scale=scale,
             )
+        )
+
+    def _forward_prefix_kv_slice_quant_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        extra: dict,
+    ) -> torch.Tensor | None:
+        """Packed FP8 attention on NPU: slice K/V to the valid prefix, then a
+        dense (non-varlen) FIA call via fp8_rotate_quant_kv_slice.
+
+        FP8 counterpart of _forward_prefix_kv_slice_npu, enabled via
+        MINDIESD_FP8_KV_SLICE. Same numerical contract as
+        _forward_varlen_packed_quant_npu: the padding document is a strict
+        suffix, so dropping it from K/V before quantization is identical to
+        masking it out. Query keeps full length; outputs on padding rows are
+        never consumed downstream. Returns None (caller falls back to the
+        unquantized varlen path) when the packed contract does not hold; see
+        _resolve_packed_seq_npu.
+        """
+        resolved = self._resolve_packed_seq_npu(query, key, extra)
+        if resolved is None:
+            return None
+        _, seq_k = resolved
+        used_k = seq_k[0]  # real document length (first cumulative end)
+
+        from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_rotate_quant_kv_slice
+
+        # The packed contract guarantees [1, T, N, D] == BSND; the quant
+        # wrapper slices K/V on the seq axis itself.
+        return fp8_rotate_quant_kv_slice(
+            query,
+            key,
+            value,
+            used_k,
+            layout="BSND",
+            softmax_scale=self.softmax_scale,
         )

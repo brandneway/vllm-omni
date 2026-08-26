@@ -6,12 +6,14 @@ Provides per-tensor dynamic quantization of Q/K/V tensors to
 float8_e4m3fn format. Designed for diffusion models where Q/K/V are
 computed fresh each forward pass (no persistent KV cache).
 
-Two entry points dispatch to the MindIE-SD FIA operator:
-``fp8_rotate_quant_fa`` for dense batched layouts (BNSD/BSND) and
+Three entry points dispatch to the MindIE-SD FIA operator:
+``fp8_rotate_quant_fa`` for dense batched layouts (BNSD/BSND),
 ``fp8_rotate_quant_fa_varlen`` for packed varlen TND tensors with
-cu_seqlens document boundaries. Setting ``MINDIESD_SET_FREQ_MANUAL`` to
-a truthy value caps the AI-core frequency around the varlen FIA call
-via mindiesd ``frequency_regulator``.
+cu_seqlens document boundaries, and ``fp8_rotate_quant_kv_slice`` for the
+packed [real, pad] layout with K/V sliced to the valid prefix so a plain
+dense BNSD/BSND FIA call (no varlen feature) suffices. Setting
+``MINDIESD_SET_FREQ_MANUAL`` to a truthy value caps the AI-core frequency
+around the wide FIA calls via mindiesd ``frequency_regulator``.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ _ROT_MATRIX_LOCK = threading.Lock()
 
 _FP8_KV_LABELS = frozenset({"fp8"})
 
-# AI-core frequency caps (MHz) applied around the varlen FIA call when
+# AI-core frequency caps (MHz) applied around wide FIA calls when
 # MINDIESD_SET_FREQ_MANUAL is truthy: one wide-head_num FIA call is a burst
 # of instantaneous compute that can trip NPU power management into
 # downclocking the chip. Capping the frequency before the call keeps the
@@ -44,6 +46,16 @@ def is_quantized_kv_cache(kv_cache_dtype: str | None) -> bool:
     return kv_cache_dtype in _FP8_KV_LABELS
 
 
+def fp8_kv_slice_enabled() -> bool:
+    """Truthy ``MINDIESD_FP8_KV_SLICE`` (``1``/``true``/``yes``/``on``) routes
+    packed FP8 attention through :func:`fp8_rotate_quant_kv_slice` — K/V sliced
+    to the valid prefix, then dense BNSD/BSND FIA — instead of the TND varlen
+    FIA path. Read per call (no cache) so a changed environment takes effect
+    without a process restart, matching the ``MINDIE_SD_FA_TYPE`` dispatch."""
+    enabled = os.environ.get("MINDIESD_FP8_KV_SLICE", "false").strip().lower()
+    return enabled in ("1", "true", "yes", "on")
+
+
 def _freq_env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
@@ -55,8 +67,8 @@ def _freq_env_int(name: str, default: int) -> int:
 
 
 @lru_cache(maxsize=1)
-def _varlen_freq_caps() -> tuple[int | None, int | None]:
-    """(before, after) AI-core frequency caps for the varlen FIA call.
+def _fia_freq_caps() -> tuple[int | None, int | None]:
+    """(before, after) AI-core frequency caps for wide FIA calls.
 
     Returns (None, None) unless MINDIESD_SET_FREQ_MANUAL is truthy
     (``1``/``true``/``yes``/``on``). Override the default 1400/1650 MHz via
@@ -350,7 +362,7 @@ def fp8_rotate_quant_fa_varlen(
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
 
-    freq_cap, freq_restore = _varlen_freq_caps()
+    freq_cap, freq_restore = _fia_freq_caps()
     if freq_cap is not None:
         _freq_cap_before_fia(frequency_regulator, freq_cap)
     out = fia_v2(
@@ -393,3 +405,122 @@ def fp8_rotate_quant_fa_varlen(
         dim=0,
     )
     return out.contiguous()
+
+
+def fp8_rotate_quant_kv_slice(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_len: int,
+    *,
+    layout: str = "BSND",
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    """Run dense NPU fused attention with dynamic FP8 Q/K/V after slicing K/V
+    to the valid prefix.
+
+    Alternative to :func:`fp8_rotate_quant_fa_varlen` for the packed
+    [real, pad] two-document layout: the padding document is a strict suffix,
+    so dropping it from K/V is identical to masking it out, and the FIA
+    operator's varlen feature (``actual_seq_*`` / ``NTD_TND``) stays off —
+    the call is a plain dense ``BNSD``/``BSND`` FIA whose query is longer
+    than its K/V. K/V are sliced (zero-copy views) BEFORE rotation and
+    quantization, so padding rows are neither attended nor quantized. Query
+    keeps its full length; outputs on padding rows are never consumed
+    downstream (same contract as the unquantized prefix-K/V-slice path).
+
+    Query padding rows are quantized together with the real rows; per-block
+    scales (128-row blocks) can therefore mix both in the boundary block.
+    This is exact when the packing pads with zeros (zeros never raise the
+    block absmax) — the MiniMax-H3 packing this path is built for.
+
+    Args:
+        query: Query tensor in ``layout`` order; its seq length may exceed
+            ``kv_len``.
+        key: Key tensor in ``layout`` order; sliced to ``kv_len`` on the seq
+            axis before quantization.
+        value: Value tensor in ``layout`` order; sliced to ``kv_len`` on the
+            seq axis before quantization.
+        kv_len: Valid K/V prefix length (real document length of the packed
+            row).
+        layout: ``BNSD`` or ``BSND`` for ``npu_fused_infer_attention_score_v2``.
+        softmax_scale: If None, uses ``1 / sqrt(head_dim)``.
+
+    Returns:
+        Attention output in the same layout as the inputs, at the query's
+        full sequence length.
+    """
+    (
+        torch_npu,
+        fia_v2,
+        fa_block_quant_preprocess,
+        _varlen_quant,
+        qua_rot_mode,
+        create_rot,
+        frequency_regulator,
+    ) = _load_quant_ops()
+
+    if layout == "BNSD":
+        _, num_heads, seq_len, head_dim = query.shape
+        kv_seq_dim = 2
+        num_kv_heads = key.shape[1]
+    elif layout == "BSND":
+        _, seq_len, num_heads, head_dim = query.shape
+        kv_seq_dim = 1
+        num_kv_heads = key.shape[2]
+    else:
+        raise ValueError(f"fp8_rotate_quant_kv_slice: unsupported layout {layout!r}, expected BNSD or BSND")
+
+    kv_total = key.shape[kv_seq_dim]
+    if not isinstance(kv_len, int) or not 0 < kv_len <= kv_total:
+        raise ValueError(f"fp8_rotate_quant_kv_slice: kv_len must be an int in (0, {kv_total}], got {kv_len!r}")
+
+    out_dtype = query.dtype
+    device = query.device
+
+    rot = _get_rot_matrix(device, query.dtype, head_dim, qua_rot_mode, create_rot)
+    q_f = torch.matmul(query, rot)
+    # Slice K/V to the valid prefix (zero-copy views) before rotation and
+    # quantization: pad rows are neither attended nor quantized.
+    key = key.narrow(kv_seq_dim, 0, kv_len)
+    value = value.narrow(kv_seq_dim, 0, kv_len)
+    k_f = torch.matmul(key, rot)
+
+    q, q_scale = fa_block_quant_preprocess(q_f, block_size=128, dst_type=torch_npu.float8_e4m3fn, layout=layout)
+    k, k_scale = fa_block_quant_preprocess(k_f, block_size=256, dst_type=torch_npu.float8_e4m3fn, layout=layout)
+    v, v_scale = fa_block_quant_preprocess(value, block_size=256, dst_type=torch_npu.float8_e4m3fn, layout=layout)
+
+    scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
+
+    freq_cap, freq_restore = _fia_freq_caps()
+    if freq_cap is not None:
+        _freq_cap_before_fia(frequency_regulator, freq_cap)
+    out = fia_v2(
+        q,
+        k,
+        v,
+        input_layout=layout,
+        num_query_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        softmax_scale=scale,
+        pre_tokens=2147483647,  # INT32_MAX: no left-context truncation.
+        next_tokens=2147483647,  # INT32_MAX: no right-context truncation.
+        query_quant_mode=7,  # NPU mode id for block FP8 dequant path.
+        key_quant_mode=7,  # Same quant mode as query branch.
+        value_quant_mode=7,  # Same quant mode as key/query branches.
+        dequant_scale_query=q_scale,
+        dequant_scale_key=k_scale,
+        dequant_scale_value=v_scale,
+        out_dtype=out_dtype,
+    )[0]
+    if freq_restore is not None:
+        _freq_restore_after_fia(frequency_regulator, freq_restore)
+
+    # The op may hand back a padded seq axis; trim to the query length.
+    if layout == "BNSD":
+        if out.shape[2] != seq_len:
+            out = out[:, :, :seq_len, :]
+    elif out.shape[1] != seq_len:
+        out = out[:, :seq_len, :, :]
+
+    return out
