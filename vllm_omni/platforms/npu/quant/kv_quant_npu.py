@@ -14,6 +14,14 @@ packed [real, pad] layout with K/V sliced to the valid prefix so a plain
 dense BNSD/BSND FIA call (no varlen feature) suffices. Setting
 ``MINDIESD_SET_FREQ_MANUAL`` to a truthy value caps the AI-core frequency
 around the wide FIA calls via mindiesd ``frequency_regulator``.
+
+Setting ``MINDIESD_FP8_FIA_QCHUNK`` to an integer N > 1 splits the dense
+kv-slice FIA call into up to N smaller calls along the query sequence axis
+(K/V kept whole), replacing one wide attention burst with N narrower ones
+to stay inside the NPU power envelope. Chunk boundaries align to the Q
+block-quant row block (128 rows), so per-chunk quantization is identical to
+the full-length quantization. Only the dense kv-slice path is chunked; the
+varlen path warns and keeps a single call.
 """
 
 from __future__ import annotations
@@ -21,6 +29,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+import warnings
 from functools import lru_cache
 
 import torch
@@ -31,6 +40,12 @@ _ROT_MATRIXS: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
 _ROT_MATRIX_LOCK = threading.Lock()
 
 _FP8_KV_LABELS = frozenset({"fp8"})
+
+# Block-quant row-block sizes for the FIA per-block FP8 path. Q chunk
+# boundaries (MINDIESD_FP8_FIA_QCHUNK) must align to _Q_BLOCK_SIZE so chunked
+# quantization stays block-identical to full-length quantization.
+_Q_BLOCK_SIZE = 128
+_KV_BLOCK_SIZE = 256
 
 # AI-core frequency caps (MHz) applied around wide FIA calls when
 # MINDIESD_SET_FREQ_MANUAL is truthy: one wide-head_num FIA call is a burst
@@ -54,6 +69,43 @@ def fp8_kv_slice_enabled() -> bool:
     without a process restart, matching the ``MINDIE_SD_FA_TYPE`` dispatch."""
     enabled = os.environ.get("MINDIESD_FP8_KV_SLICE", "false").strip().lower()
     return enabled in ("1", "true", "yes", "on")
+
+
+def _fia_q_chunk_count() -> int:
+    """Number of query-sequence chunks for the dense kv-slice FIA call.
+
+    ``MINDIESD_FP8_FIA_QCHUNK`` N > 1 splits the single wide FIA call into up
+    to N smaller ones (K/V kept whole), shortening each compute burst so the
+    NPU power management is less likely to downclock. 1 (default) keeps the
+    single wide call. Read per call (no cache) so a changed environment takes
+    effect without a process restart, matching ``fp8_kv_slice_enabled``.
+    """
+    raw = os.environ.get("MINDIESD_FP8_FIA_QCHUNK", "1").strip()
+    try:
+        n = int(raw)
+    except ValueError as e:
+        raise ValueError(f"MINDIESD_FP8_FIA_QCHUNK must be an integer, got {raw!r}") from e
+    return max(1, n)
+
+
+def _q_chunk_bounds(seq_len: int, n_chunks: int) -> list[tuple[int, int]]:
+    """``[start, end)`` query-row chunk boundaries covering ``[0, seq_len)``.
+
+    Boundaries align to the Q block-quant row block (``_Q_BLOCK_SIZE``) so
+    per-chunk quantization blocks and dequant scales are identical to the
+    full-length quantization; only the last chunk may be ragged. Fewer than
+    ``n_chunks`` chunks are returned when there are not enough row blocks.
+    """
+    if n_chunks <= 1 or seq_len <= _Q_BLOCK_SIZE:
+        return [(0, seq_len)]
+    chunk = -(-seq_len // (n_chunks * _Q_BLOCK_SIZE)) * _Q_BLOCK_SIZE
+    bounds = []
+    start = 0
+    while start < seq_len:
+        end = min(seq_len, start + chunk)
+        bounds.append((start, end))
+        start = end
+    return bounds
 
 
 def _freq_env_int(name: str, default: int) -> int:
@@ -312,6 +364,12 @@ def fp8_rotate_quant_fa_varlen(
 
     Returns the attention output in the same TND layout as the inputs.
     """
+    if _fia_q_chunk_count() > 1:
+        warnings.warn(
+            "MINDIESD_FP8_FIA_QCHUNK>1 is only implemented for the dense kv-slice "
+            "FP8 path; the varlen path keeps a single FIA call.",
+            stacklevel=2,
+        )
     (
         torch_npu,
         fia_v2,
@@ -434,6 +492,12 @@ def fp8_rotate_quant_kv_slice(
     This is exact when the packing pads with zeros (zeros never raise the
     block absmax) — the MiniMax-H3 packing this path is built for.
 
+    When ``MINDIESD_FP8_FIA_QCHUNK`` > 1 the FIA call runs as several
+    query-row chunks (see :func:`_q_chunk_bounds`) over the same quantized
+    K/V, shortening each compute burst for power management. Quantization is
+    done once up front; chunk boundaries are Q-block-aligned so per-chunk
+    scales are exact slices of the full-length scales.
+
     Args:
         query: Query tensor in ``layout`` order; its seq length may exceed
             ``kv_len``.
@@ -443,7 +507,9 @@ def fp8_rotate_quant_kv_slice(
             seq axis before quantization.
         kv_len: Valid K/V prefix length (real document length of the packed
             row).
-        layout: ``BNSD`` or ``BSND`` for ``npu_fused_infer_attention_score_v2``.
+        layout: Caller-facing tensor layout, ``BNSD`` or ``BSND``. The FIA
+            operator itself is always fed BNSD (the quant kernel's output
+            layout) and its output is transposed back for ``BSND`` callers.
         softmax_scale: If None, uses ``1 / sqrt(head_dim)``.
 
     Returns:
@@ -486,41 +552,64 @@ def fp8_rotate_quant_kv_slice(
     value = value.narrow(kv_seq_dim, 0, kv_len)
     k_f = torch.matmul(key, rot)
 
-    q, q_scale = fa_block_quant_preprocess(q_f, block_size=128, dst_type=torch_npu.float8_e4m3fn, layout=layout)
-    k, k_scale = fa_block_quant_preprocess(k_f, block_size=256, dst_type=torch_npu.float8_e4m3fn, layout=layout)
-    v, v_scale = fa_block_quant_preprocess(value, block_size=256, dst_type=torch_npu.float8_e4m3fn, layout=layout)
+    # fa_block_quant_preprocess always returns BNSD-logical tensors (BSND
+    # inputs are transposed before the quant kernel), so the FIA call is
+    # always dispatched with input_layout="BNSD" and the output is transposed
+    # back to the caller's layout below.
+    q, q_scale = fa_block_quant_preprocess(
+        q_f, block_size=_Q_BLOCK_SIZE, dst_type=torch_npu.float8_e4m3fn, layout=layout
+    )
+    k, k_scale = fa_block_quant_preprocess(
+        k_f, block_size=_KV_BLOCK_SIZE, dst_type=torch_npu.float8_e4m3fn, layout=layout
+    )
+    v, v_scale = fa_block_quant_preprocess(
+        value, block_size=_KV_BLOCK_SIZE, dst_type=torch_npu.float8_e4m3fn, layout=layout
+    )
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
 
     freq_cap, freq_restore = _fia_freq_caps()
     if freq_cap is not None:
         _freq_cap_before_fia(frequency_regulator, freq_cap)
-    out = fia_v2(
-        q,
-        k,
-        v,
-        input_layout=layout,
-        num_query_heads=num_heads,
-        num_key_value_heads=num_kv_heads,
-        softmax_scale=scale,
-        pre_tokens=2147483647,  # INT32_MAX: no left-context truncation.
-        next_tokens=2147483647,  # INT32_MAX: no right-context truncation.
-        query_quant_mode=7,  # NPU mode id for block FP8 dequant path.
-        key_quant_mode=7,  # Same quant mode as query branch.
-        value_quant_mode=7,  # Same quant mode as key/query branches.
-        dequant_scale_query=q_scale,
-        dequant_scale_key=k_scale,
-        dequant_scale_value=v_scale,
-        out_dtype=out_dtype,
-    )[0]
+    # Chunk the FIA call along the query rows (MINDIESD_FP8_FIA_QCHUNK): one
+    # wide attention burst becomes several narrower ones. q may be block-padded
+    # beyond seq_len by the quant kernel; chunks cover the quantized rows and
+    # each chunk's output keeps only its real rows (pad-row outputs are dropped
+    # exactly like the single-call trim below).
+    bounds = _q_chunk_bounds(q.shape[2], _fia_q_chunk_count())
+    out_parts = []
+    for row0, row1 in bounds:
+        real_rows = min(row1, seq_len) - row0
+        if real_rows <= 0:
+            break  # remaining chunks cover only quant padding rows
+        out_c = fia_v2(
+            q[:, :, row0:row1, :].contiguous(),
+            k,
+            v,
+            input_layout="BNSD",
+            num_query_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
+            softmax_scale=scale,
+            pre_tokens=2147483647,  # INT32_MAX: no left-context truncation.
+            next_tokens=2147483647,  # INT32_MAX: no right-context truncation.
+            query_quant_mode=7,  # NPU mode id for block FP8 dequant path.
+            key_quant_mode=7,  # Same quant mode as query branch.
+            value_quant_mode=7,  # Same quant mode as key/query branches.
+            # Per-chunk Q scale slice: block-aligned boundaries make this the
+            # exact block range of the full-length quantization.
+            dequant_scale_query=q_scale[:, :, row0 // _Q_BLOCK_SIZE : -(-row1 // _Q_BLOCK_SIZE), :].contiguous(),
+            dequant_scale_key=k_scale,
+            dequant_scale_value=v_scale,
+            out_dtype=out_dtype,
+        )[0]
+        # The op may hand back a padded seq axis; keep this chunk's real rows.
+        if out_c.shape[2] != real_rows:
+            out_c = out_c[:, :, :real_rows, :]
+        out_parts.append(out_c)
+    out = torch.cat(out_parts, dim=2) if len(out_parts) > 1 else out_parts[0]
     if freq_restore is not None:
         _freq_restore_after_fia(frequency_regulator, freq_restore)
 
-    # The op may hand back a padded seq axis; trim to the query length.
-    if layout == "BNSD":
-        if out.shape[2] != seq_len:
-            out = out[:, :, :seq_len, :]
-    elif out.shape[1] != seq_len:
-        out = out[:, :seq_len, :, :]
-
+    if layout == "BSND":
+        out = out.transpose(1, 2)
     return out
