@@ -449,6 +449,67 @@ class TestKVQuantNPUUnit:
         # reassembled output must equal the input query exactly (chunk order kept).
         assert torch.equal(out, query)
 
+    def test_fia_chunk_a2a_enabled_reads_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("MINDIESD_FP8_CHUNK_A2A", raising=False)
+        assert not kv_quant_npu._fia_chunk_a2a_enabled()
+        monkeypatch.setenv("MINDIESD_FP8_CHUNK_A2A", "1")
+        assert kv_quant_npu._fia_chunk_a2a_enabled()
+        monkeypatch.setenv("MINDIESD_FP8_CHUNK_A2A", "true")
+        assert kv_quant_npu._fia_chunk_a2a_enabled()
+        monkeypatch.setenv("MINDIESD_FP8_CHUNK_A2A", "0")
+        assert not kv_quant_npu._fia_chunk_a2a_enabled()
+
+    @pytest.mark.parametrize(
+        "total_seq,world,n_chunks,expected",
+        [
+            # shard=1024, k=2, chunk=512: 8 chunks, chunk j -> rank j//2.
+            (4096, 4, 8, [(0, 512), (512, 1024), (1024, 1536), (1536, 2048),
+                          (2048, 2560), (2560, 3072), (3072, 3584), (3584, 4096)]),
+            # n=7 < 2*world: k degrades to 1 -> one chunk per shard.
+            (4096, 4, 7, [(0, 1024), (1024, 2048), (2048, 3072), (3072, 4096)]),
+            # shard=768, k=2 -> 384 rows, 128-aligned: feasible.
+            (3072, 4, 8, [(0, 384), (384, 768), (768, 1152), (1152, 1536),
+                          (1536, 1920), (1920, 2304), (2304, 2688), (2688, 3072)]),
+            # shard=896, k=2 -> 448 rows not block-aligned -> k=1 (4 chunks).
+            (3584, 4, 8, [(0, 896), (896, 1792), (1792, 2688), (2688, 3584)]),
+            # shard=1000 not block-aligned -> infeasible.
+            (4000, 4, 8, None),
+            # total not divisible by world.
+            (4100, 4, 8, None),
+            # chunking disabled / single rank.
+            (4096, 4, 1, None),
+            (4096, 1, 8, None),
+        ],
+    )
+    def test_scheme_b_chunk_bounds(self, total_seq, world, n_chunks, expected) -> None:
+        assert kv_quant_npu._scheme_b_chunk_bounds(total_seq, world, n_chunks) == expected
+
+    def test_fp8_rotate_quant_kv_slice_chunk_callback_mode(self, fake_quant_ops) -> None:
+        query, key, value = self._make_qkv((1, 8, 2, 4))  # BSND
+        received = []
+
+        out = kv_quant_npu.fp8_rotate_quant_kv_slice(
+            query,
+            key,
+            value,
+            5,
+            layout="BSND",
+            q_chunk_bounds=[(0, 4), (4, 8)],
+            chunk_callback=lambda chunk, idx: received.append((idx, chunk)),
+        )
+
+        # Callback mode consumes the output per chunk and returns None.
+        assert out is None
+        assert len(received) == 2
+        # Chunks arrive in order, in the caller-facing (BSND) layout, with exact
+        # values (fake rotation is identity, fake FIA echoes the q chunk).
+        assert [idx for idx, _ in received] == [0, 1]
+        assert torch.equal(received[0][1], query[:, 0:4])
+        assert torch.equal(received[1][1], query[:, 4:8])
+        assert [c["q_shape"] for c in fake_quant_ops["fia_calls"]] == [(1, 2, 4, 4), (1, 2, 4, 4)]
+        # K/V are quantized exactly once, not per chunk.
+        assert len(fake_quant_ops["fa_calls"]) == 3
+
     def test_fp8_rotate_quant_kv_slice_qchunk_ragged_tail(
         self,
         fake_quant_ops: dict[str, Any],
