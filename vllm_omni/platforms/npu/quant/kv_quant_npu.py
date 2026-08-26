@@ -29,8 +29,9 @@ interleaves a chunked reverse Ulysses all-to-all (P2P gather to the
 row-owner rank) after each chunked FIA call, putting low-power
 communication gaps between compute bursts (duty cycling). Default off =
 "scheme C" (chunked FIA only, single reverse a2a at the end). Scheme B
-requires strict Ulysses SP with no joint attention and a shard/block-aligned
-sequence; otherwise the layer logs a warning and falls back to scheme C.
+requires strict Ulysses SP with no joint attention and seq_len divisible by
+the SP world size; otherwise the layer logs a warning and falls back to
+scheme C.
 """
 
 from __future__ import annotations
@@ -134,36 +135,21 @@ def _scheme_b_chunk_bounds(
 ) -> list[tuple[int, int]] | None:
     """Chunk plan for the chunked reverse-a2a mode (scheme B).
 
-    Splits ``[0, total_seq)`` into ``world_size`` contiguous shards (the
-    reverse all-to-all's seq-scatter partition) and each shard into ``k``
-    equal chunks, so chunk ``j`` maps entirely to destination rank ``j // k``
-    and the per-chunk reverse comm is a P2P gather to that single rank.
+    Reuses the Q-block-aligned boundaries of :func:`_q_chunk_bounds` over the
+    global row space; a chunk may straddle a reverse-a2a shard boundary, which
+    the per-chunk P2P gather handles by splitting sends across the (at most
+    two) destination ranks whose shards intersect the chunk.
 
-    All boundaries must align to the Q block-quant row block
-    (``_Q_BLOCK_SIZE``); since shard boundaries are chunk boundaries, the
-    shard length itself must be block-aligned. ``k`` is reduced from
-    ``n_chunks // world_size`` until the per-shard split is exact and
-    block-aligned. Returns None when no feasible plan exists (caller falls
-    back to plain chunked FIA, scheme C).
+    Returns None when scheme B is infeasible: chunking disabled (n_chunks <=
+    1), single-rank group, or total_seq not divisible by world_size (the
+    reverse a2a scatter itself requires an even split). On None the caller
+    falls back to plain chunked FIA (scheme C).
     """
     if n_chunks <= 1 or world_size <= 1:
         return None
     if total_seq % world_size != 0:
         return None
-    shard = total_seq // world_size
-    if shard % _Q_BLOCK_SIZE != 0:
-        return None
-    k = n_chunks // world_size
-    while k >= 1:
-        if shard % k == 0 and (shard // k) % _Q_BLOCK_SIZE == 0:
-            chunk = shard // k
-            return [
-                (r * shard + b * chunk, r * shard + (b + 1) * chunk)
-                for r in range(world_size)
-                for b in range(k)
-            ]
-        k -= 1
-    return None
+    return _q_chunk_bounds(total_seq, n_chunks)
 
 
 def _freq_env_int(name: str, default: int) -> int:

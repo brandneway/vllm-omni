@@ -462,19 +462,17 @@ class TestKVQuantNPUUnit:
     @pytest.mark.parametrize(
         "total_seq,world,n_chunks,expected",
         [
-            # shard=1024, k=2, chunk=512: 8 chunks, chunk j -> rank j//2.
+            # chunk = ceil(4096/1024)*128 = 512 -> 8 aligned chunks.
             (4096, 4, 8, [(0, 512), (512, 1024), (1024, 1536), (1536, 2048),
                           (2048, 2560), (2560, 3072), (3072, 3584), (3584, 4096)]),
-            # n=7 < 2*world: k degrades to 1 -> one chunk per shard.
-            (4096, 4, 7, [(0, 1024), (1024, 2048), (2048, 3072), (3072, 4096)]),
-            # shard=768, k=2 -> 384 rows, 128-aligned: feasible.
-            (3072, 4, 8, [(0, 384), (384, 768), (768, 1152), (1152, 1536),
-                          (1536, 1920), (1920, 2304), (2304, 2688), (2688, 3072)]),
-            # shard=896, k=2 -> 448 rows not block-aligned -> k=1 (4 chunks).
-            (3584, 4, 8, [(0, 896), (896, 1792), (1792, 2688), (2688, 3584)]),
-            # shard=1000 not block-aligned -> infeasible.
-            (4000, 4, 8, None),
-            # total not divisible by world.
+            # chunk = ceil(4096/896)*128 = 640 -> 7 chunks, ragged tail; chunks
+            # straddle shard boundaries (shard=1024), handled by the gather.
+            (4096, 4, 7, [(0, 640), (640, 1280), (1280, 1920), (1920, 2560),
+                          (2560, 3200), (3200, 3840), (3840, 4096)]),
+            # shard need NOT be 128-aligned (shard=1000): straddling chunks.
+            (4000, 4, 8, [(0, 512), (512, 1024), (1024, 1536), (1536, 2048),
+                          (2048, 2560), (2560, 3072), (3072, 3584), (3584, 4000)]),
+            # total not divisible by world -> infeasible.
             (4100, 4, 8, None),
             # chunking disabled / single rank.
             (4096, 4, 1, None),

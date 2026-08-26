@@ -438,25 +438,27 @@ class Attention(nn.Module):
 
         world = dist.get_world_size(ctx.ulysses_pg)
         n_chunks = kv_quant_npu._fia_q_chunk_count()
-        bounds = kv_quant_npu._scheme_b_chunk_bounds(query.shape[1], world, n_chunks)
+        total_seq = query.shape[1]
+        bounds = kv_quant_npu._scheme_b_chunk_bounds(total_seq, world, n_chunks)
         if bounds is None:
             logger.warning_once(
-                "MINDIESD_FP8_CHUNK_A2A: no 128-aligned shard-compatible chunk plan for "
-                f"seq_len={query.shape[1]}, world_size={world}, chunks={n_chunks}; "
+                "MINDIESD_FP8_CHUNK_A2A: infeasible chunk plan for "
+                f"seq_len={total_seq}, world_size={world}, chunks={n_chunks} "
+                "(need chunks>1, world>1, seq_len divisible by world); "
                 "falling back to chunked FIA without a2a gaps."
             )
             return None
         if len(bounds) != n_chunks:
             logger.warning_once(
-                f"MINDIESD_FP8_CHUNK_A2A: requested {n_chunks} chunks but the alignment "
-                f"constraints allow {len(bounds)}; running with the adjusted count."
+                f"MINDIESD_FP8_CHUNK_A2A: requested {n_chunks} chunks but the 128-row "
+                f"block alignment allows {len(bounds)}; running with the adjusted count."
             )
 
-        chunks_per_shard = len(bounds) // world
         blocks: list[torch.Tensor] = []
 
         def _gather_chunk(out_chunk: torch.Tensor, chunk_idx: int) -> None:
-            block = strategy.post_attention_chunk_gather(out_chunk, ctx, chunk_idx // chunks_per_shard)
+            row0, row1 = bounds[chunk_idx]
+            block = strategy.post_attention_chunk_gather(out_chunk, ctx, row0, row1, total_seq)
             if block is not None:
                 blocks.append(block)
 

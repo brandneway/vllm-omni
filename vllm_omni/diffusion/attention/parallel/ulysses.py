@@ -494,22 +494,26 @@ class UlyssesParallelAttention:
         self,
         attn_output_chunk: torch.Tensor,
         ctx: ParallelAttentionContext | None,
-        dst_group_rank: int,
+        row0: int,
+        row1: int,
+        total_seq: int,
     ) -> torch.Tensor | None:
         """Reverse resharding for one query chunk via P2P gather (scheme B).
 
-        ``attn_output_chunk`` is this rank's head slice ``(bs, rows,
-        head_cnt/P, head_size)`` of the chunk's rows. The chunk's rows belong
-        entirely to ``dst_group_rank``'s seq shard of the reverse a2a (the
-        chunk plan guarantees this), so the reverse comm for one chunk is a
-        gather to that single rank instead of a full all-to-all: every rank
-        sends its head slice to the owner, which concatenates slices in group
-        rank order — the same head ordering the monolithic SeqAllToAll4D
-        reverse produces.
+        ``attn_output_chunk`` is this rank's head slice ``(bs, row1-row0,
+        head_cnt/P, head_size)`` of the global rows ``[row0, row1)``. The
+        reverse a2a scatters the seq dim into per-rank shards of
+        ``total_seq / P`` rows; a chunk may straddle a shard boundary, so each
+        rank sends the intersecting sub-range to every destination rank (one or
+        two), and a destination rank concatenates the head slices it receives
+        in group rank order — the same head ordering the monolithic
+        SeqAllToAll4D reverse produces. Blocks arrive in chunk (row) order, so
+        the caller's ``torch.cat`` reproduces this rank's shard exactly.
 
-        Returns the assembled ``(bs, rows, head_cnt, head_size)`` block on the
-        destination rank, None on all other ranks. Synchronous by design: the
-        P2P exchange is the low-power gap between chunked attention bursts.
+        Returns the assembled ``(bs, rows, head_cnt, head_size)`` block on
+        ranks whose shard intersects the chunk, None otherwise. Synchronous by
+        design: the P2P exchange is the low-power gap between chunked
+        attention bursts.
         """
         assert isinstance(ctx, _UlyssesCtx), f"Unexpected ctx type: {type(ctx)!r}"
         pg = ctx.ulysses_pg
@@ -517,20 +521,48 @@ class UlyssesParallelAttention:
         if world == 1:
             return attn_output_chunk
         rank = dist.get_rank(pg)
-        send_buf = attn_output_chunk.contiguous()
-        if rank == dst_group_rank:
-            recv_bufs = [torch.empty_like(send_buf) for _ in range(world)]
-            ops = [
-                dist.P2POp(dist.irecv, recv_bufs[src], dist.get_global_rank(pg, src), pg)
-                for src in range(world)
-                if src != rank
-            ]
-            if ops:
-                for req in dist.batch_isend_irecv(ops):
-                    req.wait()
-            recv_bufs[rank] = send_buf
-            return torch.cat(recv_bufs, dim=2)
-        op = dist.P2POp(dist.isend, send_buf, dist.get_global_rank(pg, dst_group_rank), pg)
-        for req in dist.batch_isend_irecv([op]):
-            req.wait()
-        return None
+        shard = total_seq // world
+        full_buf = attn_output_chunk.contiguous()
+
+        # My shard's intersection with the chunk: if non-empty I am a
+        # destination and must receive every rank's head slice of that range.
+        my_lo = rank * shard
+        my_s, my_e = max(row0, my_lo), min(row1, my_lo + shard)
+        i_am_dst = my_s < my_e
+
+        ops = []
+        # Sends: the intersecting sub-range to every destination rank != me.
+        for r in range(world):
+            if r == rank:
+                continue
+            s, e = max(row0, r * shard), min(row1, (r + 1) * shard)
+            if s >= e:
+                continue
+            part = full_buf[:, s - row0 : e - row0].contiguous()
+            ops.append(dist.P2POp(dist.isend, part, dist.get_global_rank(pg, r), pg))
+        # Recvs: matched with every source rank's send of my row range.
+        recv_bufs: dict[int, torch.Tensor] = {}
+        if i_am_dst:
+            rows = my_e - my_s
+            for src in range(world):
+                if src == rank:
+                    continue
+                buf = torch.empty(
+                    (full_buf.shape[0], rows, full_buf.shape[2], full_buf.shape[3]),
+                    dtype=full_buf.dtype,
+                    device=full_buf.device,
+                )
+                recv_bufs[src] = buf
+                ops.append(dist.P2POp(dist.irecv, buf, dist.get_global_rank(pg, src), pg))
+        if ops:
+            for req in dist.batch_isend_irecv(ops):
+                req.wait()
+        if not i_am_dst:
+            return None
+        # Concat head slices in group rank order (matches SeqAllToAll4D's
+        # gather order); my own slice is local.
+        ordered = [
+            full_buf[:, my_s - row0 : my_e - row0] if src == rank else recv_bufs[src]
+            for src in range(world)
+        ]
+        return torch.cat(ordered, dim=2)
