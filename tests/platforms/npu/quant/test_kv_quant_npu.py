@@ -111,6 +111,7 @@ class TestKVQuantNPUUnit:
         captured: dict[str, Any] = {
             "fa_calls": [],
             "varlen_fa_calls": [],
+            "fia_calls": [],
             "npu_kwargs": None,
             "out_shape": None,
         }
@@ -119,10 +120,22 @@ class TestKVQuantNPUUnit:
             float8_e4m3fn = "fp8_marker"
 
         def fake_fia_v2(q, k, v, **kwargs):
-            del q, k, v
+            captured["fia_calls"].append(
+                {
+                    "q_shape": tuple(q.shape),
+                    "k_shape": tuple(k.shape),
+                    "v_shape": tuple(v.shape),
+                    "kwargs": kwargs,
+                }
+            )
             captured["npu_kwargs"] = kwargs
+            out_dtype = kwargs.get("out_dtype") or torch.float32
             out_shape = captured["out_shape"]
-            return (torch.ones(out_shape, dtype=torch.float32),)
+            if out_shape is not None:
+                return (torch.ones(out_shape, dtype=out_dtype),)
+            # Default: echo q (FIA output has q's shape), so chunked-output
+            # reassembly can be verified exactly.
+            return (q.to(out_dtype),)
 
         def fake_frequency_regulator(freq: int):
             del freq
@@ -137,7 +150,16 @@ class TestKVQuantNPUUnit:
                     "shape": tuple(x.shape),
                 }
             )
-            scale = torch.full((1,), float(block_size), dtype=torch.float32)
+            # Mirror the real kernel contract: BSND inputs are transposed
+            # before quantization, so the returned tensor is ALWAYS
+            # BNSD-logical [B, N, S, D] and the scale is per (head, row-block):
+            # [B, N, ceil(S / block_size), ceil(D / 128)].
+            if layout == "BSND":
+                x = x.transpose(1, 2)
+            x = x.contiguous()
+            b, n, s, _d = x.shape
+            blocks = -(-s // block_size)
+            scale = torch.ones(b, n, blocks, 1, dtype=torch.float32)
             return x, scale
 
         def fake_fa_block_quant_preprocess_varlen(x, cu_seq_lens, block_size, dst_type):
@@ -304,10 +326,12 @@ class TestKVQuantNPUUnit:
             kv_quant_npu.fp8_rotate_quant_fa_varlen(query, key, value, [4], [4])
 
     @pytest.mark.parametrize(
-        "layout,input_shape,expected_quant_shapes",
+        "layout,input_shape,fia_out_shape,expected_quant_shapes",
         [
-            ("BSND", (1, 8, 2, 4), [(1, 8, 2, 4), (1, 5, 2, 4), (1, 5, 2, 4)]),
-            ("BNSD", (1, 2, 8, 4), [(1, 2, 8, 4), (1, 2, 5, 4), (1, 2, 5, 4)]),
+            # Quant always returns BNSD-logical tensors, so the FIA output is
+            # BNSD too; the wrapper transposes back to the caller's layout.
+            ("BSND", (1, 8, 2, 4), (1, 2, 8, 4), [(1, 8, 2, 4), (1, 5, 2, 4), (1, 5, 2, 4)]),
+            ("BNSD", (1, 2, 8, 4), (1, 2, 8, 4), [(1, 2, 8, 4), (1, 2, 5, 4), (1, 2, 5, 4)]),
         ],
     )
     def test_fp8_rotate_quant_kv_slice_dense_contract(
@@ -315,10 +339,11 @@ class TestKVQuantNPUUnit:
         fake_quant_ops: dict[str, Any],
         layout: str,
         input_shape: tuple[int, int, int, int],
+        fia_out_shape: tuple[int, int, int, int],
         expected_quant_shapes: list[tuple[int, int, int, int]],
     ) -> None:
         query, key, value = self._make_qkv(input_shape)
-        fake_quant_ops["out_shape"] = input_shape
+        fake_quant_ops["out_shape"] = fia_out_shape
 
         out = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 5, layout=layout, softmax_scale=0.125)
 
@@ -328,8 +353,12 @@ class TestKVQuantNPUUnit:
         assert [call["layout"] for call in fake_quant_ops["fa_calls"]] == [layout] * 3
         assert [call["block_size"] for call in fake_quant_ops["fa_calls"]] == [128, 256, 256]
         assert fake_quant_ops["varlen_fa_calls"] == []
+        # One FIA call by default (MINDIESD_FP8_FIA_QCHUNK unset).
+        assert len(fake_quant_ops["fia_calls"]) == 1
         kwargs = fake_quant_ops["npu_kwargs"]
-        assert kwargs["input_layout"] == layout
+        # Quant output is always BNSD-logical, so the FIA dispatch is BNSD
+        # regardless of the caller-facing layout.
+        assert kwargs["input_layout"] == "BNSD"
         # Dense dispatch: the FIA varlen feature stays off.
         assert "actual_seq_qlen" not in kwargs
         assert "actual_seq_kvlen" not in kwargs
@@ -343,7 +372,7 @@ class TestKVQuantNPUUnit:
 
     def test_fp8_rotate_quant_kv_slice_full_length_kv_is_noop_slice(self, fake_quant_ops) -> None:
         query, key, value = self._make_qkv((1, 8, 2, 4))
-        fake_quant_ops["out_shape"] = (1, 8, 2, 4)
+        fake_quant_ops["out_shape"] = (1, 2, 8, 4)  # FIA output is BNSD-logical
 
         out = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 8, layout="BSND")
 
@@ -362,6 +391,82 @@ class TestKVQuantNPUUnit:
 
         with pytest.raises(ValueError, match="unsupported layout"):
             kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 5, layout="INVALID")
+
+    def test_fia_q_chunk_count_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("MINDIESD_FP8_FIA_QCHUNK", raising=False)
+        assert kv_quant_npu._fia_q_chunk_count() == 1
+        monkeypatch.setenv("MINDIESD_FP8_FIA_QCHUNK", "4")
+        assert kv_quant_npu._fia_q_chunk_count() == 4
+        # Non-positive values clamp to the single-call behavior.
+        monkeypatch.setenv("MINDIESD_FP8_FIA_QCHUNK", "0")
+        assert kv_quant_npu._fia_q_chunk_count() == 1
+        monkeypatch.setenv("MINDIESD_FP8_FIA_QCHUNK", "abc")
+        with pytest.raises(ValueError, match="MINDIESD_FP8_FIA_QCHUNK"):
+            kv_quant_npu._fia_q_chunk_count()
+
+    @pytest.mark.parametrize(
+        "seq_len,n_chunks,expected",
+        [
+            (100, 1, [(0, 100)]),  # chunking disabled
+            (128, 8, [(0, 128)]),  # seq fits in one Q block: no split
+            (512, 2, [(0, 256), (256, 512)]),
+            (256, 2, [(0, 128), (128, 256)]),
+            # More chunks requested than 128-row blocks: fewer, aligned chunks.
+            (384, 4, [(0, 128), (128, 256), (256, 384)]),
+            # Ragged tail: boundaries stay block-aligned, last chunk is short.
+            (300, 2, [(0, 256), (256, 300)]),
+        ],
+    )
+    def test_q_chunk_bounds_aligned_to_q_block(self, seq_len, n_chunks, expected) -> None:
+        assert kv_quant_npu._q_chunk_bounds(seq_len, n_chunks) == expected
+
+    def test_fp8_rotate_quant_kv_slice_qchunk_splits_fia_and_reassembles(
+        self,
+        fake_quant_ops: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("MINDIESD_FP8_FIA_QCHUNK", "2")
+        # Shrink the Q block so the tiny fake seq (8 rows) actually splits.
+        monkeypatch.setattr(kv_quant_npu, "_Q_BLOCK_SIZE", 4)
+        query, key, value = self._make_qkv((1, 8, 2, 4))  # BSND: S=8 -> 2 chunks of 4
+
+        out = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 5, layout="BSND")
+
+        assert out.shape == query.shape
+        calls = fake_quant_ops["fia_calls"]
+        assert len(calls) == 2
+        # Each call gets a BNSD-logical 4-row Q chunk and the full (kv_len-sliced) K/V.
+        assert [c["q_shape"] for c in calls] == [(1, 2, 4, 4), (1, 2, 4, 4)]
+        assert [c["k_shape"] for c in calls] == [(1, 2, 5, 4), (1, 2, 5, 4)]
+        assert [c["v_shape"] for c in calls] == [(1, 2, 5, 4), (1, 2, 5, 4)]
+        assert [c["kwargs"]["input_layout"] for c in calls] == ["BNSD", "BNSD"]
+        assert "actual_seq_qlen" not in calls[0]["kwargs"]
+        # Per-chunk Q dequant scales are the matching block slices (1 block per chunk).
+        assert [tuple(c["kwargs"]["dequant_scale_query"].shape) for c in calls] == [(1, 2, 1, 1), (1, 2, 1, 1)]
+        # K/V (and Q) are quantized exactly once, not per chunk.
+        assert len(fake_quant_ops["fa_calls"]) == 3
+        # The fake rotation is identity and fake FIA echoes its Q chunk, so the
+        # reassembled output must equal the input query exactly (chunk order kept).
+        assert torch.equal(out, query)
+
+    def test_fp8_rotate_quant_kv_slice_qchunk_ragged_tail(
+        self,
+        fake_quant_ops: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("MINDIESD_FP8_FIA_QCHUNK", "2")
+        monkeypatch.setattr(kv_quant_npu, "_Q_BLOCK_SIZE", 4)
+        query, key, value = self._make_qkv((1, 10, 2, 4))  # S=10 -> chunks (0,8), (8,10)
+
+        out = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 10, layout="BSND")
+
+        assert out.shape == query.shape
+        calls = fake_quant_ops["fia_calls"]
+        assert [c["q_shape"] for c in calls] == [(1, 2, 8, 4), (1, 2, 2, 4)]
+        # Tail chunk (2 rows) gets the ceil(2/4)=1 trailing scale block;
+        # first chunk gets its 2 blocks.
+        assert [tuple(c["kwargs"]["dequant_scale_query"].shape) for c in calls] == [(1, 2, 2, 1), (1, 2, 1, 1)]
+        assert torch.equal(out, query)
 
 
 @npu_smoke
@@ -412,3 +517,32 @@ class TestKVQuantNPUSmoke:
         out = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 5, layout="BSND")
         assert out.shape == query.shape
         assert out.dtype == query.dtype
+
+    def test_fp8_rotate_quant_kv_slice_qchunk_matches_single_call(self, monkeypatch):
+        """Chunked FIA (MINDIESD_FP8_FIA_QCHUNK>1) must match the single wide call.
+
+        Chunk boundaries align to the 128-row Q quant block, so quantization is
+        identical; only FIA-internal tiling may differ, hence allclose rather
+        than bitwise equality.
+        """
+        try:
+            kv_quant_npu._load_quant_ops.cache_clear()
+            kv_quant_npu._load_quant_ops()
+        except ImportError:
+            pytest.skip("NPU quant dependencies are not fully installed.")
+
+        torch.manual_seed(0)
+        # S=640 -> 3 chunks (256, 256, 128) with QCHUNK=3; kv_len exercises the
+        # prefix slice and the 256-row K/V block's ragged tail.
+        query = torch.randn(1, 640, 2, 128, dtype=torch.bfloat16, device="npu")
+        key = torch.randn(1, 640, 2, 128, dtype=torch.bfloat16, device="npu")
+        value = torch.randn(1, 640, 2, 128, dtype=torch.bfloat16, device="npu")
+
+        monkeypatch.setenv("MINDIESD_FP8_FIA_QCHUNK", "1")
+        ref = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 384, layout="BSND")
+        monkeypatch.setenv("MINDIESD_FP8_FIA_QCHUNK", "3")
+        out = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 384, layout="BSND")
+
+        assert out.shape == ref.shape
+        assert out.dtype == ref.dtype
+        torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
