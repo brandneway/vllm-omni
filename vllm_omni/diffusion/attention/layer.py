@@ -10,6 +10,7 @@
 from dataclasses import replace
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
@@ -361,6 +362,12 @@ class Attention(nn.Module):
             if self.use_ring and strategy is not self._no_parallel_strategy:
                 out = self._run_ring_attention(query, key, value, attn_metadata)
             else:
+                # Scheme B (MINDIESD_FP8_CHUNK_A2A): chunked FP8 FIA with the
+                # reverse Ulysses a2a interleaved per chunk as low-power gaps;
+                # returns None when any precondition fails (fallback below).
+                chunked_out = self._try_chunked_fia_a2a(query, key, value, attn_metadata, strategy, ctx)
+                if chunked_out is not None:
+                    return chunked_out
                 out = self._run_local_attention(query, key, value, attn_metadata)
 
         # 3. Post-processing (Reverse Communication)
@@ -368,6 +375,96 @@ class Attention(nn.Module):
         out = strategy.post_attention(out, ctx)
 
         return out
+
+    def _try_chunked_fia_a2a(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+        strategy,
+        ctx,
+    ) -> torch.Tensor | None:
+        """Scheme B: chunked FP8 FIA with per-chunk reverse a2a (power gaps).
+
+        Runs the dense kv-slice FP8 FIA in Q-row chunks (quantized once) and,
+        after each chunk, gathers that chunk's output to the rank owning those
+        rows in the reverse a2a (P2P), interleaving low-power communication
+        between compute bursts. Each rank concatenates its owned blocks into
+        exactly the tensor the monolithic ``post_attention`` would return.
+
+        Returns None — without entering any collective — when a precondition
+        fails; the caller then falls back to the regular path. All guards are
+        rank-invariant so ranks never diverge on whether the chunk loop runs.
+        """
+        if strategy.name != "ulysses" or ctx is None or self.use_ring:
+            return None
+        if query.dtype == torch.float32:
+            return None  # fp32 routes to the SDPA fallback in _run_local_attention
+
+        from vllm_omni.platforms.npu.quant import kv_quant_npu  # lazy: NPU-only path
+
+        if not (kv_quant_npu._fia_chunk_a2a_enabled() and kv_quant_npu._fia_q_chunk_count() > 1):
+            return None
+        if not kv_quant_npu.fp8_kv_slice_enabled():
+            logger.warning_once(
+                "MINDIESD_FP8_CHUNK_A2A requires MINDIESD_FP8_KV_SLICE=1; falling back to chunked FIA without a2a gaps."
+            )
+            return None
+        if get_ulysses_mode(default="strict") != "strict":
+            logger.warning_once(
+                "MINDIESD_FP8_CHUNK_A2A supports only strict Ulysses mode; falling back to chunked FIA without a2a gaps."
+            )
+            return None
+        if getattr(ctx, "joint_len", 0) or getattr(ctx, "use_uaa", False):
+            logger.warning_once(
+                "MINDIESD_FP8_CHUNK_A2A does not support joint (text) attention or advanced_uaa; "
+                "falling back to chunked FIA without a2a gaps."
+            )
+            return None
+        extra = attn_metadata.extra if attn_metadata else {}
+        if extra.get("kv_cache_dtype") != "fp8" or not extra.get("npu_attn_varlen", False):
+            logger.warning_once(
+                "MINDIESD_FP8_CHUNK_A2A requires the packed varlen FP8 path; falling back to non-chunked attention."
+            )
+            return None
+        forward_chunked = getattr(self.attention, "forward_npu_fp8_kv_slice_chunked", None)
+        if forward_chunked is None:
+            logger.warning_once(
+                f"MINDIESD_FP8_CHUNK_A2A requires the NPU FP8 kv-slice path (FLASH_ATTN backend); "
+                f"got {type(self.attention).__name__}. Falling back to non-chunked attention."
+            )
+            return None
+
+        world = dist.get_world_size(ctx.ulysses_pg)
+        n_chunks = kv_quant_npu._fia_q_chunk_count()
+        bounds = kv_quant_npu._scheme_b_chunk_bounds(query.shape[1], world, n_chunks)
+        if bounds is None:
+            logger.warning_once(
+                "MINDIESD_FP8_CHUNK_A2A: no 128-aligned shard-compatible chunk plan for "
+                f"seq_len={query.shape[1]}, world_size={world}, chunks={n_chunks}; "
+                "falling back to chunked FIA without a2a gaps."
+            )
+            return None
+        if len(bounds) != n_chunks:
+            logger.warning_once(
+                f"MINDIESD_FP8_CHUNK_A2A: requested {n_chunks} chunks but the alignment "
+                f"constraints allow {len(bounds)}; running with the adjusted count."
+            )
+
+        chunks_per_shard = len(bounds) // world
+        blocks: list[torch.Tensor] = []
+
+        def _gather_chunk(out_chunk: torch.Tensor, chunk_idx: int) -> None:
+            block = strategy.post_attention_chunk_gather(out_chunk, ctx, chunk_idx // chunks_per_shard)
+            if block is not None:
+                blocks.append(block)
+
+        # forward_chunked resolves the packed contract before entering the loop
+        # and fires no callback on failure, so a False return is a clean miss.
+        if not forward_chunked(query, key, value, attn_metadata, bounds, _gather_chunk):
+            return None
+        return torch.cat(blocks, dim=1)
 
     @staticmethod
     def _active_paged_kv_adapter():

@@ -772,6 +772,50 @@ class FlashAttentionImpl(AttentionImpl):
             )
         )
 
+    def forward_npu_fp8_kv_slice_chunked(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata = None,
+        q_chunk_bounds: list[tuple[int, int]] | None = None,
+        chunk_callback=None,
+    ) -> bool:
+        """Chunked FP8 kv-slice attention with a per-chunk output callback.
+
+        Scheme B (MINDIESD_FP8_CHUNK_A2A): the Omni Attention layer drives this
+        directly (bypassing forward_npu) so it can interleave reverse-a2a
+        communication between chunked FIA calls via chunk_callback, which
+        receives each chunk's output in the model layout (BSND).
+
+        Returns False — with no callback fired — when the packed contract does
+        not hold, so the caller can safely fall back to the regular paths.
+        Returns True after all chunks ran (outputs were consumed by the
+        callback).
+        """
+        extra = attn_metadata.extra if attn_metadata else {}
+        resolved = self._resolve_packed_seq_npu(query, key, extra)
+        if resolved is None:
+            return False
+        _, seq_k = resolved
+        used_k = seq_k[0]  # real document length (first cumulative end)
+
+        from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_rotate_quant_kv_slice
+
+        # The packed contract guarantees [1, T, N, D] == BSND; the quant
+        # wrapper slices K/V on the seq axis itself.
+        fp8_rotate_quant_kv_slice(
+            query,
+            key,
+            value,
+            used_k,
+            layout="BSND",
+            softmax_scale=self.softmax_scale,
+            q_chunk_bounds=q_chunk_bounds,
+            chunk_callback=chunk_callback,
+        )
+        return True
+
     def _forward_prefix_kv_slice_quant_npu(
         self,
         query: torch.Tensor,

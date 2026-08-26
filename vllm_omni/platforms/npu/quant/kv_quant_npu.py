@@ -22,6 +22,15 @@ to stay inside the NPU power envelope. Chunk boundaries align to the Q
 block-quant row block (128 rows), so per-chunk quantization is identical to
 the full-length quantization. Only the dense kv-slice path is chunked; the
 varlen path warns and keeps a single call.
+
+Setting ``MINDIESD_FP8_CHUNK_A2A`` to a truthy value (with
+``MINDIESD_FP8_FIA_QCHUNK`` > 1) selects "scheme B": the Omni Attention layer
+interleaves a chunked reverse Ulysses all-to-all (P2P gather to the
+row-owner rank) after each chunked FIA call, putting low-power
+communication gaps between compute bursts (duty cycling). Default off =
+"scheme C" (chunked FIA only, single reverse a2a at the end). Scheme B
+requires strict Ulysses SP with no joint attention and a shard/block-aligned
+sequence; otherwise the layer logs a warning and falls back to scheme C.
 """
 
 from __future__ import annotations
@@ -106,6 +115,55 @@ def _q_chunk_bounds(seq_len: int, n_chunks: int) -> list[tuple[int, int]]:
         bounds.append((start, end))
         start = end
     return bounds
+
+
+def _fia_chunk_a2a_enabled() -> bool:
+    """Truthy ``MINDIESD_FP8_CHUNK_A2A`` (``1``/``true``/``yes``/``on``) selects
+    scheme B: with ``MINDIESD_FP8_FIA_QCHUNK`` > 1, each chunked FIA call is
+    followed by a chunked reverse all-to-all (P2P gather to the row-owner
+    rank), interleaving low-power communication gaps between compute bursts.
+    Default off = scheme C (chunked FIA only, single reverse a2a at the end).
+    Read per call (no cache) so a changed environment takes effect without a
+    process restart, matching ``fp8_kv_slice_enabled``."""
+    enabled = os.environ.get("MINDIESD_FP8_CHUNK_A2A", "false").strip().lower()
+    return enabled in ("1", "true", "yes", "on")
+
+
+def _scheme_b_chunk_bounds(
+    total_seq: int, world_size: int, n_chunks: int
+) -> list[tuple[int, int]] | None:
+    """Chunk plan for the chunked reverse-a2a mode (scheme B).
+
+    Splits ``[0, total_seq)`` into ``world_size`` contiguous shards (the
+    reverse all-to-all's seq-scatter partition) and each shard into ``k``
+    equal chunks, so chunk ``j`` maps entirely to destination rank ``j // k``
+    and the per-chunk reverse comm is a P2P gather to that single rank.
+
+    All boundaries must align to the Q block-quant row block
+    (``_Q_BLOCK_SIZE``); since shard boundaries are chunk boundaries, the
+    shard length itself must be block-aligned. ``k`` is reduced from
+    ``n_chunks // world_size`` until the per-shard split is exact and
+    block-aligned. Returns None when no feasible plan exists (caller falls
+    back to plain chunked FIA, scheme C).
+    """
+    if n_chunks <= 1 or world_size <= 1:
+        return None
+    if total_seq % world_size != 0:
+        return None
+    shard = total_seq // world_size
+    if shard % _Q_BLOCK_SIZE != 0:
+        return None
+    k = n_chunks // world_size
+    while k >= 1:
+        if shard % k == 0 and (shard // k) % _Q_BLOCK_SIZE == 0:
+            chunk = shard // k
+            return [
+                (r * shard + b * chunk, r * shard + (b + 1) * chunk)
+                for r in range(world_size)
+                for b in range(k)
+            ]
+        k -= 1
+    return None
 
 
 def _freq_env_int(name: str, default: int) -> int:
@@ -473,7 +531,9 @@ def fp8_rotate_quant_kv_slice(
     *,
     layout: str = "BSND",
     softmax_scale: float | None = None,
-) -> torch.Tensor:
+    q_chunk_bounds: list[tuple[int, int]] | None = None,
+    chunk_callback=None,
+) -> torch.Tensor | None:
     """Run dense NPU fused attention with dynamic FP8 Q/K/V after slicing K/V
     to the valid prefix.
 
@@ -511,10 +571,18 @@ def fp8_rotate_quant_kv_slice(
             operator itself is always fed BNSD (the quant kernel's output
             layout) and its output is transposed back for ``BSND`` callers.
         softmax_scale: If None, uses ``1 / sqrt(head_dim)``.
+        q_chunk_bounds: Optional explicit ``[start, end)`` query-row chunk
+            plan (e.g. from :func:`_scheme_b_chunk_bounds`); overrides the
+            env-driven ``MINDIESD_FP8_FIA_QCHUNK`` bounds when given.
+        chunk_callback: Optional ``fn(out_chunk, chunk_idx)`` invoked with
+            each chunk's output in the caller-facing layout (scheme B: the
+            caller interleaves reverse-a2a communication between chunks).
+            When set, nothing is reassembled and the return value is None.
 
     Returns:
         Attention output in the same layout as the inputs, at the query's
-        full sequence length.
+        full sequence length; None when ``chunk_callback`` consumed the
+        per-chunk outputs.
     """
     (
         torch_npu,
@@ -575,10 +643,11 @@ def fp8_rotate_quant_kv_slice(
     # wide attention burst becomes several narrower ones. q may be block-padded
     # beyond seq_len by the quant kernel; chunks cover the quantized rows and
     # each chunk's output keeps only its real rows (pad-row outputs are dropped
-    # exactly like the single-call trim below).
-    bounds = _q_chunk_bounds(q.shape[2], _fia_q_chunk_count())
+    # exactly like the single-call trim below). An explicit q_chunk_bounds plan
+    # (scheme B, from _scheme_b_chunk_bounds) overrides the env-driven bounds.
+    bounds = q_chunk_bounds if q_chunk_bounds is not None else _q_chunk_bounds(q.shape[2], _fia_q_chunk_count())
     out_parts = []
-    for row0, row1 in bounds:
+    for chunk_idx, (row0, row1) in enumerate(bounds):
         real_rows = min(row1, seq_len) - row0
         if real_rows <= 0:
             break  # remaining chunks cover only quant padding rows
@@ -605,11 +674,20 @@ def fp8_rotate_quant_kv_slice(
         # The op may hand back a padded seq axis; keep this chunk's real rows.
         if out_c.shape[2] != real_rows:
             out_c = out_c[:, :, :real_rows, :]
-        out_parts.append(out_c)
-    out = torch.cat(out_parts, dim=2) if len(out_parts) > 1 else out_parts[0]
+        if layout == "BSND":
+            out_c = out_c.transpose(1, 2)
+        if chunk_callback is not None:
+            # Scheme B: the caller consumes each chunk (e.g. interleaved
+            # reverse a2a); nothing is reassembled here.
+            chunk_callback(out_c, chunk_idx)
+        else:
+            out_parts.append(out_c)
     if freq_restore is not None:
         _freq_restore_after_fia(frequency_regulator, freq_restore)
-
-    if layout == "BSND":
-        out = out.transpose(1, 2)
+    if chunk_callback is not None:
+        return None
+    # Chunks were already transposed to the caller layout in the loop; just
+    # concatenate along the layout's sequence axis.
+    seq_dim = 1 if layout == "BSND" else 2
+    out = torch.cat(out_parts, dim=seq_dim) if len(out_parts) > 1 else out_parts[0]
     return out

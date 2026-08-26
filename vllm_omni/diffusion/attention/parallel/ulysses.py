@@ -489,3 +489,48 @@ class UlyssesParallelAttention:
                 use_sync=ctx.use_sync,
             )
         return SeqAllToAll4D.apply(ctx.ulysses_pg, attn_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync)
+
+    def post_attention_chunk_gather(
+        self,
+        attn_output_chunk: torch.Tensor,
+        ctx: ParallelAttentionContext | None,
+        dst_group_rank: int,
+    ) -> torch.Tensor | None:
+        """Reverse resharding for one query chunk via P2P gather (scheme B).
+
+        ``attn_output_chunk`` is this rank's head slice ``(bs, rows,
+        head_cnt/P, head_size)`` of the chunk's rows. The chunk's rows belong
+        entirely to ``dst_group_rank``'s seq shard of the reverse a2a (the
+        chunk plan guarantees this), so the reverse comm for one chunk is a
+        gather to that single rank instead of a full all-to-all: every rank
+        sends its head slice to the owner, which concatenates slices in group
+        rank order — the same head ordering the monolithic SeqAllToAll4D
+        reverse produces.
+
+        Returns the assembled ``(bs, rows, head_cnt, head_size)`` block on the
+        destination rank, None on all other ranks. Synchronous by design: the
+        P2P exchange is the low-power gap between chunked attention bursts.
+        """
+        assert isinstance(ctx, _UlyssesCtx), f"Unexpected ctx type: {type(ctx)!r}"
+        pg = ctx.ulysses_pg
+        world = dist.get_world_size(pg)
+        if world == 1:
+            return attn_output_chunk
+        rank = dist.get_rank(pg)
+        send_buf = attn_output_chunk.contiguous()
+        if rank == dst_group_rank:
+            recv_bufs = [torch.empty_like(send_buf) for _ in range(world)]
+            ops = [
+                dist.P2POp(dist.irecv, recv_bufs[src], dist.get_global_rank(pg, src), pg)
+                for src in range(world)
+                if src != rank
+            ]
+            if ops:
+                for req in dist.batch_isend_irecv(ops):
+                    req.wait()
+            recv_bufs[rank] = send_buf
+            return torch.cat(recv_bufs, dim=2)
+        op = dist.P2POp(dist.isend, send_buf, dist.get_global_rank(pg, dst_group_rank), pg)
+        for req in dist.batch_isend_irecv([op]):
+            req.wait()
+        return None
