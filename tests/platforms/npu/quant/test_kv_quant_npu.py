@@ -473,7 +473,7 @@ class TestKVQuantNPUUnit:
             (4000, 4, 8, [(0, 512), (512, 1024), (1024, 1536), (1536, 2048),
                           (2048, 2560), (2560, 3072), (3072, 3584), (3584, 4000)]),
             # total not divisible by world -> infeasible.
-            (4100, 4, 8, None),
+            (4099, 4, 8, None),
             # chunking disabled / single rank.
             (4096, 4, 1, None),
             (4096, 1, 8, None),
