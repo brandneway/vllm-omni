@@ -464,6 +464,15 @@ class Attention(nn.Module):
         # and fires no callback on failure, so a False return is a clean miss.
         if not forward_chunked(query, key, value, attn_metadata, bounds, _gather_chunk):
             return None
+        if not getattr(self, "_chunked_a2a_logged", False):
+            self._chunked_a2a_logged = True
+            logger.info(
+                "MINDIESD_FP8_CHUNK_A2A active (scheme B): %d chunks x %d rows, "
+                "per-chunk reverse a2a gaps interleaved (prefix=%s).",
+                len(bounds),
+                bounds[0][1] - bounds[0][0],
+                self.prefix,
+            )
         return torch.cat(blocks, dim=1)
 
     @staticmethod
