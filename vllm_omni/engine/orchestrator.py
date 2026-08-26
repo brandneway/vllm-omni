@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Orchestrator for vLLM-Omni multi-stage runtime.
 
@@ -36,6 +39,7 @@ from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
+    AbortResultMessage,
     AddCompanionRequestMessage,
     CollectiveRPCRequestMessage,
     CollectiveRPCResultMessage,
@@ -362,8 +366,8 @@ class Orchestrator:
     def __init__(
         self,
         request_async_queue: janus.AsyncQueue[EngineQueueMessage],
-        output_async_queue: janus.AsyncQueue[dict[str, Any]],
-        rpc_async_queue: janus.AsyncQueue[dict[str, Any]],
+        output_async_queue: janus.AsyncQueue[EngineQueueMessage],
+        rpc_async_queue: janus.AsyncQueue[EngineQueueMessage],
         stage_pools: list[StagePool],
         *,
         async_chunk: bool = False,
@@ -817,13 +821,35 @@ class Orchestrator:
         )
 
     async def _handle_abort(self, msg: AbortRequestMessage) -> None:
-        """Handle an abort message from the main thread."""
+        """Handle an abort message from the main thread.
+
+        When ``msg.rpc_id`` is set, emit :class:`AbortResultMessage` after
+        stage aborts, binding release, and request cleanup complete so the
+        caller can await acknowledgment. Fire-and-forget aborts omit rpc_id.
+        """
         request_ids = msg.request_ids
-        # _cleanup_request_ids is CFG-aware: it expands aborted parents to
-        # their companions and fails a deferred parent whose companion is
-        # aborted before its output arrived.
-        await self._cleanup_request_ids(list(request_ids), abort=True)
-        logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
+        error: str | None = None
+        try:
+            # _cleanup_request_ids is CFG-aware: it expands aborted parents to
+            # their companions and fails a deferred parent whose companion is
+            # aborted before its output arrived.
+            await self._cleanup_request_ids(list(request_ids), abort=True)
+            logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
+        except Exception as exc:
+            error = str(exc)
+            logger.exception("[Orchestrator] Abort failed for request(s) %s", request_ids)
+            if msg.rpc_id is None:
+                raise
+        if msg.rpc_id is not None:
+            # Always emit a result when rpc_id is set so CorrelatedRpcClient
+            # waiters are unblocked even on failure.
+            await self.rpc_async_queue.put(
+                AbortResultMessage(
+                    rpc_id=msg.rpc_id,
+                    success=error is None,
+                    error=error,
+                )
+            )
 
     async def _handle_interaction(self, msg: InteractionMessage) -> None:
         """Handle a midway interaction for an active streaming diffusion request."""
@@ -1150,6 +1176,35 @@ class Orchestrator:
             abort=True,
         )
 
+    async def _fail_request_client_error(
+        self,
+        req_id: str,
+        stage_id: int,
+        error: str,
+        *,
+        close_duplex_sessions: bool = False,
+    ) -> None:
+        """Fail one request with a non-fatal 400 (bad input, engine survives).
+
+        The non-fatal counterpart of `_fail_request_dead_stage`: emits a
+        client-error ErrorMessage (default `fatal=False`) so the engine keeps
+        serving, then releases the request's state across every stage pool.
+        """
+        await self.output_async_queue.put(
+            ErrorMessage(
+                error=error,
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                error_type=DEFAULT_CLIENT_ERROR_TYPE,
+                request_id=req_id,
+                stage_id=stage_id,
+            )
+        )
+        await self._cleanup_request_ids(
+            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+            abort=True,
+            close_duplex_sessions=close_duplex_sessions,
+        )
+
     async def _dispatch_or_fail_request(
         self,
         dispatch: Callable[[], Awaitable[Any]],
@@ -1171,7 +1226,9 @@ class Orchestrator:
         StageUnavailableError (no live replica / evicted slot) or
         EngineDeadError (replica died mid-submit before the poll loop evicted
         it). Both mean "this request cannot be placed", not "the server is
-        broken": fail the request and keep serving (#4285). Unrelated errors
+        broken": fail the request and keep serving (#4285). An OverflowError
+        from encoding an out-of-range request value is likewise failed as a
+        client error (400) rather than killing the loop. Other unrelated errors
         propagate. Returns False when the request was failed.
 
         ``req_id`` is the request the failure is attributed to; ``dispatch_req_id``
@@ -1213,6 +1270,24 @@ class Orchestrator:
             await self._fail_request_dead_stage(req_id, stage_id)
             if dead_replica is not None and dead_replica in pool.live_replica_ids():
                 await self._handle_dead_replica(stage_id, dead_replica, e)
+            return False
+        except OverflowError as e:
+            # Catch overflow errors in the request payload to ensure that msgpack
+            # encoding can't kill the engine; instead, we just fail this request.
+            # The frontend should generally validate this as well, but this is needed
+            # in case we get values like seed > 2**64-1 from sampling params.
+            logger.warning(
+                "[Orchestrator] %s dispatch for req=%s hit an unserializable value on stage-%s: %s",
+                operation,
+                req_id,
+                stage_id,
+                e,
+            )
+            await self._fail_request_client_error(
+                req_id,
+                stage_id,
+                f"Request contains a value that cannot be serialized: {e}",
+            )
             return False
 
     # ---- Shared helpers ----
@@ -2269,21 +2344,11 @@ class Orchestrator:
                 "and none were provided; failing the request",
                 request_id,
             )
-            await self.output_async_queue.put(
-                ErrorMessage(
-                    error=(
-                        "async_chunk requires prompt_token_ids on the stage-0 request; "
-                        "an embeds-only prompt cannot prewarm downstream stages"
-                    ),
-                    status_code=HTTPStatus.BAD_REQUEST.value,
-                    error_type=DEFAULT_CLIENT_ERROR_TYPE,
-                    request_id=request_id,
-                    stage_id=0,
-                )
-            )
-            await self._cleanup_request_ids(
-                [request_id, *self._cfg_tracker.cleanup_parent(request_id)],
-                abort=True,
+            await self._fail_request_client_error(
+                request_id,
+                0,
+                "async_chunk requires prompt_token_ids on the stage-0 request; "
+                "an embeds-only prompt cannot prewarm downstream stages",
                 close_duplex_sessions=True,
             )
             return False
