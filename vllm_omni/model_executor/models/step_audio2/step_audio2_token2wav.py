@@ -1,14 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import io
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
-import librosa  # noqa: TID251
 import numpy as np
 import onnxruntime
 import s3tokenizer
-import soundfile as sf
 import torch
 import torch.nn as nn
 import torchaudio
@@ -23,6 +24,8 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import WeightsMapper
+from vllm.multimodal.audio import AudioResampler
+from vllm.multimodal.media.audio import load_audio
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -231,19 +234,11 @@ class StepAudio2Token2WavCore(nn.Module):
 
     def _prepare_prompt(self, prompt_wav: str):
         """Prepare prompt audio for conditioning"""
-        # Prefer soundfile/librosa path to avoid torchaudio->torchcodec runtime coupling.
-        try:
-            audio_np_raw, sample_rate = sf.read(prompt_wav, dtype="float32", always_2d=False)
-        except Exception:
-            audio_np_raw, sample_rate = librosa.load(prompt_wav, sr=None, mono=True)
-        if isinstance(audio_np_raw, np.ndarray) and audio_np_raw.ndim > 1:
-            audio_np_raw = np.mean(audio_np_raw, axis=-1)
+        audio_np_raw, sample_rate = load_audio(prompt_wav, sr=None, mono=True)
         sample_rate = int(sample_rate)
 
         # 16 kHz branch: s3tokenizer + speaker embedding
-        audio_16k = audio_np_raw.astype(np.float32)
-        if sample_rate != 16000:
-            audio_16k = librosa.resample(y=audio_16k, orig_sr=sample_rate, target_sr=16000)
+        audio_16k = AudioResampler(target_sr=16000).resample(audio_np_raw.astype(np.float32), orig_sr=sample_rate)
         audio = torch.from_numpy(audio_16k)
         mels = s3tokenizer.log_mel_spectrogram(audio)
         mels, mels_lens = s3tokenizer.padding([mels])
@@ -257,9 +252,7 @@ class StepAudio2Token2WavCore(nn.Module):
 
         # 24 kHz branch: mel spectrogram for flow model conditioning
         # Must resample from the ORIGINAL audio, not the 16 kHz version.
-        audio_24k = audio_np_raw.astype(np.float32)
-        if sample_rate != 24000:
-            audio_24k = librosa.resample(y=audio_24k, orig_sr=sample_rate, target_sr=24000)
+        audio_24k = AudioResampler(target_sr=24000).resample(audio_np_raw.astype(np.float32), orig_sr=sample_rate)
         audio_24k_t = torch.from_numpy(audio_24k).unsqueeze(0)  # [1, T]
         prompt_mel = (
             mel_spectrogram(
@@ -364,7 +357,7 @@ class StepAudio2Token2WavCore(nn.Module):
 
     def stream_chunk_for(
         self,
-        audio_tokens: list[int],
+        audio_tokens: list[int] | torch.Tensor,
         prompt_wav: str,
         last_chunk: bool,
         state: _StreamState,
@@ -377,7 +370,14 @@ class StepAudio2Token2WavCore(nn.Module):
             self.cache[prompt_wav] = self._prepare_prompt(prompt_wav)
         _, _, spk_emb, prompt_mels, _ = self.cache[prompt_wav]
 
-        token_tensor = torch.tensor([audio_tokens], dtype=torch.int32, device=self.device)
+        if isinstance(audio_tokens, torch.Tensor):
+            # Already on device; avoids the D2H->H2D round-trip of rebuilding from a list.
+            # clone() so token_tensor never aliases the caller's input_ids: when the ids
+            # already arrive int32-on-device the .to() is a no-op and would share storage,
+            # so an in-place write inside inference_chunk could corrupt input_ids.
+            token_tensor = audio_tokens.reshape(1, -1).to(device=self.device, dtype=torch.int32).clone()
+        else:
+            token_tensor = torch.tensor([audio_tokens], dtype=torch.int32, device=self.device)
 
         with torch.amp.autocast(
             str(self.device.type),
@@ -651,10 +651,11 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         state = self._stream_states[0]
 
         # --- Extract audio tokens ---
-        audio_tokens = input_ids.flatten().cpu().tolist()
+        # Kept on device; stream_chunk_for takes the tensor directly.
+        audio_tokens = input_ids.flatten()
 
         # Empty chunk (e.g. EOF with no audio tokens)
-        if not audio_tokens:
+        if audio_tokens.numel() == 0:
             if state.setup_done:
                 self.token2wav.reset_stream_for(state)
             else:
