@@ -32,6 +32,16 @@ communication gaps between compute bursts (duty cycling). Default off =
 requires strict Ulysses SP with no joint attention and seq_len divisible by
 the SP world size; otherwise the layer logs a warning and falls back to
 scheme C.
+
+Setting ``MINDIESD_FP8_FIA_HCHUNK`` to a positive integer H < num_heads
+("scheme A") calls FIA on H-head slices inside each (optionally q-chunked)
+step: the per-call K/V footprint shrinks to L2-resident sizes, which
+measurably raises long-KV throughput (the FIA kernel re-reads K/V per q-tile
+from HBM when K/V exceeds L2). Quantization stays full-length/full-head and
+is sliced per chunk, so results are bit-identical. Requires MHA; GQA layers
+warn and run unchunked. Composes with both Q chunking and scheme B (head
+chunks nest inside each q chunk; the reverse-a2a callback fires once per q
+chunk with the full-head output).
 """
 
 from __future__ import annotations
@@ -128,6 +138,28 @@ def _fia_chunk_a2a_enabled() -> bool:
     process restart, matching ``fp8_kv_slice_enabled``."""
     enabled = os.environ.get("MINDIESD_FP8_CHUNK_A2A", "false").strip().lower()
     return enabled in ("1", "true", "yes", "on")
+
+
+def _fia_head_chunk_size(num_heads: int) -> int:
+    """Heads per FIA call from ``MINDIESD_FP8_FIA_HCHUNK`` (scheme A).
+
+    Long-KV FIA is bound by KV re-reads from HBM (the per-call K+V footprint
+    far exceeds L2); calling FIA on a few heads at a time shrinks the per-call
+    KV slice to L2-resident sizes, which measurably raises throughput and
+    sustainable frequency. 0/unset/>= num_heads disables head chunking
+    (single call with all heads). Requires MHA (num_kv_heads == num_heads);
+    the caller disables it for GQA. Read per call (no cache).
+    """
+    raw = os.environ.get("MINDIESD_FP8_FIA_HCHUNK", "").strip()
+    if not raw:
+        return num_heads
+    try:
+        n = int(raw)
+    except ValueError as e:
+        raise ValueError(f"MINDIESD_FP8_FIA_HCHUNK must be an integer, got {raw!r}") from e
+    if n <= 0 or n >= num_heads:
+        return num_heads
+    return n
 
 
 def _scheme_b_chunk_bounds(
@@ -414,6 +446,12 @@ def fp8_rotate_quant_fa_varlen(
             "FP8 path; the varlen path keeps a single FIA call.",
             stacklevel=2,
         )
+    if _fia_head_chunk_size(key.shape[1]) < key.shape[1]:
+        warnings.warn(
+            "MINDIESD_FP8_FIA_HCHUNK is only implemented for the dense kv-slice "
+            "FP8 path; the varlen path keeps a single FIA call with all heads.",
+            stacklevel=2,
+        )
     (
         torch_npu,
         fia_v2,
@@ -632,34 +670,75 @@ def fp8_rotate_quant_kv_slice(
     # exactly like the single-call trim below). An explicit q_chunk_bounds plan
     # (scheme B, from _scheme_b_chunk_bounds) overrides the env-driven bounds.
     bounds = q_chunk_bounds if q_chunk_bounds is not None else _q_chunk_bounds(q.shape[2], _fia_q_chunk_count())
+
+    # Head chunking (MINDIESD_FP8_FIA_HCHUNK, scheme A): the per-call K/V
+    # footprint is num_heads * kv_len * D * 2 (fp8), which far exceeds L2 at
+    # long kv_len, so every q-tile pass re-reads K/V from HBM. Calling FIA on
+    # head slices shrinks the per-call KV to L2-resident sizes (measured +15%
+    # throughput at kv=350k with 2 heads/call). K/V head slices are
+    # materialized once and reused across q chunks.
+    heads_per_call = _fia_head_chunk_size(num_heads)
+    if heads_per_call < num_heads and num_kv_heads != num_heads:
+        warnings.warn(
+            "MINDIESD_FP8_FIA_HCHUNK: head chunking requires MHA "
+            f"(num_kv_heads == num_heads), got {num_kv_heads} kv vs {num_heads} q heads; "
+            "running without head chunking.",
+            stacklevel=2,
+        )
+        heads_per_call = num_heads
+    head_slices = [(h0, min(h0 + heads_per_call, num_heads)) for h0 in range(0, num_heads, heads_per_call)]
+    if len(head_slices) > 1:
+        kv_head_parts = [
+            (
+                k[:, h0:h1].contiguous(),
+                v[:, h0:h1].contiguous(),
+                k_scale[:, h0:h1].contiguous(),
+                v_scale[:, h0:h1].contiguous(),
+            )
+            for h0, h1 in head_slices
+        ]
+        del k, v, k_scale, v_scale
+    else:
+        kv_head_parts = [(k, v, k_scale, v_scale)]
+
     out_parts = []
     for chunk_idx, (row0, row1) in enumerate(bounds):
         real_rows = min(row1, seq_len) - row0
         if real_rows <= 0:
             break  # remaining chunks cover only quant padding rows
-        out_c = fia_v2(
-            q[:, :, row0:row1, :].contiguous(),
-            k,
-            v,
-            input_layout="BNSD",
-            num_query_heads=num_heads,
-            num_key_value_heads=num_kv_heads,
-            softmax_scale=scale,
-            pre_tokens=2147483647,  # INT32_MAX: no left-context truncation.
-            next_tokens=2147483647,  # INT32_MAX: no right-context truncation.
-            query_quant_mode=7,  # NPU mode id for block FP8 dequant path.
-            key_quant_mode=7,  # Same quant mode as query branch.
-            value_quant_mode=7,  # Same quant mode as key/query branches.
-            # Per-chunk Q scale slice: block-aligned boundaries make this the
-            # exact block range of the full-length quantization.
-            dequant_scale_query=q_scale[:, :, row0 // _Q_BLOCK_SIZE : -(-row1 // _Q_BLOCK_SIZE), :].contiguous(),
-            dequant_scale_key=k_scale,
-            dequant_scale_value=v_scale,
-            out_dtype=out_dtype,
-        )[0]
-        # The op may hand back a padded seq axis; keep this chunk's real rows.
-        if out_c.shape[2] != real_rows:
-            out_c = out_c[:, :, :real_rows, :]
+        head_parts = []
+        for (h0, h1), (k_c, v_c, ks_c, vs_c) in zip(head_slices, kv_head_parts):
+            # Head chunking is MHA-only (guarded above), so a chunk's kv heads
+            # equal its q heads; without chunking, pass the real GQA counts.
+            kv_heads_c = (h1 - h0) if len(head_slices) > 1 else num_kv_heads
+            out_hc = fia_v2(
+                q[:, h0:h1, row0:row1, :].contiguous(),
+                k_c,
+                v_c,
+                input_layout="BNSD",
+                num_query_heads=h1 - h0,
+                num_key_value_heads=kv_heads_c,
+                softmax_scale=scale,
+                pre_tokens=2147483647,  # INT32_MAX: no left-context truncation.
+                next_tokens=2147483647,  # INT32_MAX: no right-context truncation.
+                query_quant_mode=7,  # NPU mode id for block FP8 dequant path.
+                key_quant_mode=7,  # Same quant mode as query branch.
+                value_quant_mode=7,  # Same quant mode as key/query branches.
+                # Per-chunk Q scale slice: block-aligned boundaries make this the
+                # exact block range of the full-length quantization.
+                dequant_scale_query=q_scale[
+                    :, h0:h1, row0 // _Q_BLOCK_SIZE : -(-row1 // _Q_BLOCK_SIZE), :
+                ].contiguous(),
+                dequant_scale_key=ks_c,
+                dequant_scale_value=vs_c,
+                out_dtype=out_dtype,
+            )[0]
+            # The op may hand back a padded seq axis; keep this chunk's real rows.
+            if out_hc.shape[2] != real_rows:
+                out_hc = out_hc[:, :, :real_rows, :]
+            head_parts.append(out_hc)
+        # Reassemble heads (BNSD head axis) before the caller layout transpose.
+        out_c = torch.cat(head_parts, dim=1) if len(head_parts) > 1 else head_parts[0]
         if layout == "BSND":
             out_c = out_c.transpose(1, 2)
         if chunk_callback is not None:
