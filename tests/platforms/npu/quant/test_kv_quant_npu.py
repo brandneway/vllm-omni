@@ -508,6 +508,91 @@ class TestKVQuantNPUUnit:
         # K/V are quantized exactly once, not per chunk.
         assert len(fake_quant_ops["fa_calls"]) == 3
 
+    def test_fia_head_chunk_size_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("MINDIESD_FP8_FIA_HCHUNK", raising=False)
+        assert kv_quant_npu._fia_head_chunk_size(14) == 14  # unset: off
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK", "2")
+        assert kv_quant_npu._fia_head_chunk_size(14) == 2
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK", "0")
+        assert kv_quant_npu._fia_head_chunk_size(14) == 14  # 0: off
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK", "99")
+        assert kv_quant_npu._fia_head_chunk_size(14) == 14  # >= num_heads: off
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK", "abc")
+        with pytest.raises(ValueError, match="MINDIESD_FP8_FIA_HCHUNK"):
+            kv_quant_npu._fia_head_chunk_size(14)
+
+    def test_fp8_rotate_quant_kv_slice_hchunk_contract(
+        self,
+        fake_quant_ops: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK", "2")
+        query, key, value = self._make_qkv((1, 8, 4, 4))  # BSND: N=4 heads
+
+        out = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 8, layout="BSND")
+
+        assert out.shape == query.shape
+        calls = fake_quant_ops["fia_calls"]
+        # 4 heads / 2 per call -> 2 FIA calls, each with 2-head Q/K/V slices.
+        assert len(calls) == 2
+        assert [c["q_shape"] for c in calls] == [(1, 2, 8, 4), (1, 2, 8, 4)]
+        assert [c["k_shape"] for c in calls] == [(1, 2, 8, 4), (1, 2, 8, 4)]
+        assert [c["kwargs"]["num_query_heads"] for c in calls] == [2, 2]
+        # Per-call dequant scales are the matching head slices.
+        assert [tuple(c["kwargs"]["dequant_scale_query"].shape) for c in calls] == [(1, 2, 1, 1), (1, 2, 1, 1)]
+        # Fake rotation is identity and fake FIA echoes q: head-chunked output
+        # must reassemble exactly.
+        assert torch.equal(out, query)
+
+    def test_fp8_rotate_quant_kv_slice_hchunk_with_qchunk_callback(
+        self,
+        fake_quant_ops: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Head chunks nest INSIDE q chunks; the callback fires once per q
+        chunk with the full-head output (scheme B contract)."""
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK", "2")
+        query, key, value = self._make_qkv((1, 8, 4, 4))  # N=4 heads, S=8
+        received = []
+
+        out = kv_quant_npu.fp8_rotate_quant_kv_slice(
+            query,
+            key,
+            value,
+            8,
+            layout="BSND",
+            q_chunk_bounds=[(0, 4), (4, 8)],
+            chunk_callback=lambda chunk, idx: received.append((idx, chunk)),
+        )
+
+        assert out is None
+        # 2 q chunks x 2 head chunks = 4 FIA calls; 2 callback firings.
+        assert len(fake_quant_ops["fia_calls"]) == 4
+        assert [c["q_shape"] for c in fake_quant_ops["fia_calls"]] == [(1, 2, 4, 4)] * 4
+        assert len(received) == 2
+        assert torch.equal(received[0][1], query[:, 0:4])
+        assert torch.equal(received[1][1], query[:, 4:8])
+
+    def test_fp8_rotate_quant_kv_slice_hchunk_disabled_for_gqa(
+        self,
+        fake_quant_ops: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Head chunking requires MHA (num_kv_heads == num_heads); GQA keeps a
+        single call and warns."""
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK", "2")
+        query = torch.randn(1, 8, 4, 4, dtype=torch.float32)
+        key = torch.randn(1, 8, 2, 4, dtype=torch.float32)  # 2 kv heads
+        value = torch.randn(1, 8, 2, 4, dtype=torch.float32)
+
+        with pytest.warns(UserWarning, match="head chunking requires"):
+            kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 8, layout="BSND")
+
+        calls = fake_quant_ops["fia_calls"]
+        assert len(calls) == 1
+        assert calls[0]["kwargs"]["num_query_heads"] == 4
+        assert calls[0]["kwargs"]["num_key_value_heads"] == 2
+
     def test_fp8_rotate_quant_kv_slice_qchunk_ragged_tail(
         self,
         fake_quant_ops: dict[str, Any],
