@@ -510,6 +510,7 @@ class TestKVQuantNPUUnit:
 
     def test_fia_head_chunk_size_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("MINDIESD_FP8_FIA_HCHUNK", raising=False)
+        monkeypatch.delenv("MINDIESD_FP8_FIA_HCHUNK_MIN_KV", raising=False)
         assert kv_quant_npu._fia_head_chunk_size(14) == 14  # unset: off
         monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK", "2")
         assert kv_quant_npu._fia_head_chunk_size(14) == 2
@@ -521,12 +522,30 @@ class TestKVQuantNPUUnit:
         with pytest.raises(ValueError, match="MINDIESD_FP8_FIA_HCHUNK"):
             kv_quant_npu._fia_head_chunk_size(14)
 
+    def test_fia_head_chunk_size_min_kv_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """MINDIESD_FP8_FIA_HCHUNK_MIN_KV: head chunking stays off below the
+        kv-length threshold (short KV is L2-resident anyway)."""
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK", "2")
+        monkeypatch.delenv("MINDIESD_FP8_FIA_HCHUNK_MIN_KV", raising=False)
+        # Default threshold is 50000.
+        assert kv_quant_npu._fia_hchunk_min_kv() == 50000
+        assert kv_quant_npu._fia_head_chunk_size(14, kv_len=30_000) == 14  # below: off
+        assert kv_quant_npu._fia_head_chunk_size(14, kv_len=50_000) == 2  # at: on
+        assert kv_quant_npu._fia_head_chunk_size(14, kv_len=350_000) == 2  # above: on
+        assert kv_quant_npu._fia_head_chunk_size(14) == 2  # no kv_len: ungated
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK_MIN_KV", "100000")
+        assert kv_quant_npu._fia_head_chunk_size(14, kv_len=60_000) == 14
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK_MIN_KV", "abc")
+        with pytest.raises(ValueError, match="MINDIESD_FP8_FIA_HCHUNK_MIN_KV"):
+            kv_quant_npu._fia_hchunk_min_kv()
+
     def test_fp8_rotate_quant_kv_slice_hchunk_contract(
         self,
         fake_quant_ops: dict[str, Any],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK", "2")
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK_MIN_KV", "0")  # tiny test kv_len
         query, key, value = self._make_qkv((1, 8, 4, 4))  # BSND: N=4 heads
 
         out = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 8, layout="BSND")
@@ -552,6 +571,7 @@ class TestKVQuantNPUUnit:
         """Head chunks nest INSIDE q chunks; the callback fires once per q
         chunk with the full-head output (scheme B contract)."""
         monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK", "2")
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK_MIN_KV", "0")
         query, key, value = self._make_qkv((1, 8, 4, 4))  # N=4 heads, S=8
         received = []
 
@@ -573,6 +593,26 @@ class TestKVQuantNPUUnit:
         assert torch.equal(received[0][1], query[:, 0:4])
         assert torch.equal(received[1][1], query[:, 4:8])
 
+    def test_fp8_rotate_quant_kv_slice_hchunk_min_kv_gate(
+        self,
+        fake_quant_ops: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """kv_len below MINDIESD_FP8_FIA_HCHUNK_MIN_KV disables head chunking
+        even when HCHUNK is set."""
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK", "2")
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK_MIN_KV", "50000")
+        query, key, value = self._make_qkv((1, 8, 4, 4))  # kv_len=8 << 50000
+
+        kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 8, layout="BSND")
+        assert len(fake_quant_ops["fia_calls"]) == 1  # gated off: single call
+        assert fake_quant_ops["fia_calls"][0]["kwargs"]["num_query_heads"] == 4
+
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK_MIN_KV", "1")
+        fake_quant_ops["fia_calls"].clear()
+        kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 8, layout="BSND")
+        assert len(fake_quant_ops["fia_calls"]) == 2  # gate open: 2 head chunks
+
     def test_fp8_rotate_quant_kv_slice_hchunk_disabled_for_gqa(
         self,
         fake_quant_ops: dict[str, Any],
@@ -581,6 +621,7 @@ class TestKVQuantNPUUnit:
         """Head chunking requires MHA (num_kv_heads == num_heads); GQA keeps a
         single call and warns."""
         monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK", "2")
+        monkeypatch.setenv("MINDIESD_FP8_FIA_HCHUNK_MIN_KV", "0")
         query = torch.randn(1, 8, 4, 4, dtype=torch.float32)
         key = torch.randn(1, 8, 2, 4, dtype=torch.float32)  # 2 kv heads
         value = torch.randn(1, 8, 2, 4, dtype=torch.float32)
