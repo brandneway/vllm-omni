@@ -41,7 +41,9 @@ from HBM when K/V exceeds L2). Quantization stays full-length/full-head and
 is sliced per chunk, so results are bit-identical. Requires MHA; GQA layers
 warn and run unchunked. Composes with both Q chunking and scheme B (head
 chunks nest inside each q chunk; the reverse-a2a callback fires once per q
-chunk with the full-head output).
+chunk with the full-head output). Head chunking only engages when the valid
+kv length reaches ``MINDIESD_FP8_FIA_HCHUNK_MIN_KV`` (default 50000) — below
+that the K/V slice is L2-resident already and chunking only adds overhead.
 """
 
 from __future__ import annotations
@@ -140,15 +142,30 @@ def _fia_chunk_a2a_enabled() -> bool:
     return enabled in ("1", "true", "yes", "on")
 
 
-def _fia_head_chunk_size(num_heads: int) -> int:
+def _fia_hchunk_min_kv() -> int:
+    """``MINDIESD_FP8_FIA_HCHUNK_MIN_KV``: minimum kv length for head chunking.
+
+    Below the threshold the K/V slice is L2-resident anyway, so head chunking
+    only adds per-call overhead — it stays off. Default 50000. Read per call
+    (no cache)."""
+    raw = os.environ.get("MINDIESD_FP8_FIA_HCHUNK_MIN_KV", "50000").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError as e:
+        raise ValueError(f"MINDIESD_FP8_FIA_HCHUNK_MIN_KV must be an integer, got {raw!r}") from e
+
+
+def _fia_head_chunk_size(num_heads: int, kv_len: int | None = None) -> int:
     """Heads per FIA call from ``MINDIESD_FP8_FIA_HCHUNK`` (scheme A).
 
     Long-KV FIA is bound by KV re-reads from HBM (the per-call K+V footprint
     far exceeds L2); calling FIA on a few heads at a time shrinks the per-call
     KV slice to L2-resident sizes, which measurably raises throughput and
     sustainable frequency. 0/unset/>= num_heads disables head chunking
-    (single call with all heads). Requires MHA (num_kv_heads == num_heads);
-    the caller disables it for GQA. Read per call (no cache).
+    (single call with all heads). When ``kv_len`` is given, chunking also
+    stays off below ``MINDIESD_FP8_FIA_HCHUNK_MIN_KV`` (short KV is
+    L2-resident already). Requires MHA (num_kv_heads == num_heads); the caller
+    disables it for GQA. Read per call (no cache).
     """
     raw = os.environ.get("MINDIESD_FP8_FIA_HCHUNK", "").strip()
     if not raw:
@@ -158,6 +175,8 @@ def _fia_head_chunk_size(num_heads: int) -> int:
     except ValueError as e:
         raise ValueError(f"MINDIESD_FP8_FIA_HCHUNK must be an integer, got {raw!r}") from e
     if n <= 0 or n >= num_heads:
+        return num_heads
+    if kv_len is not None and kv_len < _fia_hchunk_min_kv():
         return num_heads
     return n
 
@@ -446,7 +465,7 @@ def fp8_rotate_quant_fa_varlen(
             "FP8 path; the varlen path keeps a single FIA call.",
             stacklevel=2,
         )
-    if _fia_head_chunk_size(key.shape[1]) < key.shape[1]:
+    if _fia_head_chunk_size(key.shape[1], key.shape[0]) < key.shape[1]:
         warnings.warn(
             "MINDIESD_FP8_FIA_HCHUNK is only implemented for the dense kv-slice "
             "FP8 path; the varlen path keeps a single FIA call with all heads.",
@@ -677,7 +696,7 @@ def fp8_rotate_quant_kv_slice(
     # head slices shrinks the per-call KV to L2-resident sizes (measured +15%
     # throughput at kv=350k with 2 heads/call). K/V head slices are
     # materialized once and reused across q chunks.
-    heads_per_call = _fia_head_chunk_size(num_heads)
+    heads_per_call = _fia_head_chunk_size(num_heads, kv_len)
     if heads_per_call < num_heads and num_kv_heads != num_heads:
         warnings.warn(
             "MINDIESD_FP8_FIA_HCHUNK: head chunking requires MHA "
