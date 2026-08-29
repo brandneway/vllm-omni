@@ -238,7 +238,6 @@ def _load_quant_ops():
         from mindiesd.layers.flash_attn.fused_infer_attention_score import fused_infer_attention_score_v2
         from mindiesd.layers.quant.block_quant import (
             fa_block_quant_preprocess,
-            fa_block_quant_preprocess_varlen,
         )
         from msmodelslim.processor.quarot.common.quarot_utils import QuaRotMode, create_rot
     except ImportError as e:
@@ -246,6 +245,15 @@ def _load_quant_ops():
             "fp8_rotate_quant_fa requires torch_npu, MindIE-SD (mindiesd), and MSModelSlim. "
             "See https://gitcode.com/Ascend/MindIE-SD and https://gitcode.com/Ascend/msmodelslim"
         ) from e
+    # The varlen block-quant helper is only needed by fp8_rotate_quant_fa_varlen;
+    # keep it optional so the dense kv-slice path works against MindIE-SD
+    # builds that do not provide it yet.
+    try:
+        from mindiesd.layers.quant.block_quant import (
+            fa_block_quant_preprocess_varlen,
+        )
+    except ImportError:
+        fa_block_quant_preprocess_varlen = None
     return (
         torch_npu,
         fused_infer_attention_score_v2,
@@ -480,7 +488,12 @@ def fp8_rotate_quant_fa_varlen(
         create_rot,
         frequency_regulator,
     ) = _load_quant_ops()
-
+    if fa_block_quant_preprocess_varlen is None:
+        raise ImportError(
+            "fp8_rotate_quant_fa_varlen requires MindIE-SD with "
+            "fa_block_quant_preprocess_varlen (mindiesd.layers.quant.block_quant); "
+            "the installed MindIE-SD does not provide it."
+        )
     if query.dim() != 3 or key.dim() != 3 or value.dim() != 3:
         raise ValueError(
             f"fp8_rotate_quant_fa_varlen: expected packed TND 3D tensors, got "
