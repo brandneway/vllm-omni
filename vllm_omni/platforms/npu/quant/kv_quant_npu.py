@@ -5,11 +5,19 @@
 Provides per-tensor dynamic quantization of Q/K/V tensors to
 float8_e4m3fn format. Designed for diffusion models where Q/K/V are
 computed fresh each forward pass (no persistent KV cache).
+
+Two entry points dispatch to the MindIE-SD FIA operator:
+``fp8_rotate_quant_fa`` for dense batched layouts (BNSD/BSND) and
+``fp8_rotate_quant_kv_slice`` for the packed [real, pad] layout with K/V
+sliced to the valid prefix so a plain dense BNSD/BSND FIA call (no varlen
+feature) suffices. Setting ``MINDIESD_FP8_KV_SLICE`` to a truthy value
+routes packed FP8 attention through the latter.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import threading
 from functools import lru_cache
 
@@ -22,10 +30,26 @@ _ROT_MATRIX_LOCK = threading.Lock()
 
 _FP8_KV_LABELS = frozenset({"fp8"})
 
+# Block-quant row-block sizes for the FIA per-block FP8 path (Q: 128 rows,
+# K/V: 256 rows).
+_Q_BLOCK_SIZE = 128
+_KV_BLOCK_SIZE = 256
+
 
 def is_quantized_kv_cache(kv_cache_dtype: str | None) -> bool:
     """True if config requests FP8-style KV / QKV quantization for the NPU FA path."""
     return kv_cache_dtype in _FP8_KV_LABELS
+
+
+def fp8_kv_slice_enabled() -> bool:
+    """Truthy ``MINDIESD_FP8_KV_SLICE`` (``1``/``true``/``yes``/``on``) routes
+    packed FP8 attention through :func:`fp8_rotate_quant_kv_slice` — K/V sliced
+    to the valid prefix, then dense BNSD/BSND FIA — instead of the dense
+    full-length path. Read per call (no cache) so a changed environment takes
+    effect without a process restart, matching the ``MINDIE_SD_FA_TYPE``
+    dispatch."""
+    enabled = os.environ.get("MINDIESD_FP8_KV_SLICE", "false").strip().lower()
+    return enabled in ("1", "true", "yes", "on")
 
 
 @lru_cache(maxsize=1)
@@ -39,7 +63,17 @@ def _load_quant_ops():
             "fp8_rotate_quant_fa requires torch_npu, MindIE-SD (mindiesd), and MSModelSlim. "
             "See https://gitcode.com/Ascend/MindIE-SD and https://gitcode.com/Ascend/msmodelslim"
         ) from e
-    return torch_npu, fa_block_quant_preprocess, QuaRotMode, create_rot
+    # The MindIE-SD FIA wrapper is only needed by fp8_rotate_quant_kv_slice;
+    # keep it optional so the dense fp8_rotate_quant_fa path (which calls
+    # torch_npu directly) works against MindIE-SD builds that do not provide
+    # it yet.
+    try:
+        from mindiesd.layers.flash_attn.fused_infer_attention_score import (
+            fused_infer_attention_score_v2,
+        )
+    except ImportError:
+        fused_infer_attention_score_v2 = None
+    return torch_npu, fused_infer_attention_score_v2, fa_block_quant_preprocess, QuaRotMode, create_rot
 
 
 def _get_rot_matrix(
@@ -78,7 +112,7 @@ def fp8_rotate_quant_fa(
     Returns:
         Attention output in the same layout as inputs.
     """
-    torch_npu, fa_block_quant_preprocess, qua_rot_mode, create_rot = _load_quant_ops()
+    torch_npu, _fia_v2, fa_block_quant_preprocess, qua_rot_mode, create_rot = _load_quant_ops()
 
     out_dtype = query.dtype
     device = query.device
@@ -123,5 +157,129 @@ def fp8_rotate_quant_fa(
             out = out[:, :, :s, :]
         elif layout == "BSND":
             out = out[:, :s, :, :]
+
+    return out
+
+
+def fp8_rotate_quant_kv_slice(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_len: int,
+    *,
+    layout: str = "BSND",
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    """Run dense NPU fused attention with dynamic FP8 Q/K/V after slicing K/V
+    to the valid prefix.
+
+    Alternative to :func:`fp8_rotate_quant_fa` for the packed [real, pad]
+    two-document layout: the padding document is a strict suffix, so dropping
+    it from K/V is identical to masking it out, and the FIA operator's varlen
+    feature (``actual_seq_*`` / ``NTD_TND``) stays off — the call is a plain
+    dense ``BNSD``/``BSND`` FIA whose query is longer than its K/V. K/V are
+    sliced (zero-copy views) BEFORE rotation and quantization, so padding rows
+    are neither attended nor quantized. Query keeps its full length; outputs
+    on padding rows are never consumed downstream (same contract as the
+    unquantized prefix-K/V-slice path).
+
+    Query padding rows are quantized together with the real rows; per-block
+    scales (128-row blocks) can therefore mix both in the boundary block.
+    This is exact when the packing pads with zeros (zeros never raise the
+    block absmax) — the MiniMax-H3 packing this path is built for.
+
+    Args:
+        query: Query tensor in ``layout`` order; its seq length may exceed
+            ``kv_len``.
+        key: Key tensor in ``layout`` order; sliced to ``kv_len`` on the seq
+            axis before quantization.
+        value: Value tensor in ``layout`` order; sliced to ``kv_len`` on the seq
+            axis before quantization.
+        kv_len: Valid K/V prefix length (real document length of the packed
+            row).
+        layout: Caller-facing tensor layout, ``BNSD`` or ``BSND``. The FIA
+            operator itself is always fed BNSD (the quant kernel's output
+            layout) and its output is transposed back for ``BSND`` callers.
+        softmax_scale: If None, uses ``1 / sqrt(head_dim)``.
+
+    Returns:
+        Attention output in the same layout as the inputs, at the query's
+        full sequence length.
+    """
+    torch_npu, fia_v2, fa_block_quant_preprocess, qua_rot_mode, create_rot = _load_quant_ops()
+    if fia_v2 is None:
+        raise ImportError(
+            "fp8_rotate_quant_kv_slice requires MindIE-SD with "
+            "fused_infer_attention_score_v2 (mindiesd.layers.flash_attn.fused_infer_attention_score); "
+            "the installed MindIE-SD does not provide it."
+        )
+
+    if layout == "BNSD":
+        _, num_heads, seq_len, head_dim = query.shape
+        kv_seq_dim = 2
+        num_kv_heads = key.shape[1]
+    elif layout == "BSND":
+        _, seq_len, num_heads, head_dim = query.shape
+        kv_seq_dim = 1
+        num_kv_heads = key.shape[2]
+    else:
+        raise ValueError(f"fp8_rotate_quant_kv_slice: unsupported layout {layout!r}, expected BNSD or BSND")
+
+    kv_total = key.shape[kv_seq_dim]
+    if not isinstance(kv_len, int) or not 0 < kv_len <= kv_total:
+        raise ValueError(f"fp8_rotate_quant_kv_slice: kv_len must be an int in (0, {kv_total}], got {kv_len!r}")
+
+    out_dtype = query.dtype
+    device = query.device
+
+    rot = _get_rot_matrix(device, query.dtype, head_dim, qua_rot_mode, create_rot)
+    q_f = torch.matmul(query, rot)
+    # Slice K/V to the valid prefix (zero-copy views) before rotation and
+    # quantization: pad rows are neither attended nor quantized.
+    key = key.narrow(kv_seq_dim, 0, kv_len)
+    value = value.narrow(kv_seq_dim, 0, kv_len)
+    k_f = torch.matmul(key, rot)
+
+    # fa_block_quant_preprocess always returns BNSD-logical tensors (BSND
+    # inputs are transposed before the quant kernel), so the FIA call is
+    # always dispatched with input_layout="BNSD" and the output is transposed
+    # back to the caller's layout below.
+    q, q_scale = fa_block_quant_preprocess(
+        q_f, block_size=_Q_BLOCK_SIZE, dst_type=torch_npu.float8_e4m3fn, layout=layout
+    )
+    k, k_scale = fa_block_quant_preprocess(
+        k_f, block_size=_KV_BLOCK_SIZE, dst_type=torch_npu.float8_e4m3fn, layout=layout
+    )
+    v, v_scale = fa_block_quant_preprocess(
+        value, block_size=_KV_BLOCK_SIZE, dst_type=torch_npu.float8_e4m3fn, layout=layout
+    )
+
+    scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
+
+    out = fia_v2(
+        q,
+        k,
+        v,
+        input_layout="BNSD",
+        num_query_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        softmax_scale=scale,
+        pre_tokens=2147483647,  # INT32_MAX: no left-context truncation.
+        next_tokens=2147483647,  # INT32_MAX: no right-context truncation.
+        query_quant_mode=7,  # NPU mode id for block FP8 dequant path.
+        key_quant_mode=7,  # Same quant mode as query branch.
+        value_quant_mode=7,  # Same quant mode as key/query branches.
+        dequant_scale_query=q_scale,
+        dequant_scale_key=k_scale,
+        dequant_scale_value=v_scale,
+        out_dtype=out_dtype,
+    )[0]
+
+    # The op hands back BNSD-logical output, possibly padded on the seq axis:
+    # trim to the query length, then transpose back for BSND callers.
+    if out.shape[2] != seq_len:
+        out = out[:, :, :seq_len, :]
+    if layout == "BSND":
+        out = out.transpose(1, 2)
 
     return out
