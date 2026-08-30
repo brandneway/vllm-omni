@@ -1163,6 +1163,11 @@ class AsyncOmniEngine:
             "lora_scale": kwargs.get("lora_scale", 1.0),
             "lora_backend": kwargs.get("lora_backend", "peft"),
             "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
+            # Opt the single diffusion stage into the InlineStageDiffusionClient
+            # (in-Orchestrator thread) instead of a StageDiffusionProc subprocess
+            # + ZMQ/msgpack IPC.  Honors --stage-overrides '{"0": {...}}' via the
+            # stage-0 override fold above; requires num_replicas == 1.
+            "inline_diffusion": bool(kwargs.get("inline_diffusion", False)),
             "worker_extension_cls": kwargs.get("worker_extension_cls", None),
             "trust_remote_code": (False if kwargs.get("trust_remote_code") is None else kwargs["trust_remote_code"]),
             "distributed_executor_backend": kwargs.get("distributed_executor_backend"),
@@ -1277,12 +1282,20 @@ class AsyncOmniEngine:
         # the complete override mapping through load_and_resolve_stage_configs.
         default_stage_kwargs = kwargs
         stage_zero_overrides = (stage_overrides or {}).get("0", {})
+        if stage_zero_overrides:
+            # Scalar engine-arg overrides (e.g. inline_diffusion) fold into the
+            # fallback kwargs verbatim; "extras" deep-merges instead so thin
+            # overrides do not drop keys already present in kwargs.
+            default_stage_kwargs = {
+                **kwargs,
+                **{k: v for k, v in stage_zero_overrides.items() if k != "extras"},
+            }
         if "extras" in stage_zero_overrides:
             override_extras = stage_zero_overrides["extras"]
             if not isinstance(override_extras, Mapping):
                 raise TypeError("stage 0 extras must be a mapping")
             default_stage_kwargs = {
-                **kwargs,
+                **default_stage_kwargs,
                 "extras": {
                     **(kwargs.get("extras") or {}),
                     **override_extras,
