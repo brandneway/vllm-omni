@@ -85,10 +85,7 @@ class RMSNorm(CustomOp):
     def forward_cuda(
         self,
         x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is not None:
-            return self.forward_native(x, residual)
+    ) -> torch.Tensor:
         # During torch.compile tracing, fused_rms_norm writes to `out` in-place
         # (returns None) and accesses self.weight.data, which is a DTensor under
         # HSDP. Both patterns confuse inductor's compute_ancestors scheduler.
@@ -104,10 +101,7 @@ class RMSNorm(CustomOp):
     def forward_hip(
         self,
         x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is not None:
-            return self.forward_native(x, residual)
+    ) -> torch.Tensor:
         if torch.compiler.is_compiling():
             return self.forward_native(x)
         try:
@@ -118,10 +112,7 @@ class RMSNorm(CustomOp):
     def forward_musa(
         self,
         x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is not None:
-            return self.forward_native(x, residual)
+    ) -> torch.Tensor:
         # Preserve the aten::rms_norm graph so dynamic Inductor can fuse the
         # H3 Q/K norm with its inline RoPE path on MUSA.
         return F.rms_norm(
@@ -134,18 +125,8 @@ class RMSNorm(CustomOp):
     def forward_npu(
         self,
         x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         import torch_npu
-
-        if residual is not None:
-            output, _, updated_residual = torch_npu.npu_add_rms_norm(
-                x,
-                residual,
-                self.weight,
-                self.variance_epsilon,
-            )
-            return output, updated_residual
 
         output = torch_npu.npu_rms_norm(x, gamma=self.weight, epsilon=self.variance_epsilon)[0]
 
@@ -154,27 +135,19 @@ class RMSNorm(CustomOp):
     def forward_xpu(
         self,
         x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            return self.forward_native(x)
-        return self.forward_native(x, residual)
+    ) -> torch.Tensor:
+        return self.forward_native(x)
 
     def forward_native(
         self,
         x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is not None:
-            residual = residual + x
-            x = residual
+    ) -> torch.Tensor:
         input_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
         out = x * torch.rsqrt(variance + self.variance_epsilon)
         out = self.weight.to(torch.float32) * out
-        out = out.to(input_dtype)
-        return (out, residual) if residual is not None else out
+        return out.to(input_dtype)
 
 
 class RMSNormVAE(CustomOp):
