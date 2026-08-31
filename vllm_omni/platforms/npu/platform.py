@@ -176,7 +176,6 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
         from vllm_omni.platforms.npu.models.minimax_h3 import (
             apply_minimax_h3_qwen3vl_patch,
-            apply_minimax_h3_qwen3vl_swiglu_patch,
         )
 
         # Both patches import the MiniMax encoder package, whose __init__ loads
@@ -186,7 +185,6 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         # DiffusionOutput. Apply them only after the platform exists, before
         # the diffusion pipeline is loaded.
         apply_minimax_h3_qwen3vl_patch()
-        apply_minimax_h3_qwen3vl_swiglu_patch()
         set_mc2_tokens_capacity(vllm_config, od_config.max_num_seqs, 1)
         set_mc2_mask(vllm_config, device)
 
