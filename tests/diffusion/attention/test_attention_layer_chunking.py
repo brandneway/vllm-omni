@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Layer-level injection of KV quantization + attention chunking options.
 
 The Attention layer parses the diffusion config once (``_init_kv_cache_quantization``)
@@ -83,9 +83,7 @@ class TestWithKvCacheDtypeInjection:
 
     def test_layer_opt_out_pops_both_keys(self) -> None:
         layer = _bare_layer(disable=True)
-        metadata = AttentionMetadata(
-            extra={"kv_cache_dtype": "fp8", "attn_chunking": AttnChunkingOptions(q_chunk=8)}
-        )
+        metadata = AttentionMetadata(extra={"kv_cache_dtype": "fp8", "attn_chunking": AttnChunkingOptions(q_chunk=8)})
 
         cleaned = layer._with_kv_cache_dtype(metadata)
 
@@ -94,9 +92,7 @@ class TestWithKvCacheDtypeInjection:
 
     def test_skip_step_hit_pops_both_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
-        monkeypatch.setattr(
-            layer_mod, "get_forward_context", lambda: SimpleNamespace(denoise_step_idx=3)
-        )
+        monkeypatch.setattr(layer_mod, "get_forward_context", lambda: SimpleNamespace(denoise_step_idx=3))
         layer = _bare_layer(skip_steps={3})
 
         cleaned = layer._with_kv_cache_dtype(AttentionMetadata(extra={"kv_cache_dtype": "fp8"}))

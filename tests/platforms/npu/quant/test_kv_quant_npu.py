@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for NPU FP8 KV quantization helpers.
 
 These tests load ``kv_quant_npu`` from its source file via ``importlib`` so
@@ -335,7 +335,9 @@ class TestKVQuantNPUUnit:
         num_kv_heads: int | None = None,
     ) -> list:
         options = chunking.AttnChunkingOptions(
-            q_chunk=q_chunk, head_chunk=head_chunk, head_chunk_min_kv=0  # gate off in tests
+            q_chunk=q_chunk,
+            head_chunk=head_chunk,
+            head_chunk_min_kv=0,  # gate off in tests
         )
         return chunking.build_chunk_plan(
             seq_len=seq_len,

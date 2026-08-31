@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Test script for FlashAttention backend with padding handling.
@@ -903,9 +903,7 @@ def test_npu_fp8_nonpacked_with_chunking_warns_and_ignores(monkeypatch):
     impl = _npu_impl()
     impl.forward_fa_quant_npu = Mock(return_value=torch.tensor([4.0]))
     impl.forward_fa_npu = Mock(return_value=torch.tensor([3.0]))
-    metadata = AttentionMetadata(
-        extra={"kv_cache_dtype": "fp8", "attn_chunking": AttnChunkingOptions(q_chunk=8)}
-    )
+    metadata = AttentionMetadata(extra={"kv_cache_dtype": "fp8", "attn_chunking": AttnChunkingOptions(q_chunk=8)})
 
     out = impl.forward_npu(torch.randn(1, 8, 2, 4), *[torch.randn(1, 8, 2, 4)] * 2, metadata)
 

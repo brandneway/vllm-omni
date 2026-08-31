@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the backend-neutral attention chunking scheduler.
 
 These tests load ``chunking`` from its source file via ``importlib`` (same
@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 
@@ -80,9 +81,7 @@ class TestBuildChunkPlan:
         assert _plan_calls(plan) == [(0, 128, 0, 4)]
 
     def test_default_options_yield_single_call(self) -> None:
-        plan = chunking.build_chunk_plan(
-            seq_len=128, num_heads=4, options=chunking.AttnChunkingOptions()
-        )
+        plan = chunking.build_chunk_plan(seq_len=128, num_heads=4, options=chunking.AttnChunkingOptions())
         assert _plan_calls(plan) == [(0, 128, 0, 4)]
 
     def test_q_chunk_even_split_aligned(self) -> None:
@@ -173,13 +172,9 @@ class TestBuildChunkPlan:
 
     def test_head_chunk_collapses_below_min_kv(self) -> None:
         options = chunking.AttnChunkingOptions(head_chunk=2, head_chunk_min_kv=50000)
-        short = chunking.build_chunk_plan(
-            seq_len=256, num_heads=4, options=options, num_kv_heads=4, kv_len=49999
-        )
+        short = chunking.build_chunk_plan(seq_len=256, num_heads=4, options=options, num_kv_heads=4, kv_len=49999)
         assert all(h1 - h0 == 4 for _, _, h0, h1 in _plan_calls(short))
-        long = chunking.build_chunk_plan(
-            seq_len=256, num_heads=4, options=options, num_kv_heads=4, kv_len=50000
-        )
+        long = chunking.build_chunk_plan(seq_len=256, num_heads=4, options=options, num_kv_heads=4, kv_len=50000)
         assert all(h1 - h0 == 2 for _, _, h0, h1 in _plan_calls(long))
 
     def test_min_kv_gate_leaves_q_chunking_alone(self) -> None:
@@ -260,7 +255,7 @@ class TestRunChunked:
     """Executor contract via a stub make_call echoing the call's shape."""
 
     @staticmethod
-    def _make_call(out_width: int = 4) -> "type":
+    def _make_call(out_width: int = 4) -> Callable[[object], torch.Tensor]:
         def make_call(call) -> torch.Tensor:
             # Caller-layout output for one call: [1, rows, heads_slice, width].
             return torch.full((1, call.row1 - call.row0, call.h1 - call.h0, out_width), call.row0)
@@ -311,9 +306,7 @@ class TestRunChunked:
         def cb(out_chunk, call) -> None:
             chunks.append((out_chunk, (call.row0, call.row1)))
 
-        result = chunking.run_chunked(
-            plan, seq_dim=1, head_dim=2, make_call=self._make_call(), chunk_callback=cb
-        )
+        result = chunking.run_chunked(plan, seq_dim=1, head_dim=2, make_call=self._make_call(), chunk_callback=cb)
         assert result is None
         # One head-merged chunk per q chunk, full head width each.
         assert [tuple(t.shape) for t, _ in chunks] == [(1, 128, 4, 4)] * 2
