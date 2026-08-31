@@ -10,8 +10,20 @@ Two entry points dispatch to the MindIE-SD FIA operator:
 ``fp8_rotate_quant_fa`` for dense batched layouts (BNSD/BSND) and
 ``fp8_rotate_quant_kv_slice`` for the packed [real, pad] layout with K/V
 sliced to the valid prefix so a plain dense BNSD/BSND FIA call (no varlen
-feature) suffices. Setting ``MINDIESD_FP8_KV_SLICE`` to a truthy value
-routes packed FP8 attention through the latter.
+feature) suffices. The kv-slice path is the default behavior of
+``--diffusion-kv-cache-dtype fp8`` on NPU; ``MINDIESD_FP8_KV_SLICE=0`` is
+an escape hatch that drops the packed FP8 path back to unquantized
+attention (see :func:`fp8_kv_slice_disabled_by_env`).
+
+``fp8_rotate_quant_kv_slice`` also accepts a chunk plan from
+``vllm_omni.diffusion.attention.chunking`` (duck-typed ``ChunkCall``
+sequence; no runtime import so this file stays loadable outside the
+``vllm_omni`` package): the single wide FIA call becomes several narrower
+ones along the query sequence and/or head axes — a power-envelope
+mitigation for specific machine types. Quantization happens once up
+front; chunk boundaries align to the Q block-quant row block
+(``_Q_BLOCK_SIZE``) so per-chunk dequant scales are exact slices of the
+full-length scales and chunked results match the single call.
 """
 
 from __future__ import annotations
@@ -20,8 +32,12 @@ import math
 import os
 import threading
 from functools import lru_cache
+from typing import TYPE_CHECKING, Sequence
 
 import torch
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.attention.chunking import ChunkCall
 
 # Hadamard rotation matrix for QuaRot-style preprocessing
 # keyed by (device, dtype, head_dim) to avoid matmul dtype mismatch.
@@ -41,15 +57,22 @@ def is_quantized_kv_cache(kv_cache_dtype: str | None) -> bool:
     return kv_cache_dtype in _FP8_KV_LABELS
 
 
-def fp8_kv_slice_enabled() -> bool:
-    """Truthy ``MINDIESD_FP8_KV_SLICE`` (``1``/``true``/``yes``/``on``) routes
-    packed FP8 attention through :func:`fp8_rotate_quant_kv_slice` — K/V sliced
-    to the valid prefix, then dense BNSD/BSND FIA — instead of the dense
-    full-length path. Read per call (no cache) so a changed environment takes
-    effect without a process restart, matching the ``MINDIE_SD_FA_TYPE``
-    dispatch."""
-    enabled = os.environ.get("MINDIESD_FP8_KV_SLICE", "false").strip().lower()
-    return enabled in ("1", "true", "yes", "on")
+def fp8_kv_slice_disabled_by_env() -> bool:
+    """True only when ``MINDIESD_FP8_KV_SLICE`` is explicitly falsy
+    (``0``/``false``/``no``/``off``).
+
+    The kv-slice path is the *default* behavior of
+    ``--diffusion-kv-cache-dtype fp8`` for packed inputs — no opt-in env is
+    needed anymore. The env survives as an operations escape hatch: an
+    explicitly falsy value drops the packed FP8 path and runs unquantized
+    attention (never dense FP8, which would ignore packed document
+    boundaries). Unset or any other value keeps the default. Read per call
+    (no cache) so a changed environment takes effect without a process
+    restart, matching the ``MINDIE_SD_FA_TYPE`` dispatch."""
+    raw = os.environ.get("MINDIESD_FP8_KV_SLICE")
+    if raw is None:
+        return False
+    return raw.strip().lower() in ("0", "false", "no", "off")
 
 
 @lru_cache(maxsize=1)
@@ -169,7 +192,9 @@ def fp8_rotate_quant_kv_slice(
     *,
     layout: str = "BSND",
     softmax_scale: float | None = None,
-) -> torch.Tensor:
+    plan: Sequence[ChunkCall] | None = None,
+    chunk_callback=None,
+) -> torch.Tensor | None:
     """Run dense NPU fused attention with dynamic FP8 Q/K/V after slicing K/V
     to the valid prefix.
 
@@ -188,6 +213,15 @@ def fp8_rotate_quant_kv_slice(
     This is exact when the packing pads with zeros (zeros never raise the
     block absmax) — the MiniMax-H3 packing this path is built for.
 
+    With ``plan`` (from
+    ``vllm_omni.diffusion.attention.chunking.build_chunk_plan`` with
+    ``row_align=_Q_BLOCK_SIZE``) the wide FIA call runs as several narrower
+    ones over the same one-shot quantization — a power-envelope mitigation
+    for specific machine types, not a general win. Calls are grouped per q
+    chunk (the plan's q-chunk-major order); K/V head slices are materialized
+    once and reused across q chunks. ``None`` (default) keeps the single
+    wide call.
+
     Args:
         query: Query tensor in ``layout`` order; its seq length may exceed
             ``kv_len``.
@@ -201,10 +235,20 @@ def fp8_rotate_quant_kv_slice(
             operator itself is always fed BNSD (the quant kernel's output
             layout) and its output is transposed back for ``BSND`` callers.
         softmax_scale: If None, uses ``1 / sqrt(head_dim)``.
+        plan: Optional duck-typed ``ChunkCall`` sequence scheduling the FIA
+            calls. Row boundaries must start on ``_Q_BLOCK_SIZE``-row blocks
+            so per-chunk dequant scales are exact slices of the full-length
+            scales.
+        chunk_callback: Optional ``fn(out_chunk, call)`` invoked with each q
+            chunk's head-merged output in the caller-facing layout. When set,
+            nothing is reassembled and the return value is None (the caller
+            consumes chunks, e.g. interleaving low-power communication
+            between compute bursts).
 
     Returns:
         Attention output in the same layout as the inputs, at the query's
-        full sequence length.
+        full sequence length; None when ``chunk_callback`` consumed the
+        per-chunk outputs.
     """
     torch_npu, fia_v2, fa_block_quant_preprocess, qua_rot_mode, create_rot = _load_quant_ops()
     if fia_v2 is None:
@@ -256,30 +300,127 @@ def fp8_rotate_quant_kv_slice(
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
 
-    out = fia_v2(
-        q,
-        k,
-        v,
-        input_layout="BNSD",
-        num_query_heads=num_heads,
-        num_key_value_heads=num_kv_heads,
-        softmax_scale=scale,
-        pre_tokens=2147483647,  # INT32_MAX: no left-context truncation.
-        next_tokens=2147483647,  # INT32_MAX: no right-context truncation.
-        query_quant_mode=7,  # NPU mode id for block FP8 dequant path.
-        key_quant_mode=7,  # Same quant mode as query branch.
-        value_quant_mode=7,  # Same quant mode as key/query branches.
-        dequant_scale_query=q_scale,
-        dequant_scale_key=k_scale,
-        dequant_scale_value=v_scale,
-        out_dtype=out_dtype,
-    )[0]
+    if plan is None:
+        out = fia_v2(
+            q,
+            k,
+            v,
+            input_layout="BNSD",
+            num_query_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
+            softmax_scale=scale,
+            pre_tokens=2147483647,  # INT32_MAX: no left-context truncation.
+            next_tokens=2147483647,  # INT32_MAX: no right-context truncation.
+            query_quant_mode=7,  # NPU mode id for block FP8 dequant path.
+            key_quant_mode=7,  # Same quant mode as query branch.
+            value_quant_mode=7,  # Same quant mode as key/query branches.
+            dequant_scale_query=q_scale,
+            dequant_scale_key=k_scale,
+            dequant_scale_value=v_scale,
+            out_dtype=out_dtype,
+        )[0]
+        # The op hands back BNSD-logical output, possibly padded on the seq
+        # axis: trim to the query length, then transpose back for BSND.
+        if out.shape[2] != seq_len:
+            out = out[:, :, :seq_len, :]
+        if layout == "BSND":
+            out = out.transpose(1, 2)
+        return out
 
-    # The op hands back BNSD-logical output, possibly padded on the seq axis:
-    # trim to the query length, then transpose back for BSND callers.
-    if out.shape[2] != seq_len:
-        out = out[:, :, :seq_len, :]
-    if layout == "BSND":
-        out = out.transpose(1, 2)
+    # Chunked dispatch. The plan is q-chunk-major: group consecutive calls
+    # sharing a row range into one q chunk, run each of its head slices
+    # against the materialized K/V head part, merge on the head axis, then
+    # concatenate q chunks on the layout's sequence axis. q may be
+    # block-padded by the quant kernel beyond seq_len; the plan only
+    # schedules real rows, and each call's output still trims the op's own
+    # padding.
+    chunks: list[tuple[tuple[int, int], list[ChunkCall]]] = []
+    for call in plan:
+        rows = (call.row0, call.row1)
+        if chunks and chunks[-1][0] == rows:
+            chunks[-1][1].append(call)
+        else:
+            chunks.append((rows, [call]))
 
+    # Head chunking: materialize K/V head slices (and their scales) once and
+    # reuse them across q chunks — the per-call K/V footprint drops to
+    # L2-resident sizes, which is the point. Head chunking is MHA-only (the
+    # plan builder collapses GQA), so a slice's kv heads equal its q heads;
+    # without head chunking the real GQA counts are used below.
+    head_slices = sorted({(call.h0, call.h1) for call in plan})
+    if len(head_slices) > 1:
+        kv_head_parts = {
+            (h0, h1): (
+                k[:, h0:h1].contiguous(),
+                v[:, h0:h1].contiguous(),
+                k_scale[:, h0:h1].contiguous(),
+                v_scale[:, h0:h1].contiguous(),
+            )
+            for h0, h1 in head_slices
+        }
+        del k, v, k_scale, v_scale
+
+    out_parts = []
+    for (row0, row1), calls in chunks:
+        real_rows = min(row1, seq_len) - row0
+        if real_rows <= 0:
+            continue  # defensive: plans built over seq_len never emit these
+        if row0 % _Q_BLOCK_SIZE != 0:
+            raise ValueError(
+                "fp8_rotate_quant_kv_slice: plan row boundaries must start on "
+                f"{_Q_BLOCK_SIZE}-row blocks (got row0={row0}); build the plan with "
+                "row_align=_Q_BLOCK_SIZE so per-chunk dequant scales are exact "
+                "slices of the full-length scales."
+            )
+        head_parts = []
+        for call in calls:
+            h0, h1 = call.h0, call.h1
+            if len(head_slices) > 1:
+                k_c, v_c, ks_c, vs_c = kv_head_parts[(h0, h1)]
+                kv_heads_c = h1 - h0
+            else:
+                k_c, v_c, ks_c, vs_c = k, v, k_scale, v_scale
+                kv_heads_c = num_kv_heads
+            out_hc = fia_v2(
+                q[:, h0:h1, row0:row1, :].contiguous(),
+                k_c,
+                v_c,
+                input_layout="BNSD",
+                num_query_heads=h1 - h0,
+                num_key_value_heads=kv_heads_c,
+                softmax_scale=scale,
+                pre_tokens=2147483647,  # INT32_MAX: no left-context truncation.
+                next_tokens=2147483647,  # INT32_MAX: no right-context truncation.
+                query_quant_mode=7,  # NPU mode id for block FP8 dequant path.
+                key_quant_mode=7,  # Same quant mode as query branch.
+                value_quant_mode=7,  # Same quant mode as key/query branches.
+                # Per-chunk Q scale slice: block-aligned boundaries make this
+                # the exact block range of the full-length quantization.
+                dequant_scale_query=q_scale[
+                    :, h0:h1, row0 // _Q_BLOCK_SIZE : -(-row1 // _Q_BLOCK_SIZE), :
+                ].contiguous(),
+                dequant_scale_key=ks_c,
+                dequant_scale_value=vs_c,
+                out_dtype=out_dtype,
+            )[0]
+            # The op may hand back a padded seq axis; keep this call's real rows.
+            if out_hc.shape[2] != real_rows:
+                out_hc = out_hc[:, :, :real_rows, :]
+            head_parts.append(out_hc)
+        # Reassemble heads (BNSD head axis) before the caller layout transpose.
+        out_c = torch.cat(head_parts, dim=1) if len(head_parts) > 1 else head_parts[0]
+        if layout == "BSND":
+            out_c = out_c.transpose(1, 2)
+        if chunk_callback is not None:
+            # The caller consumes each q chunk (e.g. interleaved reverse
+            # communication); nothing is reassembled here.
+            chunk_callback(out_c, calls[0])
+        else:
+            out_parts.append(out_c)
+    if chunk_callback is not None:
+        return None
+    # Chunks were already transposed to the caller layout in the loop; just
+    # concatenate along the layout's sequence axis.
+    seq_dim = 1 if layout == "BSND" else 2
+    out = torch.cat(out_parts, dim=seq_dim) if len(out_parts) > 1 else out_parts[0]
     return out
