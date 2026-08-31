@@ -730,7 +730,9 @@ def test_prefix_kv_slice_no_scaling_without_factor(monkeypatch):
     torch.testing.assert_close(out, torch.ones(1, 8, 2, 4))
 
 
-# --- Test group F: FP8 K/V-slice routing in forward_npu (MINDIESD_FP8_KV_SLICE) --
+# --- Test group F: FP8 K/V-slice routing in forward_npu ----------------------
+# The kv-slice path is the DEFAULT for packed FP8 inputs; MINDIESD_FP8_KV_SLICE
+# survives only as an escape hatch (explicitly falsy → unquantized).
 
 
 def _packed_extra(**overrides) -> dict:
@@ -746,7 +748,27 @@ def _packed_extra(**overrides) -> dict:
     return extra
 
 
-def test_npu_fp8_kv_slice_env_routes_to_slice_quant(monkeypatch):
+def test_npu_fp8_kv_slice_default_routes_to_slice_quant(monkeypatch):
+    monkeypatch.delenv("MINDIESD_FP8_KV_SLICE", raising=False)
+    _fake_mindiesd(monkeypatch)
+    impl = _npu_impl()
+    impl._forward_prefix_kv_slice_quant_npu = Mock(return_value=torch.tensor([5.0]))
+    impl.forward_fa_quant_npu = Mock(return_value=torch.tensor([4.0]))
+    impl.forward_fa_npu = Mock(return_value=torch.tensor([3.0]))
+    metadata = AttentionMetadata(extra=_packed_extra(kv_cache_dtype="fp8"))
+
+    out = impl.forward_npu(torch.randn(1, 8, 2, 4), *[torch.randn(1, 8, 2, 4)] * 2, metadata)
+
+    # No env needed anymore: dtype=fp8 + packed → kv-slice path.
+    impl._forward_prefix_kv_slice_quant_npu.assert_called_once()
+    impl.forward_fa_quant_npu.assert_not_called()
+    impl.forward_fa_npu.assert_not_called()
+    assert out.item() == 5.0
+
+
+def test_npu_fp8_kv_slice_env_truthy_keeps_slice_quant(monkeypatch):
+    # Legacy opt-in value is accepted but redundant: the default already runs
+    # the kv-slice path.
     monkeypatch.setenv("MINDIESD_FP8_KV_SLICE", "1")
     _fake_mindiesd(monkeypatch)
     impl = _npu_impl()
@@ -759,13 +781,13 @@ def test_npu_fp8_kv_slice_env_routes_to_slice_quant(monkeypatch):
 
     impl._forward_prefix_kv_slice_quant_npu.assert_called_once()
     impl.forward_fa_quant_npu.assert_not_called()
-    impl.forward_fa_npu.assert_not_called()
     assert out.item() == 5.0
 
 
-def test_npu_fp8_kv_slice_env_off_keeps_dense_quant(monkeypatch):
-    monkeypatch.delenv("MINDIESD_FP8_KV_SLICE", raising=False)
+@pytest.mark.parametrize("raw", ["0", "false", "off"])
+def test_npu_fp8_kv_slice_env_falsy_escapes_to_unquantized(monkeypatch, raw):
     _fake_mindiesd(monkeypatch)
+    monkeypatch.setenv("MINDIESD_FP8_KV_SLICE", raw)
     impl = _npu_impl()
     impl._forward_prefix_kv_slice_quant_npu = Mock(return_value=torch.tensor([5.0]))
     impl.forward_fa_quant_npu = Mock(return_value=torch.tensor([4.0]))
@@ -774,14 +796,16 @@ def test_npu_fp8_kv_slice_env_off_keeps_dense_quant(monkeypatch):
 
     out = impl.forward_npu(torch.randn(1, 8, 2, 4), *[torch.randn(1, 8, 2, 4)] * 2, metadata)
 
-    # The env is the opt-in: with it unset the dispatch is unchanged.
+    # Escape hatch: unquantized execution, never dense FP8 (it would cross
+    # packed document boundaries).
     impl._forward_prefix_kv_slice_quant_npu.assert_not_called()
-    impl.forward_fa_quant_npu.assert_called_once()
-    assert out.item() == 4.0
+    impl.forward_fa_quant_npu.assert_not_called()
+    impl.forward_fa_npu.assert_called_once()
+    assert out.item() == 3.0
 
 
 def test_npu_fp8_kv_slice_contract_failure_falls_back_unquantized(monkeypatch):
-    monkeypatch.setenv("MINDIESD_FP8_KV_SLICE", "1")
+    monkeypatch.delenv("MINDIESD_FP8_KV_SLICE", raising=False)
     _fake_mindiesd(monkeypatch)
     impl = _npu_impl()
     impl._forward_prefix_kv_slice_quant_npu = Mock(return_value=None)
@@ -805,13 +829,14 @@ def test_npu_fp8_kv_slice_single_call(monkeypatch):
 
     captured: dict = {}
 
-    def fake_kv_slice(q, k, v, kv_len, *, layout, softmax_scale=None):
+    def fake_kv_slice(q, k, v, kv_len, *, layout, softmax_scale=None, plan=None, chunk_callback=None):
         captured.update(
             q_shape=tuple(q.shape),
             k_shape=tuple(k.shape),
             kv_len=kv_len,
             layout=layout,
             softmax_scale=softmax_scale,
+            plan=plan,
         )
         return torch.zeros(q.shape)
 
@@ -826,7 +851,67 @@ def test_npu_fp8_kv_slice_single_call(monkeypatch):
     assert captured["kv_len"] == 5
     assert captured["layout"] == "BSND"
     assert captured["softmax_scale"] == pytest.approx(0.5)
+    # No chunking options in extra → no plan (single wide call).
+    assert captured["plan"] is None
     assert out.shape == (1, 8, 2, 4)
+
+
+def test_npu_fp8_kv_slice_builds_chunk_plan_from_extra(monkeypatch):
+    """Layer-injected options drive a chunk plan built at the call site."""
+    _fake_mindiesd(monkeypatch)
+    import vllm_omni.platforms.npu.quant.kv_quant_npu as kv_quant_npu
+    from vllm_omni.diffusion.attention.chunking import AttnChunkingOptions
+
+    captured: dict = {}
+
+    def fake_kv_slice(q, k, v, kv_len, *, layout, softmax_scale=None, plan=None, chunk_callback=None):
+        captured.update(kv_len=kv_len, plan=plan)
+        return torch.zeros(q.shape)
+
+    monkeypatch.setattr(kv_quant_npu, "fp8_rotate_quant_kv_slice", fake_kv_slice)
+    impl = _npu_impl()
+    q = torch.randn(1, 256, 2, 4)
+    cu = torch.tensor([0, 200, 256], dtype=torch.int32)
+    extra = {
+        "cu_seqlens_q": cu,
+        "cu_seqlens_k": cu,
+        "max_seqlen_q": 200,
+        "max_seqlen_k": 200,
+        "npu_attn_varlen": True,
+        "attn_chunking": AttnChunkingOptions(q_chunk=2, head_chunk=1, head_chunk_min_kv=0),
+    }
+
+    impl._forward_prefix_kv_slice_quant_npu(q, q, q, extra)
+
+    # q-chunk-major / head-minor plan over the 128-row quant grid, against
+    # the resolved kv prefix.
+    assert captured["kv_len"] == 200
+    assert [(c.row0, c.row1, c.h0, c.h1) for c in captured["plan"]] == [
+        (0, 128, 0, 1),
+        (0, 128, 1, 2),
+        (128, 256, 0, 1),
+        (128, 256, 1, 2),
+    ]
+
+
+def test_npu_fp8_nonpacked_with_chunking_warns_and_ignores(monkeypatch):
+    """Non-packed FP8 (dense layouts) has no chunking support: the knobs are
+    ignored with a warning and dense quant still runs."""
+    _fake_mindiesd(monkeypatch)
+    from vllm_omni.diffusion.attention.chunking import AttnChunkingOptions
+
+    impl = _npu_impl()
+    impl.forward_fa_quant_npu = Mock(return_value=torch.tensor([4.0]))
+    impl.forward_fa_npu = Mock(return_value=torch.tensor([3.0]))
+    metadata = AttentionMetadata(
+        extra={"kv_cache_dtype": "fp8", "attn_chunking": AttnChunkingOptions(q_chunk=8)}
+    )
+
+    out = impl.forward_npu(torch.randn(1, 8, 2, 4), *[torch.randn(1, 8, 2, 4)] * 2, metadata)
+
+    impl.forward_fa_quant_npu.assert_called_once()
+    impl.forward_fa_npu.assert_not_called()
+    assert out.item() == 4.0
 
 
 def test_npu_fp8_kv_slice_contract_failure_returns_none(monkeypatch):
