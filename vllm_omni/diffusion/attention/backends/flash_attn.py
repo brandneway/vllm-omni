@@ -576,6 +576,21 @@ class FlashAttentionImpl(AttentionImpl):
                     "(requires MHA and kv_len >= --diffusion-attn-head-chunk-min-kv); "
                     "running with full heads."
                 )
+            # One activation line per attention layer per distinct schedule
+            # (q-chunk count x heads per call) so operators can confirm the
+            # chunking is live; short requests collapse to the single-call
+            # schedule, and the line re-fires when the shape changes.
+            head_width = plan[0].h1 - plan[0].h0 if plan else num_heads
+            schedule = (len({(c.row0, c.row1) for c in plan}), head_width)
+            if getattr(self, "_chunking_last_schedule", None) != schedule:
+                self._chunking_last_schedule = schedule
+                logger.info(
+                    "Attention chunking active: %d q chunks x %d/%d heads per FIA call, row_align=%d.",
+                    schedule[0],
+                    head_width,
+                    num_heads,
+                    kv_quant_npu._Q_BLOCK_SIZE,
+                )
 
         # The quant wrapper slices K/V on the seq axis itself.
         return fp8_rotate_quant_kv_slice(
