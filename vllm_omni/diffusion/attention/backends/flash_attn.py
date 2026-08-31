@@ -499,18 +499,9 @@ class FlashAttentionImpl(AttentionImpl):
             return self.forward_fa_quant_npu(query, key, value, attn_metadata)
         # Packed inputs: the kv-slice path is the DEFAULT for FP8 — K/V are
         # sliced to the valid prefix outside the operator instead of
-        # attending over the padding document. MINDIESD_FP8_KV_SLICE survives
-        # as an operations escape hatch: an explicitly falsy value drops the
-        # packed FP8 path and runs unquantized (never dense FP8, which would
-        # cross packed document boundaries).
-        from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_kv_slice_disabled_by_env
-
-        if fp8_kv_slice_disabled_by_env():
-            logger.warning_once(
-                "MINDIESD_FP8_KV_SLICE is explicitly disabled: packed FP8 kv-slice "
-                "attention falls back to unquantized execution."
-            )
-            return self.forward_fa_npu(query, key, value, attn_metadata)
+        # attending over the padding document. (The legacy MINDIESD_FP8_KV_SLICE
+        # opt-in env is obsolete and ignored; drop --diffusion-kv-cache-dtype
+        # fp8 to run unquantized.)
         out = self._forward_prefix_kv_slice_quant_npu(query, key, value, extra)
         if out is not None:
             return out

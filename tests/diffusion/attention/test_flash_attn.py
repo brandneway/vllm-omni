@@ -731,8 +731,9 @@ def test_prefix_kv_slice_no_scaling_without_factor(monkeypatch):
 
 
 # --- Test group F: FP8 K/V-slice routing in forward_npu ----------------------
-# The kv-slice path is the DEFAULT for packed FP8 inputs; MINDIESD_FP8_KV_SLICE
-# survives only as an escape hatch (explicitly falsy → unquantized).
+# The kv-slice path is the DEFAULT for packed FP8 inputs. The legacy
+# MINDIESD_FP8_KV_SLICE opt-in env is obsolete and ignored; run without
+# --diffusion-kv-cache-dtype fp8 to get unquantized execution.
 
 
 def _packed_extra(**overrides) -> dict:
@@ -749,7 +750,6 @@ def _packed_extra(**overrides) -> dict:
 
 
 def test_npu_fp8_kv_slice_default_routes_to_slice_quant(monkeypatch):
-    monkeypatch.delenv("MINDIESD_FP8_KV_SLICE", raising=False)
     _fake_mindiesd(monkeypatch)
     impl = _npu_impl()
     impl._forward_prefix_kv_slice_quant_npu = Mock(return_value=torch.tensor([5.0]))
@@ -759,53 +759,14 @@ def test_npu_fp8_kv_slice_default_routes_to_slice_quant(monkeypatch):
 
     out = impl.forward_npu(torch.randn(1, 8, 2, 4), *[torch.randn(1, 8, 2, 4)] * 2, metadata)
 
-    # No env needed anymore: dtype=fp8 + packed → kv-slice path.
+    # dtype=fp8 + packed → kv-slice path, no env needed.
     impl._forward_prefix_kv_slice_quant_npu.assert_called_once()
     impl.forward_fa_quant_npu.assert_not_called()
     impl.forward_fa_npu.assert_not_called()
     assert out.item() == 5.0
 
 
-def test_npu_fp8_kv_slice_env_truthy_keeps_slice_quant(monkeypatch):
-    # Legacy opt-in value is accepted but redundant: the default already runs
-    # the kv-slice path.
-    monkeypatch.setenv("MINDIESD_FP8_KV_SLICE", "1")
-    _fake_mindiesd(monkeypatch)
-    impl = _npu_impl()
-    impl._forward_prefix_kv_slice_quant_npu = Mock(return_value=torch.tensor([5.0]))
-    impl.forward_fa_quant_npu = Mock(return_value=torch.tensor([4.0]))
-    impl.forward_fa_npu = Mock(return_value=torch.tensor([3.0]))
-    metadata = AttentionMetadata(extra=_packed_extra(kv_cache_dtype="fp8"))
-
-    out = impl.forward_npu(torch.randn(1, 8, 2, 4), *[torch.randn(1, 8, 2, 4)] * 2, metadata)
-
-    impl._forward_prefix_kv_slice_quant_npu.assert_called_once()
-    impl.forward_fa_quant_npu.assert_not_called()
-    assert out.item() == 5.0
-
-
-@pytest.mark.parametrize("raw", ["0", "false", "off"])
-def test_npu_fp8_kv_slice_env_falsy_escapes_to_unquantized(monkeypatch, raw):
-    _fake_mindiesd(monkeypatch)
-    monkeypatch.setenv("MINDIESD_FP8_KV_SLICE", raw)
-    impl = _npu_impl()
-    impl._forward_prefix_kv_slice_quant_npu = Mock(return_value=torch.tensor([5.0]))
-    impl.forward_fa_quant_npu = Mock(return_value=torch.tensor([4.0]))
-    impl.forward_fa_npu = Mock(return_value=torch.tensor([3.0]))
-    metadata = AttentionMetadata(extra=_packed_extra(kv_cache_dtype="fp8"))
-
-    out = impl.forward_npu(torch.randn(1, 8, 2, 4), *[torch.randn(1, 8, 2, 4)] * 2, metadata)
-
-    # Escape hatch: unquantized execution, never dense FP8 (it would cross
-    # packed document boundaries).
-    impl._forward_prefix_kv_slice_quant_npu.assert_not_called()
-    impl.forward_fa_quant_npu.assert_not_called()
-    impl.forward_fa_npu.assert_called_once()
-    assert out.item() == 3.0
-
-
 def test_npu_fp8_kv_slice_contract_failure_falls_back_unquantized(monkeypatch):
-    monkeypatch.delenv("MINDIESD_FP8_KV_SLICE", raising=False)
     _fake_mindiesd(monkeypatch)
     impl = _npu_impl()
     impl._forward_prefix_kv_slice_quant_npu = Mock(return_value=None)
