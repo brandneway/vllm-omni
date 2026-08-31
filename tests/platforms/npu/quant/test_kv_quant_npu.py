@@ -471,3 +471,41 @@ class TestKVQuantNPUSmoke:
         out = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 5, layout="BSND")
         assert out.shape == query.shape
         assert out.dtype == query.dtype
+
+    def test_fp8_rotate_quant_kv_slice_chunked_matches_single_call(self):
+        """Config-7 core contract on real hardware: chunked dispatch (q rows
+        x heads) over one shared quantization matches the single wide call.
+
+        Boundaries are 128-row aligned so per-chunk dequant scales are exact
+        slices of the full-length scales — the outputs must agree bitwise.
+        """
+        try:
+            kv_quant_npu._load_quant_ops.cache_clear()
+            kv_quant_npu._load_quant_ops()
+        except ImportError:
+            pytest.skip("NPU quant dependencies are not fully installed.")
+
+        torch.manual_seed(425500)
+        seq_len, num_heads, head_dim, kv_len = 512, 4, 128, 400
+        query = torch.randn(1, seq_len, num_heads, head_dim, dtype=torch.float16, device="npu")
+        key = torch.randn(1, seq_len, num_heads, head_dim, dtype=torch.float16, device="npu")
+        value = torch.randn(1, seq_len, num_heads, head_dim, dtype=torch.float16, device="npu")
+
+        out_single = kv_quant_npu.fp8_rotate_quant_kv_slice(
+            query, key, value, kv_len, layout="BSND", softmax_scale=0.088
+        )
+        plan = chunking.build_chunk_plan(
+            seq_len=seq_len,
+            num_heads=num_heads,
+            num_kv_heads=num_heads,
+            kv_len=kv_len,
+            options=chunking.AttnChunkingOptions(q_chunk=4, head_chunk=2, head_chunk_min_kv=0),
+            row_align=kv_quant_npu._Q_BLOCK_SIZE,
+        )
+        assert len(plan) == 8  # 4 row chunks x 2 head slices
+        out_chunked = kv_quant_npu.fp8_rotate_quant_kv_slice(
+            query, key, value, kv_len, layout="BSND", softmax_scale=0.088, plan=plan
+        )
+
+        assert out_chunked.shape == out_single.shape
+        assert torch.equal(out_single, out_chunked)
