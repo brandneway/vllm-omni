@@ -50,6 +50,34 @@ def _load_kv_quant_npu() -> ModuleType:
 kv_quant_npu = _load_kv_quant_npu()
 
 
+def _load_chunking() -> ModuleType:
+    """Load the framework-level chunking scheduler standalone (same pattern).
+
+    The FIA adapter consumes its plan duck-typed (no runtime import), so the
+    plan objects used here double as an interop check that a real ChunkCall
+    sequence drives the chunked dispatch.
+    """
+    import sys
+
+    path = _repo_root() / "vllm_omni" / "diffusion" / "attention" / "chunking.py"
+    name = "vllm_omni_test_chunking_standalone"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        msg = f"cannot load import spec for {path}"
+        raise RuntimeError(msg)
+    mod = importlib.util.module_from_spec(spec)
+    # Register before exec: dataclass KW_ONLY detection looks the module up
+    # in sys.modules and crashes on a missing entry.
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+chunking = _load_chunking()
+
+
 def _npu_smoke_available() -> bool:
     try:
         import torch_npu  # noqa: F401
@@ -67,15 +95,18 @@ def test_is_quantized_kv_cache() -> None:
     assert not kv_quant_npu.is_quantized_kv_cache("int8")
 
 
-def test_fp8_kv_slice_enabled_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fp8_kv_slice_disabled_by_env_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The kv-slice path is the DEFAULT for packed FP8: unset keeps it on.
     monkeypatch.delenv("MINDIESD_FP8_KV_SLICE", raising=False)
-    assert not kv_quant_npu.fp8_kv_slice_enabled()
-    monkeypatch.setenv("MINDIESD_FP8_KV_SLICE", "1")
-    assert kv_quant_npu.fp8_kv_slice_enabled()
-    monkeypatch.setenv("MINDIESD_FP8_KV_SLICE", "true")
-    assert kv_quant_npu.fp8_kv_slice_enabled()
-    monkeypatch.setenv("MINDIESD_FP8_KV_SLICE", "0")
-    assert not kv_quant_npu.fp8_kv_slice_enabled()
+    assert not kv_quant_npu.fp8_kv_slice_disabled_by_env()
+    # Explicitly falsy values are the operations escape hatch.
+    for raw in ("0", "false", "no", "off"):
+        monkeypatch.setenv("MINDIESD_FP8_KV_SLICE", raw)
+        assert kv_quant_npu.fp8_kv_slice_disabled_by_env(), raw
+    # Truthy (legacy opt-in) and unrecognized values keep the default.
+    for raw in ("1", "true", "yes", "on", "banana"):
+        monkeypatch.setenv("MINDIESD_FP8_KV_SLICE", raw)
+        assert not kv_quant_npu.fp8_kv_slice_disabled_by_env(), raw
 
 
 class TestKVQuantNPUUnit:
@@ -290,6 +321,133 @@ class TestKVQuantNPUUnit:
 
         with pytest.raises(ValueError, match="unsupported layout"):
             kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 5, layout="INVALID")
+
+    # --- Chunked dispatch (plan from the generic chunking scheduler) -------
+
+    @staticmethod
+    def _chunk_plan(
+        seq_len: int,
+        num_heads: int,
+        kv_len: int,
+        *,
+        q_chunk: int = 1,
+        head_chunk: int = 0,
+        num_kv_heads: int | None = None,
+    ) -> list:
+        options = chunking.AttnChunkingOptions(
+            q_chunk=q_chunk, head_chunk=head_chunk, head_chunk_min_kv=0  # gate off in tests
+        )
+        return chunking.build_chunk_plan(
+            seq_len=seq_len,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads if num_kv_heads is not None else num_heads,
+            kv_len=kv_len,
+            options=options,
+            row_align=kv_quant_npu._Q_BLOCK_SIZE,
+        )
+
+    def test_kv_slice_plan_splits_fia_calls_and_reassembles(self, fake_quant_ops) -> None:
+        # BSND [1, T=256, N=2, D=4]; q_chunk=2 + head_chunk=1 → 2 q chunks x
+        # 2 head slices = 4 FIA calls over one shared quantization.
+        query, key, value = self._make_qkv((1, 256, 2, 4))
+        plan = self._chunk_plan(256, 2, 200, q_chunk=2, head_chunk=1)
+
+        out = kv_quant_npu.fp8_rotate_quant_kv_slice(
+            query, key, value, 200, layout="BSND", softmax_scale=0.125, plan=plan
+        )
+
+        assert out.shape == query.shape
+        # Quantization happens ONCE regardless of the plan.
+        assert len(fake_quant_ops["fa_calls"]) == 3
+        assert len(fake_quant_ops["fia_calls"]) == 4
+        for call in fake_quant_ops["fia_calls"]:
+            # Each dispatch: BNSD q slice (1, head_slice, 128, 4) against the
+            # materialized K/V head part (1, head_slice, kv_len=200, 4).
+            assert call["q_shape"] == (1, 1, 128, 4)
+            assert call["k_shape"] == (1, 1, 200, 4)
+            kwargs = call["kwargs"]
+            assert kwargs["num_query_heads"] == 1
+            assert kwargs["num_key_value_heads"] == 1
+            assert kwargs["input_layout"] == "BNSD"
+            # Exact block range of the full-length quantization: one 128-row
+            # block per chunk.
+            assert kwargs["dequant_scale_query"].shape == (1, 1, 1, 1)
+
+    def test_kv_slice_plan_qchunk_only_keeps_full_heads(self, fake_quant_ops) -> None:
+        query, key, value = self._make_qkv((1, 256, 2, 4))
+        plan = self._chunk_plan(256, 2, 200, q_chunk=2)
+
+        out = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 200, layout="BSND", plan=plan)
+
+        assert out.shape == query.shape
+        assert len(fake_quant_ops["fia_calls"]) == 2
+        for call in fake_quant_ops["fia_calls"]:
+            assert call["q_shape"] == (1, 2, 128, 4)
+            # No head chunking: the real GQA kv head count is passed through.
+            assert call["kwargs"]["num_query_heads"] == 2
+            assert call["kwargs"]["num_key_value_heads"] == 2
+
+    def test_kv_slice_plan_ragged_tail_chunk(self, fake_quant_ops) -> None:
+        # 200 rows with 128-block alignment → chunks (0,128) and (128,200).
+        query, key, value = self._make_qkv((1, 200, 2, 4))
+        plan = self._chunk_plan(200, 2, 200, q_chunk=2)
+
+        out = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 200, layout="BSND", plan=plan)
+
+        assert out.shape == query.shape
+        shapes = [call["q_shape"] for call in fake_quant_ops["fia_calls"]]
+        assert shapes == [(1, 2, 128, 4), (1, 2, 72, 4)]
+
+    def test_kv_slice_plan_single_call_matches_no_plan(self, fake_quant_ops) -> None:
+        query, key, value = self._make_qkv((1, 256, 2, 4))
+        single = [chunking.ChunkCall(0, 256, 0, 2)]
+
+        out_plan = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 200, layout="BSND", plan=single)
+        assert len(fake_quant_ops["fia_calls"]) == 1
+        out_plain = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 200, layout="BSND")
+        assert len(fake_quant_ops["fia_calls"]) == 2  # one more call recorded
+        assert out_plan.shape == out_plain.shape == query.shape
+
+    def test_kv_slice_plan_chunk_callback_consumes_chunks(self, fake_quant_ops) -> None:
+        query, key, value = self._make_qkv((1, 256, 2, 4))
+        plan = self._chunk_plan(256, 2, 200, q_chunk=2, head_chunk=1)
+        chunks: list[tuple[torch.Tensor, tuple[int, int]]] = []
+
+        def cb(out_chunk, call) -> None:
+            chunks.append((out_chunk, (call.row0, call.row1)))
+
+        result = kv_quant_npu.fp8_rotate_quant_kv_slice(
+            query, key, value, 200, layout="BSND", plan=plan, chunk_callback=cb
+        )
+
+        assert result is None
+        assert len(fake_quant_ops["fia_calls"]) == 4  # still fully executed
+        # One head-merged chunk per q chunk, in caller (BSND) layout.
+        assert [tuple(t.shape) for t, _ in chunks] == [(1, 128, 2, 4)] * 2
+        assert [rows for _, rows in chunks] == [(0, 128), (128, 256)]
+
+    def test_kv_slice_plan_misaligned_row_boundary_raises(self, fake_quant_ops) -> None:
+        # Duck-typed plan (no chunking import needed at runtime); row0=100 is
+        # off the 128-row block grid so scale slices would be inexact.
+        query, key, value = self._make_qkv((1, 256, 2, 4))
+        plan = [SimpleNamespace(row0=100, row1=200, h0=0, h1=2)]
+
+        with pytest.raises(ValueError, match="row boundaries"):
+            kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 200, layout="BSND", plan=plan)
+
+    def test_kv_slice_plan_skips_calls_beyond_seq_len(self, fake_quant_ops) -> None:
+        # Defensive: a plan covering rows past the real sequence contributes
+        # nothing (its outputs would be dropped anyway).
+        query, key, value = self._make_qkv((1, 256, 2, 4))
+        plan = [
+            SimpleNamespace(row0=0, row1=256, h0=0, h1=2),
+            SimpleNamespace(row0=256, row1=384, h0=0, h1=2),
+        ]
+
+        out = kv_quant_npu.fp8_rotate_quant_kv_slice(query, key, value, 200, layout="BSND", plan=plan)
+
+        assert out.shape == query.shape
+        assert len(fake_quant_ops["fia_calls"]) == 1
 
 
 @npu_smoke
