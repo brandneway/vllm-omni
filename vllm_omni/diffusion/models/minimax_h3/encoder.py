@@ -42,12 +42,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
-from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
 from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
 )
-
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 
@@ -368,22 +366,18 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
 # ---------------------------------------------------------------------------
 
 
-class MiniMaxH3Qwen3VLRMSNorm(DiffusionRMSNorm):
-    """Qwen3-VL RMSNorm using the common implementation.
+class MiniMaxH3Qwen3VLRMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
 
-    The model-specific name keeps checkpoint weight keys stable, while the
-    common RMSNorm dispatches to torch_npu.npu_rms_norm on Ascend. Gamma uses
-    the checkpoint/model dtype, but native fallbacks keep the RMS variance
-    reduction and scaling in float32.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-        dtype: torch.dtype = torch.float32,
-    ) -> None:
-        super().__init__(hidden_size, eps=eps, dtype=dtype)
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -777,8 +771,8 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        self.q_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
-        self.k_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
+        self.q_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = MiniMaxH3Qwen3VLRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -894,10 +888,8 @@ class MiniMaxH3Qwen3VLTextDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = MiniMaxH3Qwen3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
-        self.post_attention_layernorm = MiniMaxH3Qwen3VLRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
-        )
+        self.input_layernorm = MiniMaxH3Qwen3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = MiniMaxH3Qwen3VLRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
