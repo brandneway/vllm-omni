@@ -11,9 +11,8 @@ Two entry points dispatch to the MindIE-SD FIA operator:
 ``fp8_rotate_quant_kv_slice`` for the packed [real, pad] layout with K/V
 sliced to the valid prefix so a plain dense BNSD/BSND FIA call (no varlen
 feature) suffices. The kv-slice path is the default behavior of
-``--diffusion-kv-cache-dtype fp8`` on NPU; ``MINDIESD_FP8_KV_SLICE=0`` is
-an escape hatch that drops the packed FP8 path back to unquantized
-attention (see :func:`fp8_kv_slice_disabled_by_env`).
+``--diffusion-kv-cache-dtype fp8`` on NPU for packed inputs (the legacy
+``MINDIESD_FP8_KV_SLICE`` opt-in env is obsolete and ignored).
 
 ``fp8_rotate_quant_kv_slice`` also accepts a chunk plan from
 ``vllm_omni.diffusion.attention.chunking`` (duck-typed ``ChunkCall``
@@ -29,7 +28,6 @@ full-length scales and chunked results match the single call.
 from __future__ import annotations
 
 import math
-import os
 import threading
 from collections.abc import Sequence
 from functools import lru_cache
@@ -56,24 +54,6 @@ _KV_BLOCK_SIZE = 256
 def is_quantized_kv_cache(kv_cache_dtype: str | None) -> bool:
     """True if config requests FP8-style KV / QKV quantization for the NPU FA path."""
     return kv_cache_dtype in _FP8_KV_LABELS
-
-
-def fp8_kv_slice_disabled_by_env() -> bool:
-    """True only when ``MINDIESD_FP8_KV_SLICE`` is explicitly falsy
-    (``0``/``false``/``no``/``off``).
-
-    The kv-slice path is the *default* behavior of
-    ``--diffusion-kv-cache-dtype fp8`` for packed inputs — no opt-in env is
-    needed anymore. The env survives as an operations escape hatch: an
-    explicitly falsy value drops the packed FP8 path and runs unquantized
-    attention (never dense FP8, which would ignore packed document
-    boundaries). Unset or any other value keeps the default. Read per call
-    (no cache) so a changed environment takes effect without a process
-    restart, matching the ``MINDIE_SD_FA_TYPE`` dispatch."""
-    raw = os.environ.get("MINDIESD_FP8_KV_SLICE")
-    if raw is None:
-        return False
-    return raw.strip().lower() in ("0", "false", "no", "off")
 
 
 @lru_cache(maxsize=1)

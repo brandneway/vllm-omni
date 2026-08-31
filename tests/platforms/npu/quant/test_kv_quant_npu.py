@@ -95,20 +95,6 @@ def test_is_quantized_kv_cache() -> None:
     assert not kv_quant_npu.is_quantized_kv_cache("int8")
 
 
-def test_fp8_kv_slice_disabled_by_env_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The kv-slice path is the DEFAULT for packed FP8: unset keeps it on.
-    monkeypatch.delenv("MINDIESD_FP8_KV_SLICE", raising=False)
-    assert not kv_quant_npu.fp8_kv_slice_disabled_by_env()
-    # Explicitly falsy values are the operations escape hatch.
-    for raw in ("0", "false", "no", "off"):
-        monkeypatch.setenv("MINDIESD_FP8_KV_SLICE", raw)
-        assert kv_quant_npu.fp8_kv_slice_disabled_by_env(), raw
-    # Truthy (legacy opt-in) and unrecognized values keep the default.
-    for raw in ("1", "true", "yes", "on", "banana"):
-        monkeypatch.setenv("MINDIESD_FP8_KV_SLICE", raw)
-        assert not kv_quant_npu.fp8_kv_slice_disabled_by_env(), raw
-
-
 class TestKVQuantNPUUnit:
     @pytest.fixture(autouse=True)
     def clear_rot_cache(self):
