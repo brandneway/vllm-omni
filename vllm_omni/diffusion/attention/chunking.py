@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Backend-neutral scheduling for chunked attention calls.
 
 Splitting one wide attention call into several narrower ones along the query
@@ -43,6 +43,7 @@ __all__ = [
     "ChunkCall",
     "build_chunk_plan",
     "run_chunked",
+    "validate_options",
 ]
 
 # Default L2-residency gate for head chunking: below this valid kv length the
@@ -74,6 +75,20 @@ class AttnChunkingOptions:
     def active(self) -> bool:
         """True when any chunking is requested (non-default knobs)."""
         return self.q_chunk > 1 or self.head_chunk > 0
+
+
+def validate_options(options: AttnChunkingOptions) -> None:
+    """Range-check the knobs; raise ValueError on impossible values.
+
+    Config surfaces call this at post-init so a typo (e.g. ``q_chunk=0``)
+    fails fast instead of silently disabling chunking at plan time.
+    """
+    if options.q_chunk < 1:
+        raise ValueError(f"q_chunk must be >= 1, got {options.q_chunk}")
+    if options.head_chunk < 0:
+        raise ValueError(f"head_chunk must be >= 0, got {options.head_chunk}")
+    if options.head_chunk_min_kv < 0:
+        raise ValueError(f"head_chunk_min_kv must be >= 0, got {options.head_chunk_min_kv}")
 
 
 @dataclass(frozen=True)
@@ -160,14 +175,7 @@ def build_chunk_plan(
     if row_align < 1:
         raise ValueError(f"build_chunk_plan: row_align must be >= 1, got {row_align}")
     if options is not None:
-        if options.q_chunk < 1:
-            raise ValueError(f"build_chunk_plan: q_chunk must be >= 1, got {options.q_chunk}")
-        if options.head_chunk < 0:
-            raise ValueError(f"build_chunk_plan: head_chunk must be >= 0, got {options.head_chunk}")
-        if options.head_chunk_min_kv < 0:
-            raise ValueError(
-                f"build_chunk_plan: head_chunk_min_kv must be >= 0, got {options.head_chunk_min_kv}"
-            )
+        validate_options(options)
 
     row_bounds = _row_chunk_bounds(seq_len, options.q_chunk if options is not None else 1, row_align)
 
@@ -229,6 +237,7 @@ def run_chunked(
         merged = head_parts[0] if len(head_parts) == 1 else torch.cat(head_parts, dim=head_dim)
         head_parts.clear()
         if chunk_callback is not None:
+            assert cur is not None  # head_parts non-empty implies a group started
             chunk_callback(merged, cur)
         else:
             out_parts.append(merged)

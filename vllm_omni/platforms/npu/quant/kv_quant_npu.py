@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """FP8 quantization utilities for diffusion attention tensors.
 
 Provides per-tensor dynamic quantization of Q/K/V tensors to
@@ -31,8 +31,9 @@ from __future__ import annotations
 import math
 import os
 import threading
+from collections.abc import Sequence
 from functools import lru_cache
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING
 
 import torch
 
