@@ -92,11 +92,10 @@ class RotaryEmbedding(CustomOp):
            of 1st half and 2nd half (GPT-NeoX style).
     """
 
-    def __init__(self, is_neox_style: bool = False, half_head_dim: bool = True) -> None:
+    def __init__(self, is_neox_style: bool = False) -> None:
         super().__init__()
         self.is_neox_style = is_neox_style
         self.interleaved = not is_neox_style
-        self.half_head_dim = half_head_dim
         self.apply_rotary_emb_flash_attn = None
         self.has_mindie = False
         # ``find_spec("flash_attn")`` is True as long as *any* package publishes
@@ -114,21 +113,6 @@ class RotaryEmbedding(CustomOp):
         if find_spec("mindiesd") is not None:
             self.has_mindie = True
 
-    def _prepare_half_head_dim_cos_sin(
-        self,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Normalize shared cos/sin to the half-dim layout used by CUDA/native kernels."""
-        if cos.dim() == 3:
-            # All batch elements share the same rotary position encoding.
-            cos = cos[0]
-            sin = sin[0]
-        if not self.half_head_dim:
-            cos = cos[..., ::2] if self.interleaved else cos[..., : cos.shape[-1] // 2]
-            sin = sin[..., ::2] if self.interleaved else sin[..., : sin.shape[-1] // 2]
-        return cos, sin
-
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -137,7 +121,10 @@ class RotaryEmbedding(CustomOp):
     ) -> torch.Tensor:
         from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
 
-        cos, sin = self._prepare_half_head_dim_cos_sin(cos, sin)
+        if cos.dim() == 3:
+            # (B, S, D/2) -> (S, D/2)
+            cos = cos[0]
+            sin = sin[0]
 
         x, squeezed = _ensure_batch_dim(x)
         output = apply_rotary_emb(
@@ -157,7 +144,10 @@ class RotaryEmbedding(CustomOp):
         if self.apply_rotary_emb_flash_attn is None:
             return self.forward_cuda(x, cos, sin)
 
-        cos, sin = self._prepare_half_head_dim_cos_sin(cos, sin)
+        if cos.dim() == 3:
+            # (B, S, D/2) -> (S, D/2)
+            cos = cos[0]
+            sin = sin[0]
 
         x, squeezed = _ensure_batch_dim(x)
         output = self.apply_rotary_emb_flash_attn(
@@ -175,7 +165,7 @@ class RotaryEmbedding(CustomOp):
         sin: torch.Tensor,
     ) -> torch.Tensor:
         if self.has_mindie:
-            return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved, self.half_head_dim)
+            return apply_rotary_emb_mindiesd(x, cos, sin, self.interleaved)
         else:
             return self.forward_native(x, cos, sin)
 
@@ -213,7 +203,9 @@ class RotaryEmbedding(CustomOp):
         # All batch elements share the same rotary position encoding.
         # Strip the batch dim so the underlying op broadcasts over the batch,
         # consistent with forward_cuda / forward_hip / apply_rotary_emb_mindiesd.
-        cos, sin = self._prepare_half_head_dim_cos_sin(cos, sin)
+        if cos.dim() == 3:
+            cos = cos[0]
+            sin = sin[0]
         return apply_rotary_emb_torch(
             x,
             cos,
