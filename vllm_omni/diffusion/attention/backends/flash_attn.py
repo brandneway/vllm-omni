@@ -469,27 +469,42 @@ class FlashAttentionImpl(AttentionImpl):
         """NPU attention implementation using mindiesd."""
 
         kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata else None
-        if kv_cache_dtype is not None:
-            extra = attn_metadata.extra if attn_metadata else {}
-            if extra.get("npu_attn_varlen", False):
-                # MINDIESD_FP8_KV_SLICE selects the dense-FIA variant: K/V are
-                # sliced to the valid prefix outside the operator instead of
-                # attending over the padding document.
-                from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_kv_slice_enabled
-
-                if fp8_kv_slice_enabled():
-                    out = self._forward_prefix_kv_slice_quant_npu(query, key, value, extra)
-                    if out is not None:
-                        return out
-                    # Packed contract failed. Dense FP8 would ignore document
-                    # boundaries, so run unquantized to keep varlen semantics.
-                    logger.warning_once(
-                        "kv_cache_dtype='fp8' is ignored for this attention layer: "
-                        "the packed varlen contract did not hold, so attention runs "
-                        "unquantized instead of crossing document boundaries."
-                    )
-                    return self.forward_fa_npu(query, key, value, attn_metadata)
+        if kv_cache_dtype is None:
+            return self.forward_fa_npu(query, key, value, attn_metadata)
+        extra = attn_metadata.extra if attn_metadata else {}
+        if not extra.get("npu_attn_varlen", False):
+            # Non-packed FP8 (dense layouts) has no chunking support: the
+            # chunk knobs ride along in extra but do nothing here.
+            if extra.get("attn_chunking") is not None:
+                logger.warning_once(
+                    "Attention chunking applies only to the packed FP8 kv-slice "
+                    "path; ignoring the chunking options for this non-packed layer."
+                )
             return self.forward_fa_quant_npu(query, key, value, attn_metadata)
+        # Packed inputs: the kv-slice path is the DEFAULT for FP8 — K/V are
+        # sliced to the valid prefix outside the operator instead of
+        # attending over the padding document. MINDIESD_FP8_KV_SLICE survives
+        # as an operations escape hatch: an explicitly falsy value drops the
+        # packed FP8 path and runs unquantized (never dense FP8, which would
+        # cross packed document boundaries).
+        from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_kv_slice_disabled_by_env
+
+        if fp8_kv_slice_disabled_by_env():
+            logger.warning_once(
+                "MINDIESD_FP8_KV_SLICE is explicitly disabled: packed FP8 kv-slice "
+                "attention falls back to unquantized execution."
+            )
+            return self.forward_fa_npu(query, key, value, attn_metadata)
+        out = self._forward_prefix_kv_slice_quant_npu(query, key, value, extra)
+        if out is not None:
+            return out
+        # Packed contract failed. Dense FP8 would ignore document boundaries,
+        # so run unquantized to keep varlen semantics.
+        logger.warning_once(
+            "kv_cache_dtype='fp8' is ignored for this attention layer: "
+            "the packed varlen contract did not hold, so attention runs "
+            "unquantized instead of crossing document boundaries."
+        )
         return self.forward_fa_npu(query, key, value, attn_metadata)
 
     def forward_fa_quant_npu(
@@ -522,14 +537,20 @@ class FlashAttentionImpl(AttentionImpl):
         """Packed FP8 attention on NPU: slice K/V to the valid prefix, then a
         dense (non-varlen) FIA call via fp8_rotate_quant_kv_slice.
 
-        FP8 counterpart of _forward_prefix_kv_slice_npu, enabled via
-        MINDIESD_FP8_KV_SLICE. Same numerical contract as the unquantized
-        prefix-K/V-slice path: the padding document is a strict suffix, so
-        dropping it from K/V before quantization is identical to masking it
-        out. Query keeps full length; outputs on padding rows are never
-        consumed downstream. Returns None (caller falls back to the
-        unquantized path) when the packed contract does not hold; see
-        _resolve_packed_seq_npu.
+        FP8 counterpart of _forward_prefix_kv_slice_npu and the default packed
+        FP8 path. Same numerical contract as the unquantized prefix-K/V-slice
+        path: the padding document is a strict suffix, so dropping it from K/V
+        before quantization is identical to masking it out. Query keeps full
+        length; outputs on padding rows are never consumed downstream. Returns
+        None (caller falls back to the unquantized path) when the packed
+        contract does not hold; see _resolve_packed_seq_npu.
+
+        When the layer injected chunking options (``extra["attn_chunking"]``,
+        from --diffusion-attn-q-chunk/--diffusion-attn-head-chunk), a chunk
+        plan is built here — the call site already knows every plan input
+        (seq/heads from the packed shapes, kv_len from the resolved contract)
+        — and handed to the quant wrapper, which executes it against one
+        shared quantization.
         """
         resolved = self._resolve_packed_seq_npu(query, key, extra)
         if resolved is None:
@@ -537,10 +558,35 @@ class FlashAttentionImpl(AttentionImpl):
         _, seq_k = resolved
         used_k = seq_k[0]  # real document length (first cumulative end)
 
+        from vllm_omni.platforms.npu.quant import kv_quant_npu
         from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_rotate_quant_kv_slice
 
-        # The packed contract guarantees [1, T, N, D] == BSND; the quant
-        # wrapper slices K/V on the seq axis itself.
+        plan = None
+        options = extra.get("attn_chunking")
+        if options is not None:
+            from vllm_omni.diffusion.attention.chunking import build_chunk_plan
+
+            # The packed contract guarantees [1, T, N, D] == BSND.
+            num_heads = query.shape[2]
+            plan = build_chunk_plan(
+                seq_len=query.shape[1],
+                num_heads=num_heads,
+                num_kv_heads=key.shape[2],
+                kv_len=used_k,
+                options=options,
+                # Row boundaries must land on the Q block-quant grid so
+                # per-chunk dequant scales are exact slices of the one-shot
+                # full-length quantization.
+                row_align=kv_quant_npu._Q_BLOCK_SIZE,
+            )
+            if options.head_chunk > 0 and plan and plan[0].h1 - plan[0].h0 == num_heads:
+                logger.warning_once(
+                    "Attention head chunking is inactive for this layer/request "
+                    "(requires MHA and kv_len >= --diffusion-attn-head-chunk-min-kv); "
+                    "running with full heads."
+                )
+
+        # The quant wrapper slices K/V on the seq axis itself.
         return fp8_rotate_quant_kv_slice(
             query,
             key,
@@ -548,6 +594,7 @@ class FlashAttentionImpl(AttentionImpl):
             used_k,
             layout="BSND",
             softmax_scale=self.softmax_scale,
+            plan=plan,
         )
 
     def forward_fa_npu(
