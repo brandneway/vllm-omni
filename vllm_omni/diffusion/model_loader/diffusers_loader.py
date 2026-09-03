@@ -608,9 +608,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                         if unsupported_methods:
                             raise ValueError(
                                 "DLO+AllGather supports online quantization only for "
-                                "per-tensor FP8, INT8, and MXFP8 linears; unsupported online "
-                                f"methods: {', '.join(unsupported_methods)}. Please use "
-                                "--dlo-no-use-allgather or disable online quantization."
+                                "per-tensor FP8, INT8, and MXFP8 linears "
+                                "(host-loaded unquantized fallback layers are also allowed); "
+                                f"unsupported online methods: {', '.join(unsupported_methods)}. "
+                                "Please use --dlo-no-use-allgather or disable online quantization."
                             )
                         logger.info(
                             "Validated online methods (per-tensor FP8, INT8, MXFP8) with "
@@ -730,6 +731,11 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         scale, packing, or aliasing layouts (e.g. dual-scale fp4 pairs,
         swizzled or NZ hardware formats) and remain fail-closed until
         validated.
+
+        ``UnquantizedHostLinearMethod`` is also allowed: it backs layers too
+        wide for npu_quant_matmul, loads their weights straight into host
+        memory, and its runtime layout is a plain contiguous bf16 weight —
+        identical to the ordinary unquantized path DLO already shards.
         """
         from vllm.model_executor.layers.quantization.online.fp8 import (
             Fp8PerTensorOnlineLinearMethod,
@@ -738,6 +744,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         from vllm_omni.quantization.int8_config import (
             Int8OnlineLinearMethod,
             NPUInt8OnlineLinearMethod,
+            UnquantizedHostLinearMethod,
         )
 
         try:
@@ -759,6 +766,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             Fp8PerTensorOnlineLinearMethod,
             Int8OnlineLinearMethod,
             NPUInt8OnlineLinearMethod,
+            UnquantizedHostLinearMethod,
             *mxfp8_online_methods,
         )
 
