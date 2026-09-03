@@ -1461,6 +1461,12 @@ class WorkerProc:
     ) -> None:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
+        if os.environ.get("VLLM_OMNI_MEM_HISTORY"):
+            import torch_npu
+            torch.npu.memory._record_memory_history(
+                enabled="all", context="all", stacks="python",
+                max_entries=10_000_000,   # 一个 50 步请求约 141 万条事件,默认上限不够
+            )
 
         shutdown_triggered = False
 

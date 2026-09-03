@@ -9,7 +9,7 @@ model-related operations.
 """
 
 from __future__ import annotations
-
+import os
 import copy
 import gc
 import time
@@ -747,6 +747,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             ):
                 cache_summary(self.pipeline, details=True)
 
+            if os.environ.get("VLLM_OMNI_MEM_HISTORY"):
+                import torch_npu
+                torch.npu.memory._dump_snapshot(f"snap_rank{self.device.index}_req{reqs[0].request_id}.pickle")
         return self._runner_output_from_outputs(reqs, outputs)
 
     def _attach_stepwise_metrics(
