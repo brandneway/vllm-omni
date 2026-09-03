@@ -510,7 +510,19 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     target_device=device, load_format=load_format, custom_pipeline_name=custom_pipeline_name
                 )
             else:
-                model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=False)
+                # The model is headed back to host memory right after online
+                # quantization, so over-wide NPU-unquantizable fallback weights
+                # load straight into host memory instead of round-tripping
+                # through the accelerator (~24 GiB startup peak on MiniMax H3).
+                from vllm_omni.quantization.int8_config import load_unquantizable_fallback_on_cpu
+
+                fallback_ctx = (
+                    load_unquantizable_fallback_on_cpu() if offload_after_quant else contextlib.nullcontext()
+                )
+                with fallback_ctx:
+                    model = self._init_from_load_format(
+                        load_format, target_device, custom_pipeline_name, is_hsdp=False
+                    )
 
                 _dist_offload = getattr(self.od_config, "enable_distributed_layerwise_offload", False)
                 _use_ag = getattr(self.od_config, "dlo_use_allgather", True)
