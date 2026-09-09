@@ -823,7 +823,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             raise RuntimeError("MiniMax H3 encode-only video VAE cannot decode latents")
         with self._decode_tiling_context(latent):
             decoded = self.model.decode_base(self._denormalize_latent(latent))
-        return self._normalize_decoded_frames(self.model.processor.revert_tensor(decoded))
+        return self._normalize_decoded_frames(self._revert_decoded_inplace(decoded))
 
     def _denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
         channels = int(self.config_dict["latent_channels"])
@@ -875,6 +875,33 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # gather instead of decoding rank-locally.
         with self._decode_tiling_context(z):
             decode_h3_chunks(self, z, on_chunk, group=group)
+
+    def _revert_decoded_inplace(self, decoded: torch.Tensor) -> torch.Tensor:
+        """In-place counterpart of the processor's ``revert_tensor``.
+
+        The checkpoint version materializes a denormalized copy, a clamped
+        copy, and a contiguous copy of the whole decoded video -- three
+        pixel-scale tensors resident at the decode peak. Decoding owns the
+        tensor here, so the same op order (torchvision ``Normalize`` is
+        ``(x - mean) / std``, then ``clamp(0, 1)``) runs in place on the
+        original ``(B, C, T, H, W)`` layout, which is bit-identical
+        elementwise to normalizing the ``(b t) c h w`` rearrangement and
+        returns with zero whole-video copies.
+
+        Falls back to ``processor.revert_tensor`` when the checkpoint's
+        denormalization constants are not discoverable.
+        """
+        processor = getattr(self.model, "processor", None)
+        transform_rev = getattr(processor, "transform_rev", None)
+        mean = getattr(transform_rev, "mean", None)
+        std = getattr(transform_rev, "std", None)
+        if mean is None or std is None or len(mean) != 3 or len(std) != 3:
+            return processor.revert_tensor(decoded)
+        if bool(getattr(processor, "use_3d_conv", True)) and decoded.ndim == 4:
+            decoded = decoded.unsqueeze(2)
+        mean_t = torch.as_tensor(mean, dtype=decoded.dtype, device=decoded.device).view(1, 3, 1, 1, 1)
+        std_t = torch.as_tensor(std, dtype=decoded.dtype, device=decoded.device).view(1, 3, 1, 1, 1)
+        return decoded.sub_(mean_t).div_(std_t).clamp_(0.0, 1.0)
 
 
 class MiniMaxH3AudioVAE(nn.Module):
