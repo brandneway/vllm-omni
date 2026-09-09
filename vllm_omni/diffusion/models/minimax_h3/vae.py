@@ -203,6 +203,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             )
         install_temporal_stream_patches(self.remote.model)
         self.model = self.remote.model
+        self._stager = None
         self._encoder_stager = None
         self._decoder_stager = None
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
@@ -222,15 +223,25 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         the checkpoint's ``AutoencoderKLLegacy``: the one cross reference,
         ``tiled_decode``'s ``getattr(self.encoder, "mask_enabled")``, is
         short-circuited by ``self.training`` at inference). No storage is
-        shared across the two groups, so independent staging is exact.
+        shared across the two groups, so independent staging is exact. When
+        the checkpoint's structure is not discoverable, fall back to
+        whole-module staging (the previous single-stager behavior).
         """
-        self._encoder_stager = PinnedModuleStager(
-            [self.model.encoder, self.model.quant_conv],
-            device,
-            pin_memory=True,
-        )
-        self._decoder_stager = PinnedModuleStager(
-            [self.model.post_quant_conv, self.model.decoder],
+        part_names = ("encoder", "quant_conv", "post_quant_conv", "decoder")
+        if all(isinstance(getattr(self.model, name, None), nn.Module) for name in part_names):
+            self._encoder_stager = PinnedModuleStager(
+                [self.model.encoder, self.model.quant_conv],
+                device,
+                pin_memory=True,
+            )
+            self._decoder_stager = PinnedModuleStager(
+                [self.model.post_quant_conv, self.model.decoder],
+                device,
+                pin_memory=True,
+            )
+            return
+        self._stager = PinnedModuleStager(
+            self.remote,
             device,
             pin_memory=True,
         )
@@ -246,6 +257,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         stager = self._part_stager(part)
         if stager is not None:
             stager.load()
+        elif self._stager is not None:
+            self._stager.load()
         else:
             # No staged residency (the component lives on the device already
             # or is fully CPU-resident): fall back to whole-module placement.
@@ -255,6 +268,9 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         stager = self._part_stager(part)
         if stager is not None:
             stager.offload()
+            return
+        if self._stager is not None:
+            self._stager.offload()
             return
         self.remote.to("cpu")
         self._release_component_cache()
@@ -270,12 +286,14 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         if self._encoder_stager is not None:
             self._encoder_stager.load()
             self._decoder_stager.load()
+        elif self._stager is not None:
+            self._stager.load()
         else:
             self.remote.to(self._device_target)
 
     def set_omni_component_cache(self, cache: BoundedAllocatorCache | None) -> None:
         self._omni_component_cache = cache
-        for stager in (self._encoder_stager, self._decoder_stager):
+        for stager in (self._encoder_stager, self._decoder_stager, self._stager):
             if stager is not None:
                 stager.set_cache_retention(cache)
 
@@ -283,6 +301,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         if self._encoder_stager is not None:
             self._encoder_stager.offload()
             self._decoder_stager.offload()
+        elif self._stager is not None:
+            self._stager.offload()
         else:
             self.remote.to("cpu")
             self._release_component_cache()
