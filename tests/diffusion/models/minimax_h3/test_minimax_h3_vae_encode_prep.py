@@ -69,13 +69,19 @@ def _video(num_frames, height=6, width=8, seed=0):
     return rng.integers(0, 256, size=(num_frames, height, width, 3), dtype=np.uint8)
 
 
+def _pad_frames(frames: np.ndarray, pad: int) -> np.ndarray:
+    if not pad:
+        return frames
+    return np.concatenate([frames, np.repeat(frames[-1:], pad, axis=0)])
+
+
 def test_stream_prep_matches_legacy_path_bitwise():
     frames = _video(10)
     out = _vae()._stream_prepare_video_tensor(frames, torch.device("cpu"))
     assert out is not None
     assert out.shape == (3, 12, 6, 8)  # pad = (0 - 10) % 4 == 2
     assert out.dtype == torch.float32
-    assert torch.equal(out, _legacy_reference(frames))
+    assert torch.equal(out, _legacy_reference(_pad_frames(frames, 2)))
 
 
 def test_stream_prep_isolated_first_frame_offset():
@@ -85,7 +91,7 @@ def test_stream_prep_isolated_first_frame_offset():
     out = _vae(model)._stream_prepare_video_tensor(frames, torch.device("cpu"))
     assert out is not None
     assert out.shape[1] == 13
-    assert torch.equal(out, _legacy_reference(frames))
+    assert torch.equal(out, _legacy_reference(_pad_frames(frames, 3)))
 
 
 def test_stream_prep_pads_with_last_frame():
@@ -163,7 +169,9 @@ def _vae_for_encode_video():
         "latents_mean": [0.0] * 4,
         "latents_std": [1.0] * 4,
     }
-    vae._dummy_parameter = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
+    # A plain tensor (not nn.Parameter): nn.Module.__setattr__ refuses
+    # Parameters on instances built via object.__new__.
+    vae._dummy_parameter = torch.zeros(1, dtype=torch.float32)
     vae.parameters = lambda: iter([vae._dummy_parameter])
     return vae
 
