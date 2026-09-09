@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """CPU tests for the split encoder/decoder residency of the MiniMax-H3 VAE.
 
@@ -119,10 +119,55 @@ def test_proxy_does_not_register_the_adapter_as_submodule():
     vae = _vae()
     proxy = vae.encoder_component
     assert proxy._vae is vae
-    assert "encoder_component" not in dict(vae.named_children()) or True
     # The back-reference must not recurse through module traversal.
     assert all(child is not vae for child in proxy.children())
     assert len(list(proxy.parameters())) == 0
+
+
+def test_component_on_device_unwraps_proxy_for_sequential_offload(monkeypatch):
+    """Model-level CPU offload hooks the real video_vae, never the part
+    proxies: _component_on_device must hand the hooked module to the
+    sequential context, or _get_sequential_offload_hook raises on the
+    hook-less proxy on the first encode/decode of every request."""
+    from contextlib import contextmanager
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    vae = _vae()
+    seen: list[nn.Module] = []
+
+    @contextmanager
+    def fake_sequential_offload_component(component):
+        seen.append(component)
+        yield
+
+    monkeypatch.setattr(pipeline_module, "sequential_offload_component", fake_sequential_offload_component)
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline._model_cpu_offload_modules = [vae]
+
+    with pipeline._component_on_device(vae.encoder_component):
+        pass
+    with pipeline._component_on_device(vae.decoder_component):
+        pass
+    # A component without an unwrapping property passes through unchanged.
+    with pipeline._component_on_device(vae):
+        pass
+
+    assert seen == [vae, vae, vae]
+
+
+def test_sequential_offload_target_is_the_hooked_module():
+    from vllm_omni.diffusion.offloader.sequential_backend import _get_sequential_offload_hook
+
+    vae = _vae()
+    proxy = vae.encoder_component
+    # The pre-fix failure mode: the proxy carries no hook registry.
+    with pytest.raises(RuntimeError, match="no sequential offload hook"):
+        _get_sequential_offload_hook(proxy)
+    assert proxy.sequential_offload_target is vae
 
 
 def test_cache_retention_forwarded_to_both_stagers():

@@ -1632,6 +1632,12 @@ class MiniMaxH3Pipeline(
     @contextmanager
     def _component_on_device(self, component: nn.Module):
         if getattr(self, "_model_cpu_offload_modules", None):
+            # Sequential offload hooks whole modules (enable_omni_model_cpu_offload
+            # registers them on the discovered components, e.g. the real
+            # video_vae). Split-residency proxies carry no hook, so unwrap to the
+            # hooked module before entering the context — whole-module movement
+            # has no half-residency benefit anyway.
+            component = getattr(component, "sequential_offload_target", component)
             with sequential_offload_component(component):
                 yield
             return

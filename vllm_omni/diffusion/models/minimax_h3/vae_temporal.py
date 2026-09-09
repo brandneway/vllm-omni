@@ -157,9 +157,15 @@ def _decode_temporal_streaming_uint8(self, z, z_head, z_tail, num_chunks, pad_to
         # quantizer (*255, round, uint8), in place on the part: the blended
         # raw values are consumed before this point, and every write into
         # ``dec`` goes through here, so the final buffer matches the legacy
-        # post-decode chain element for element.
+        # post-decode chain element for element. Denormalization and clamping
+        # run in the decoded dtype exactly like the legacy adapter; the
+        # quantizer then runs in FP32 because the legacy adapter returned
+        # ``frames.float()`` before the pipeline multiplied and rounded —
+        # rounding fp16/bf16 directly flips borderline pixels by one.
         mean_t, std_t = norm
-        part.sub_(mean_t).div_(std_t).clamp_(0.0, 1.0).mul_(255.0).round_()
+        part.sub_(mean_t).div_(std_t).clamp_(0.0, 1.0)
+        part = part.float()
+        part.mul_(255.0).round_()
 
         remaining = int(dec.shape[2]) - write_pos
         copy_frames = min(part_frames, max(0, remaining))

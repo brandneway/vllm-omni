@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """CPU tests for the streaming uint8 preparation in the MiniMax-H3 video VAE.
 
@@ -29,6 +29,10 @@ class _FakeNormalize:
 
 
 class _FakeProcessor:
+    # Read by the stream prep via getattr(..., False); annotation only so
+    # tests can attach it per case.
+    isolated_last_frame: bool
+
     def __init__(self):
         self.transform = _FakeNormalize(IMAGENET_MEAN, IMAGENET_STD)
 

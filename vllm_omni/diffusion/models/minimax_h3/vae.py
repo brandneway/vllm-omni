@@ -171,6 +171,21 @@ class _VideoVAEPartProxy(nn.Module):
     def set_omni_component_cache(self, cache: BoundedAllocatorCache | None) -> None:
         self._vae.set_omni_component_cache(cache)
 
+    @property
+    def sequential_offload_target(self) -> MiniMaxH3VideoVAE:
+        """The module model-level CPU offload actually hooks.
+
+        ``enable_omni_model_cpu_offload`` registers the sequential hook on the
+        real ``video_vae``, and the hook moves the whole module through
+        ``parameters()`` — entering the sequential context through this proxy
+        would find no ``_hook_registry`` and raise, and whole-module movement
+        has no half-residency benefit anyway. ``_component_on_device`` unwraps
+        through this property before entering its sequential-offload branch;
+        the manual per-half staging above stays proxy-driven, where split
+        residency is the whole point.
+        """
+        return self._vae
+
 
 class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     """Adapter around the checkpoint's native parallel-tiled video VAE."""
