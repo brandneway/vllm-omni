@@ -84,14 +84,50 @@ def test_stream_prep_matches_legacy_path_bitwise():
     assert torch.equal(out, _legacy_reference(_pad_frames(frames, 2)))
 
 
-def test_stream_prep_isolated_first_frame_offset():
-    # offset_frame = 1 → pad = (1 - 10) % 4 == 3
+def test_stream_prep_isolated_first_frame_without_last_frame_skips_pad():
+    # Asymmetric checkpoint (isolated first frame, no isolated last frame):
+    # trim-stable lengths are k*clip + 0, which never satisfy the
+    # encode_temporal offset of 1, so the remote re-pads through its own
+    # whole-video cat regardless. Padding here would only upload frames the
+    # remote trim discards, so the legacy frame count is kept.
     model = _FakeCheckpointModel(isolated_first_frame=True)
     frames = _video(10)
     out = _vae(model)._stream_prepare_video_tensor(frames, torch.device("cpu"))
     assert out is not None
+    assert out.shape[1] == 10
+    assert torch.equal(out, _legacy_reference(frames))
+
+
+def test_stream_prep_symmetric_isolated_frames_pad_to_trim_stable():
+    # isolated first + last frames: offset == tail % clip == 1, so padding
+    # to the next trim-stable length makes the remote trim a no-op and keeps
+    # encode_temporal from re-padding: T=10, clip=4, tail=1 → 3*4+1 == 13.
+    model = _FakeCheckpointModel(isolated_first_frame=True)
+    model.processor.isolated_last_frame = True
+    frames = _video(10)
+    out = _vae(model)._stream_prepare_video_tensor(frames, torch.device("cpu"))
+    assert out is not None
     assert out.shape[1] == 13
+    assert out.shape[1] % 4 == 1
     assert torch.equal(out, _legacy_reference(_pad_frames(frames, 3)))
+
+
+def test_stream_prep_uses_processor_align_when_available():
+    calls = []
+
+    class _AlignedProcessor(_FakeProcessor):
+        def align_video_length(self, video_length, mode="pad", granularity="chunk"):
+            calls.append((video_length, mode, granularity))
+            return 5
+
+    model = _FakeCheckpointModel()
+    model.processor = _AlignedProcessor()
+    frames = _video(10)
+    out = _vae(model)._stream_prepare_video_tensor(frames, torch.device("cpu"))
+    assert out is not None
+    assert calls == [(10, "pad", "chunk")]
+    assert out.shape[1] == 15
+    assert torch.equal(out, _legacy_reference(_pad_frames(frames, 5)))
 
 
 def test_stream_prep_pads_with_last_frame():

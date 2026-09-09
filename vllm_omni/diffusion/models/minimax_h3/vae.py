@@ -374,15 +374,33 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             return None
         if mean is None or std is None or len(mean) != 3 or len(std) != 3:
             return None
-        # Mirror klvae.encode_temporal's alignment so the device-side
-        # padding ``torch.cat`` never triggers: pad by replicating the last
-        # frame when the frame count is not ``offset_frame`` modulo
-        # ``clip_length``.
+        # Mirror the checkpoint's temporal alignment so the device-side
+        # ``get_suitable_video_length`` trim is a no-op and the
+        # ``encode_temporal`` padding ``torch.cat`` never triggers. A
+        # trim-stable length is ``k * clip_length + tail`` (tail = frame
+        # overlap plus the isolated last frame); it also satisfies
+        # encode_temporal only when ``tail % clip_length == offset_frame``.
+        # With an asymmetric checkpoint (isolated last frame but no isolated
+        # first frame) no trim-stable length can satisfy encode_temporal, so
+        # the remote re-pads through a whole-video cat regardless and any
+        # host-side pad would be trimmed away before that -- keep the legacy
+        # frame count there instead of uploading dead frames.
         isolated_first_frame = bool(getattr(model, "isolated_first_frame", False))
         frame_pre_padding = int(getattr(model, "frame_pre_padding", 0) or 0)
         offset = 1 if isolated_first_frame and frame_pre_padding == 0 else 0
+        processor = getattr(model, "processor", None)
+        tail = int(getattr(processor, "frame_overlap", 0) or 0)
+        if bool(getattr(processor, "isolated_last_frame", False)):
+            tail += 1
         num_frames = int(frames.shape[0])
-        pad = (offset - num_frames) % clip_length
+        pad = 0
+        if tail % clip_length == offset:
+            align = getattr(processor, "align_video_length", None)
+            if callable(align):
+                pad = max(0, int(align(num_frames, mode="pad", granularity="chunk")))
+            else:
+                chunks = -(-(num_frames - tail) // clip_length)
+                pad = max(max(chunks, 1) * clip_length + tail - num_frames, 0)
         if pad:
             frames = np.concatenate([frames, np.repeat(frames[-1:], pad, axis=0)])
             num_frames += pad
