@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """CPU tests for the temporal VAE forks and the uint8 output transfer.
 
@@ -9,6 +9,8 @@ fork must produce the same video as the legacy fp32-buffer chain
 (revert -> clamp -> *255 -> round -> uint8), and the output transfer must
 match the previous ``.to(uint8, contiguous)`` conversion.
 """
+
+from typing import Any, cast
 
 import pytest
 import torch
@@ -34,6 +36,12 @@ CLIP = 4
 
 class _EncodeModel:
     """Minimal stand-in implementing the checkpoint's encode_temporal."""
+
+    # Attached per test case as capability probes for the install checks;
+    # annotations only, the fork must keep working when they are absent.
+    encode_temporal: Any
+    _decode_temporal_streaming: Any
+    processor: Any
 
     def __init__(self, *, isolated_first=False, isolated_last=False, key_frame=False, frame_drop=0):
         self.clip_length = CLIP
@@ -186,7 +194,7 @@ class _DecodeModel:
         return int(total), int(pad_tokens), int(total - pad_tokens)
 
     def legacy_streaming(self, z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype):
-        """The checkpoint's original: raw fp32 accumulation, quantize later."""
+        """The checkpoint's original: accumulate in the cat dtype, quantize later."""
         total_frames, _, output_frames = self._decode_temporal_output_frame_plan(
             z, z_head, z_tail, num_chunks, pad_tokens
         )
@@ -212,6 +220,8 @@ class _DecodeModel:
             t_end = t_start + self.tokens_chunk_size + self.token_overlap
             clip_z = z[:, :, t_start:t_end]
             clip_dec = self._adaptive_decode(clip_z)
+            if temporal_cat_dtype is not None and clip_dec.dtype != temporal_cat_dtype:
+                clip_dec = clip_dec.to(temporal_cat_dtype)
             for j in range(split_count):
                 chunk = clip_dec[:, :, j * chunk_dec : min(j * chunk_dec + chunk_dec, clip_dec.shape[2])]
                 if j == 0:
@@ -224,23 +234,31 @@ class _DecodeModel:
             if i == num_chunks - 1 and dec_overlap is not None:
                 write_part(dec_overlap)
                 dec_overlap = None
-        # Legacy post-decode chain: revert in place, then the output quantizer.
-        mean = torch.tensor(DENORM_MEAN).view(1, 3, 1, 1, 1)
-        std = torch.tensor(DENORM_STD).view(1, 3, 1, 1, 1)
-        dec.sub_(mean).div_(std).clamp_(0.0, 1.0).mul_(255.0).round_()
+        # Legacy post-decode chain: revert in place in the decoded dtype, then
+        # the adapter's ``frames.float()`` before the pipeline's quantizer.
+        assert dec is not None
+        mean = torch.tensor(DENORM_MEAN, dtype=dec.dtype).view(1, 3, 1, 1, 1)
+        std = torch.tensor(DENORM_STD, dtype=dec.dtype).view(1, 3, 1, 1, 1)
+        dec.sub_(mean).div_(std).clamp_(0.0, 1.0)
+        dec = dec.float()
+        dec.mul_(255.0).round_()
         return dec.to(torch.uint8)
 
 
 @pytest.mark.parametrize("token_drop,frame_overlap", [(0, 0), (1, 1)])
-def test_decode_fork_matches_legacy_chain_bitwise(token_drop, frame_overlap):
+@pytest.mark.parametrize("temporal_cat_dtype", [None, torch.float16, torch.bfloat16])
+def test_decode_fork_matches_legacy_chain_bitwise(token_drop, frame_overlap, temporal_cat_dtype):
+    # The quantizer must see FP32 no matter the cat dtype: the legacy adapter
+    # returned frames.float() before the pipeline multiplied and rounded, so
+    # an fp16/bf16 cat dtype only narrows denormalization, never the rounding.
     torch.manual_seed(0)
     tokens = 2 * 2 + (1 if token_drop else 0)  # num_chunks * tokens_chunk_size
     z = torch.randn(1, 3, tokens, 4, 4)
     legacy = _DecodeModel(token_drop=token_drop, frame_overlap=frame_overlap)
-    expected = legacy.legacy_streaming(z.clone(), None, None, 2, 0, None)
+    expected = legacy.legacy_streaming(z.clone(), None, None, 2, 0, temporal_cat_dtype)
 
     fork = _DecodeModel(token_drop=token_drop, frame_overlap=frame_overlap)
-    out = _decode_temporal_streaming_uint8(fork, z.clone(), None, None, 2, 0, None)
+    out = _decode_temporal_streaming_uint8(fork, z.clone(), None, None, 2, 0, temporal_cat_dtype)
     assert out.dtype == torch.uint8
     assert out.shape == expected.shape
     assert torch.equal(out, expected)
@@ -260,8 +278,10 @@ def test_decode_fork_rejects_empty_plan():
 
 def test_install_binds_both_forks():
     model = _EncodeModel()
-    model.encode_temporal = lambda x: x  # placeholder for the capability check
-    model._decode_temporal_streaming = lambda *a: None
+    # cast(Any, ...) keeps mypy from narrowing the probes to the lambda type,
+    # which has no __func__ for the bound-method assertions below.
+    model.encode_temporal = cast(Any, lambda x: x)  # placeholder for the capability check
+    model._decode_temporal_streaming = cast(Any, lambda *a: None)
     model.processor = _FakeProcessor()
     install_temporal_stream_patches(model)
     assert model.encode_temporal.__func__ is _encode_temporal_tail_pad
@@ -270,8 +290,8 @@ def test_install_binds_both_forks():
 
 def test_install_skips_decode_fork_without_denorm_contract():
     model = _EncodeModel()
-    model.encode_temporal = lambda x: x
-    model._decode_temporal_streaming = lambda *a: None
+    model.encode_temporal = cast(Any, lambda x: x)
+    model._decode_temporal_streaming = cast(Any, lambda *a: None)
     install_temporal_stream_patches(model)  # no processor -> keep original
     assert model.encode_temporal.__func__ is _encode_temporal_tail_pad
     assert not hasattr(model._decode_temporal_streaming, "__func__")
