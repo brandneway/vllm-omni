@@ -136,8 +136,9 @@ class RainFusionAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supported_platforms: tuple[str, ...] = ("npu",)
     # The impl trims [real, pad] packed tensors to the valid prefix with
-    # [:, :used] itself (and never reads attn_mask), so models may run the
-    # padded layout without materializing a padding mask.
+    # [:, :used] itself, so models may run the padded layout without
+    # materializing a padding mask (a forward that carries one anyway falls
+    # back dense in _resolve_plan).
     supports_prefix_kv_slicing: bool = True
 
     @classmethod
