@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -33,6 +35,9 @@ from .packed_tokens import minimax_h3_patchify_video_latent
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 MINIMAX_H3_AUDIO_CHANNELS = 2
+
+# Escape hatch back to the checkpoint's whole-video numpy preparation path.
+_VAE_ENCODE_LEGACY_PREP_ENV = "VLLM_OMNI_VAE_ENCODE_LEGACY_PREP"
 
 
 logger = init_logger(__name__)
@@ -57,6 +62,11 @@ def _minimax_h3_keyframe_encode_context(
         allow_tf32=True,
     ):
         yield
+
+
+def _legacy_encode_prep_enabled() -> bool:
+    value = os.environ.get(_VAE_ENCODE_LEGACY_PREP_ENV, "0")
+    return value.strip().lower() not in ("", "0", "false", "off")
 
 
 def _load_component_config(component_path: str) -> dict[str, Any]:
@@ -330,6 +340,73 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             patch_size=(1, 2, 2),
         ).float()
 
+    def _stream_prepare_video_tensor(
+        self,
+        frames: np.ndarray,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        """Upload a uint8 ``(T, H, W, 3)`` video as one normalized FP32 tensor.
+
+        The checkpoint's numpy path uploads the whole video as FP32, then
+        ``transform_tensor`` materializes a second normalized copy, then
+        ``encode_temporal`` pads through a full-video ``torch.cat``: three
+        resident pixel-scale copies on the device. Here the padding is
+        replicated on the host, a single preallocated ``(3, T', H, W)`` tensor
+        receives clip-by-clip uploads, and the ``÷255 → (x-mean)/std`` chain
+        runs in place on each clip's staging buffer in the same op order as
+        ``convert_numpy_to_tensor`` → ``transform_tensor``, so peak device
+        memory is the output tensor plus one clip instead of three copies.
+
+        Returns ``None`` whenever the checkpoint contract this mirrors (uint8
+        frames, ``clip_length`` alignment, processor ``transform`` constants)
+        is not discoverable; callers fall back to the legacy path.
+        """
+        if frames.dtype != np.uint8 or frames.ndim != 4 or frames.shape[-1] != 3:
+            return None
+        if int(frames.shape[0]) == 0:
+            return None
+        model = self.model
+        clip_length = getattr(model, "clip_length", None)
+        transform = getattr(getattr(model, "processor", None), "transform", None)
+        mean = getattr(transform, "mean", None)
+        std = getattr(transform, "std", None)
+        if not isinstance(clip_length, int) or clip_length <= 0:
+            return None
+        if mean is None or std is None or len(mean) != 3 or len(std) != 3:
+            return None
+        # Mirror klvae.encode_temporal's alignment so the device-side
+        # padding ``torch.cat`` never triggers: pad by replicating the last
+        # frame when the frame count is not ``offset_frame`` modulo
+        # ``clip_length``.
+        isolated_first_frame = bool(getattr(model, "isolated_first_frame", False))
+        frame_pre_padding = int(getattr(model, "frame_pre_padding", 0) or 0)
+        offset = 1 if isolated_first_frame and frame_pre_padding == 0 else 0
+        num_frames = int(frames.shape[0])
+        pad = (offset - num_frames) % clip_length
+        if pad:
+            frames = np.concatenate([frames, np.repeat(frames[-1:], pad, axis=0)])
+            num_frames += pad
+        mean_t = torch.as_tensor(mean, dtype=torch.float32, device=device).view(3, 1, 1, 1)
+        std_t = torch.as_tensor(std, dtype=torch.float32, device=device).view(3, 1, 1, 1)
+        height, width = int(frames.shape[1]), int(frames.shape[2])
+        out = torch.empty(
+            (3, num_frames, height, width),
+            dtype=torch.float32,
+            device=device,
+        )
+        for start in range(0, num_frames, clip_length):
+            end = min(start + clip_length, num_frames)
+            # Frame slices of a C-contiguous (T, H, W, 3) array stay
+            # contiguous, so each clip uploads at uint8 width (4x less host
+            # traffic than the legacy FP32 upload) before the in-place
+            # normalization chain. permute lands on the checkpoint's
+            # (3, T, H, W) layout directly.
+            chunk = torch.from_numpy(frames[start:end]).to(device=device)
+            chunk = chunk.permute(3, 0, 1, 2).to(torch.float32).div_(255.0)
+            chunk = chunk.sub_(mean_t).div_(std_t)
+            out[:, start:end].copy_(chunk)
+        return out
+
     @torch.inference_mode()
     def encode_video(
         self,
@@ -346,6 +423,14 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 for device in devices:
                     with self.device_module.device(device):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
+                prepared = None
+                if isinstance(frames, np.ndarray) and not _legacy_encode_prep_enabled():
+                    prepared = self._stream_prepare_video_tensor(frames, parameter.device)
+                if prepared is not None:
+                    # Tensor inputs already carry the checkpoint's expected
+                    # (3, T, H, W) normalized-FP32 contract, so encode_videos
+                    # skips its own convert/transform/pad whole-video copies.
+                    frames = [prepared]
                 latent = self.model.encode_videos(
                     frames,
                     use_fp16_latent=True,
