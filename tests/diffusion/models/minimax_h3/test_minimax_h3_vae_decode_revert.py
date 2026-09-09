@@ -55,12 +55,12 @@ def _legacy_revert(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.ndim == 4:
         tensor = tensor.unsqueeze(2)
     assert tensor.ndim == 5
-    tensor = tensor.squeeze(0)  # rearrange "b c t h w -> (b t) c h w" at B=1
-    mean = torch.tensor(DENORM_MEAN).view(1, 3, 1, 1)
-    std = torch.tensor(DENORM_STD).view(1, 3, 1, 1)
+    # Normalize runs on the (b t) c h w rearrangement; at B == 1 that is a
+    # view of (B, C, T, H, W), so the per-channel broadcast is equivalent.
+    mean = torch.tensor(DENORM_MEAN).view(1, 3, 1, 1, 1)
+    std = torch.tensor(DENORM_STD).view(1, 3, 1, 1, 1)
     tensor = (tensor - mean) / std
-    tensor = tensor.clamp(0, 1)
-    return tensor.unsqueeze(0)  # rearrange "(b t) c h w -> b c t h w"
+    return tensor.clamp(0, 1)
 
 
 def test_revert_inplace_matches_legacy_bitwise():
