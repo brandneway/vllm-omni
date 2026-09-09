@@ -79,7 +79,9 @@ def test_revert_inplace_mutates_without_extra_copies():
 
 
 def test_revert_inplace_unsqueezes_4d_input():
-    decoded = torch.randn(3, 5, 4, 4)
+    # 4-D decoded tensors follow the (B, C, H, W) image contract: unsqueeze(2)
+    # lands T=1, matching the checkpoint's revert_tensor branch.
+    decoded = torch.randn(1, 3, 6, 8)
     expected = _legacy_revert(decoded.clone())
     out = _vae()._revert_decoded_inplace(decoded.clone())
     assert torch.equal(out, expected)
