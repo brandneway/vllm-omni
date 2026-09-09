@@ -35,6 +35,7 @@ from vllm_omni.diffusion.offloader.module_residency import (
 from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .vae_temporal import install_temporal_stream_patches
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
@@ -274,6 +275,34 @@ class _AudioVAEDeterminismContext(AbstractContextManager):
         return False
 
 
+class _VideoVAEPartProxy(nn.Module):
+    """Residency proxy for one half of the split video VAE.
+
+    The pipeline's ``_component_on_device`` drives whatever object it is
+    given through ``load_to_device``/``offload_to_cpu``. The checkpoint's
+    ViT decoder holds ~9GB of FP32 weights while the CNN encoder holds
+    ~0.7GB, and each is used by exactly one direction, so routing those
+    calls per half keeps the decoder off the device while reference videos
+    encode and the encoder off while latents decode. ``object.__setattr__``
+    keeps the back-reference out of the module registry (registering the
+    adapter as a submodule would recurse through ``parameters()``).
+    """
+
+    def __init__(self, vae: MiniMaxH3VideoVAE, part: str) -> None:
+        super().__init__()
+        object.__setattr__(self, "_vae", vae)
+        object.__setattr__(self, "_part", part)
+
+    def load_to_device(self) -> None:
+        self._vae._load_part_to_device(self._part)
+
+    def offload_to_cpu(self) -> None:
+        self._vae._offload_part_to_cpu(self._part)
+
+    def set_omni_component_cache(self, cache: BoundedAllocatorCache | None) -> None:
+        self._vae.set_omni_component_cache(cache)
+
+
 class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     """Adapter around the checkpoint's native parallel-tiled video VAE."""
 
@@ -313,14 +342,14 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 decoder,
                 device=device,
             )
-        self._stager = None
-        if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
-            self._stager = PinnedModuleStager(
-                self.remote,
-                device,
-                pin_memory=True,
-            )
+        install_temporal_stream_patches(self.remote.model)
         self.model = self.remote.model
+        self._encoder_stager = None
+        self._decoder_stager = None
+        if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
+            self._build_residency_stagers(device)
+        self.encoder_component = _VideoVAEPartProxy(self, "encoder")
+        self.decoder_component = _VideoVAEPartProxy(self, "decoder")
         self.use_tiling = True
         self.use_slicing = False
         self.parallel_size = 1
@@ -331,27 +360,78 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         if self._tile_gather_reuse_enabled():
             self._install_persistent_tile_gather()
 
+    def _build_residency_stagers(self, device: torch.device) -> None:
+        """Stage the encode and decode halves of the remote separately.
+
+        The encode path touches only ``encoder`` + ``quant_conv`` and the
+        decode path only ``post_quant_conv`` + ``decoder`` (verified against
+        the checkpoint's ``AutoencoderKLLegacy``: the one cross reference,
+        ``tiled_decode``'s ``getattr(self.encoder, "mask_enabled")``, is
+        short-circuited by ``self.training`` at inference). No storage is
+        shared across the two groups, so independent staging is exact.
+        """
+        self._encoder_stager = PinnedModuleStager(
+            [self.model.encoder, self.model.quant_conv],
+            device,
+            pin_memory=True,
+        )
+        self._decoder_stager = PinnedModuleStager(
+            [self.model.post_quant_conv, self.model.decoder],
+            device,
+            pin_memory=True,
+        )
+
+    def _part_stager(self, part: str) -> PinnedModuleStager | None:
+        if part == "encoder":
+            return self._encoder_stager
+        if part == "decoder":
+            return self._decoder_stager
+        raise ValueError(f"unknown video VAE part {part!r}")
+
+    def _load_part_to_device(self, part: str) -> None:
+        stager = self._part_stager(part)
+        if stager is not None:
+            stager.load()
+        else:
+            # No staged residency (the component lives on the device already
+            # or is fully CPU-resident): fall back to whole-module placement.
+            self.remote.to(self._device_target)
+
+    def _offload_part_to_cpu(self, part: str) -> None:
+        stager = self._part_stager(part)
+        if stager is not None:
+            stager.offload()
+            return
+        self.remote.to("cpu")
+        self._release_component_cache()
+
+    def _release_component_cache(self) -> None:
+        cache = getattr(self, "_omni_component_cache", None)
+        if cache is None:
+            torch.accelerator.empty_cache()
+        else:
+            cache.release_if_needed()
+
     def load_to_device(self) -> None:
-        if self._stager is not None:
-            self._stager.load()
+        if self._encoder_stager is not None:
+            self._encoder_stager.load()
+            self._decoder_stager.load()
         else:
             self.remote.to(self._device_target)
 
     def set_omni_component_cache(self, cache: BoundedAllocatorCache | None) -> None:
         self._omni_component_cache = cache
-        if self._stager is not None:
-            self._stager.set_cache_retention(cache)
+        for stager in (self._encoder_stager, self._decoder_stager):
+            if stager is not None:
+                stager.set_cache_retention(cache)
 
     def offload_to_cpu(self) -> None:
-        if self._stager is not None:
-            self._stager.offload()
+        if self._encoder_stager is not None:
+            self._encoder_stager.offload()
+            self._decoder_stager.offload()
         else:
             self.remote.to("cpu")
-            cache = getattr(self, "_omni_component_cache", None)
-            if cache is None:
-                torch.accelerator.empty_cache()
-            else:
-                cache.release_if_needed()
+            self._release_component_cache()
 
     def set_parallel_size(
         self,
@@ -841,6 +921,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             raise RuntimeError("MiniMax H3 encode-only video VAE cannot decode latents")
         with self._decode_tiling_context(latent):
             decoded = self.model.decode_base(self._denormalize_latent(latent))
+        if decoded.dtype == torch.uint8:
+            # The streaming uint8 write-back already ran the revert and the
+            # output quantizer inside write_part; nothing remains but the
+            # shape contract.
+            return self._normalize_decoded_frames(decoded)
         return self._normalize_decoded_frames(self._revert_decoded_inplace(decoded))
 
     def _denormalize_latent(self, latent: torch.Tensor) -> torch.Tensor:
@@ -858,7 +943,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             frames = frames.unsqueeze(0).transpose(1, 2)
         if frames.ndim != 5:
             raise ValueError(f"unexpected decoded video shape {tuple(frames.shape)}")
-        return frames.float()
+        return frames if frames.dtype == torch.uint8 else frames.float()
 
     # Chunks are reverted through the checkpoint's processor, which
     # denormalizes and clamps into the unit interval.
