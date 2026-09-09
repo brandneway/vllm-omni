@@ -389,12 +389,20 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
 
 def _prepare_minimax_h3_video_output(video: torch.Tensor) -> torch.Tensor:
     """Quantize decoded frames in place before worker-to-engine transfer."""
-    video = video.detach().float()
+    video = video.detach()
+    if video.dtype == torch.uint8:
+        # Streaming decode already quantized and clamped; only the transfer
+        # layout remains.
+        return video.permute(0, 2, 3, 4, 1).contiguous()
+    video = video.float()
     video.clamp_(0, 1).mul_(255).round_()
-    return video.permute(0, 2, 3, 4, 1).to(
-        dtype=torch.uint8,
-        memory_format=torch.contiguous_format,
-    )
+    permuted = video.permute(0, 2, 3, 4, 1)
+    out = torch.empty(permuted.shape, dtype=torch.uint8, device=video.device)
+    # copy_ fuses the layout change and the cast into one kernel;
+    # ``.to(dtype=uint8, memory_format=contiguous_format)`` materializes a
+    # contiguous FP32 intermediate first (~4.2GB for a 15s clip).
+    out.copy_(permuted)
+    return out
 
 
 def _register_dlo_component_cache(cache: BoundedAllocatorCache, *components: Any) -> None:
@@ -1670,8 +1678,12 @@ class MiniMaxH3Pipeline(
         _, rank, _ = _dit_rank_world()
         # Keep image and video references in one residency window when both
         # appear in a request; otherwise the video branch would reload the VAE.
+        # Encoding touches only the CNN encoder half, so the 9GB ViT decoder
+        # stays off the device for the whole window.
         needs_video_vae = video_count > 0 or (rank == 0 and bool(images))
-        video_vae_context = self._component_on_device(self.video_vae) if needs_video_vae else nullcontext()
+        video_vae_context = (
+            self._component_on_device(self.video_vae.encoder_component) if needs_video_vae else nullcontext()
+        )
         with video_vae_context:
             if images:
                 image_rows = None
@@ -2178,9 +2190,10 @@ class MiniMaxH3Pipeline(
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Denoise just ended: its freed activation pages must not stay mapped
-        # through the VAE decode peak.
+        # through the VAE decode peak. Decoding needs only the ViT decoder
+        # half of the VAE, so the CNN encoder stays off the device.
         self._release_stage_cache()
-        with self._component_on_device(self.video_vae):
+        with self._component_on_device(self.video_vae.decoder_component):
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
                 dtype=torch.float16,
