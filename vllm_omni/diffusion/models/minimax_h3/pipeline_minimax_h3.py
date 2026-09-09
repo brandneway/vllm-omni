@@ -1692,6 +1692,10 @@ class MiniMaxH3Pipeline(
                 )
                 rows.append(video_rows)
                 shapes.extend(video_shapes)
+        # The latents are extracted; the encode's input/staging pages are idle
+        # and must not stay mapped through the denoise and decode peaks.
+        if needs_video_vae:
+            self._release_stage_cache()
         return (torch.cat(rows) if rows else None), shapes
 
     def _encode_audio_conditions_resident(
@@ -2145,6 +2149,26 @@ class MiniMaxH3Pipeline(
             audio_t=audio_t,
         )
 
+    def _release_stage_cache(self) -> None:
+        """Return idle allocator pages to the device at stage boundaries.
+
+        The bounded component cache releases only past its idle-cache bound
+        (>25% of device capacity), which on large devices lets a finished
+        stage's freed activations -- the DiT's denoise buffers, an encode
+        input, a decoded frame tensor -- stay physically mapped across the
+        next stage's peak. Forcing the release at a boundary is exact (only
+        free pages are returned; live tensors are untouched) and costs one
+        remap per later allocation.
+        """
+        cache = getattr(self, "_dlo_component_cache", None)
+        if cache is not None:
+            try:
+                cache.release_if_needed(force=True)
+            except BaseException:
+                logger.exception("Failed to release retained allocator cache at stage boundary")
+            return
+        current_omni_platform.empty_cache()
+
     def decode(
         self,
         video_latent: torch.Tensor,
@@ -2153,6 +2177,9 @@ class MiniMaxH3Pipeline(
         height: int,
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Denoise just ended: its freed activation pages must not stay mapped
+        # through the VAE decode peak.
+        self._release_stage_cache()
         with self._component_on_device(self.video_vae):
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
@@ -2530,6 +2557,11 @@ class MiniMaxH3Pipeline(
                 width=context["width"],
             )
             videos.append(_prepare_minimax_h3_video_output(video))
+            # The FP32 decoded frames are quantized into the appended uint8
+            # tensor; drop the reference and return the idle pages instead of
+            # holding them through the next output's denoise/decode.
+            del video
+            self._release_stage_cache()
             audios.append(audio)
         video = videos[0] if len(videos) == 1 else torch.cat(videos, dim=0)
         audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
@@ -2835,6 +2867,7 @@ class MiniMaxH3Pipeline(
             width=shape["width"],
         )
         video = _prepare_minimax_h3_video_output(video)
+        self._release_stage_cache()
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
