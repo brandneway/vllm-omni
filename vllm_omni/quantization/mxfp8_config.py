@@ -217,11 +217,11 @@ class _LazyWeightMixin:
             param = layer.weight
             counter = CopyNumelCounter()
             with counter:
-                res = weight_loader(param, loaded_weight, *args, **kwargs)
+                res = weight_loader(param, loaded_weight, *args, **kwargs)  # type: ignore[misc]
             layer._loaded_numel += counter.copied_numel
 
             if layer._loaded_numel == layer.weight.numel():
-                self.process_weights_after_loading(layer)
+                self.process_weights_after_loading(layer)  # type: ignore[attr-defined]
                 layer._already_called_process_weights_after_loading = True
 
                 # This layer's weight is final, so nothing needs it on the
