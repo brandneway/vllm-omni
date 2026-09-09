@@ -38,9 +38,11 @@ class _FakeRemote(nn.Module):
 
 def _vae() -> MiniMaxH3VideoVAE:
     vae = object.__new__(MiniMaxH3VideoVAE)
+    nn.Module.__init__(vae)  # bare instance: enable Module attribute assignment
     vae._device_target = torch.device("cpu")
     vae.remote = _FakeRemote()
     vae.model = vae.remote.model
+    vae._stager = None
     vae._encoder_stager = None
     vae._decoder_stager = None
     vae._build_residency_stagers(torch.device("cpu"))
@@ -57,15 +59,16 @@ def test_split_stagers_snapshot_disjoint_halves():
     vae = _vae()
     enc_master = _ptr(vae.model.encoder.weight)
     dec_master = _ptr(vae.model.decoder.weight)
+    pqc_master = _ptr(vae.model.post_quant_conv.weight)
     assert enc_master != dec_master
 
     vae._load_part_to_device("encoder")
     # The encoder half is rebound to freshly allocated staging storage...
     assert _ptr(vae.model.encoder.weight) != enc_master
     assert _ptr(vae.model.quant_conv.weight) != enc_master
-    # ...while the decode half stays on its CPU master.
+    # ...while every decode-half tensor stays on its own CPU master.
     assert _ptr(vae.model.decoder.weight) == dec_master
-    assert _ptr(vae.model.post_quant_conv.weight) == dec_master
+    assert _ptr(vae.model.post_quant_conv.weight) == pqc_master
 
     vae._offload_part_to_cpu("encoder")
     assert _ptr(vae.model.encoder.weight) == enc_master
@@ -134,3 +137,29 @@ def test_unknown_part_raises():
     vae = _vae()
     with pytest.raises(ValueError, match="unknown video VAE part"):
         vae._part_stager("middle")
+
+
+def test_missing_checkpoint_structure_falls_back_to_whole_stager():
+    vae = object.__new__(MiniMaxH3VideoVAE)
+    nn.Module.__init__(vae)
+    vae._device_target = torch.device("cpu")
+
+    class BareRemote(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Linear(4, 4)  # no encoder/decoder submodules
+
+    vae.remote = BareRemote()
+    vae.model = vae.remote.model
+    vae._stager = None
+    vae._encoder_stager = None
+    vae._decoder_stager = None
+    vae._build_residency_stagers(torch.device("cpu"))
+    assert vae._stager is not None
+    assert vae._encoder_stager is None
+    assert vae._decoder_stager is None
+    # Part loads fall back to the whole-module stager.
+    vae._load_part_to_device("decoder")
+    assert vae._stager.loaded
+    vae._offload_part_to_cpu("decoder")
+    assert not vae._stager.loaded
