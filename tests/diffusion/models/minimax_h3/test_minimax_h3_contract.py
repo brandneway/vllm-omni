@@ -959,6 +959,56 @@ def test_packed_attention_keeps_padding_mask_for_other_backends():
     )
 
 
+def test_packed_attention_never_builds_padding_mask_under_usp_executor():
+    """With a USP executor, padding is excluded by KV slicing, never by a mask."""
+    from unittest.mock import Mock
+
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3Attention,
+    )
+
+    class FakeBackend:
+        # Deliberately advertises no mask-free capability: the executor's KV
+        # slicing must win over whatever the configured backend declares.
+        supports_prefix_kv_slicing = False
+
+        @classmethod
+        def supports_packed_mask_free(cls) -> bool:
+            return False
+
+    class FakeAttention(torch.nn.Module):
+        attn_backend = FakeBackend
+
+        def __init__(self):
+            super().__init__()
+            self.metadata = None
+            self._usp_executor = Mock()
+
+        def forward(self, query, key, value, metadata):
+            self.metadata = metadata
+            return query
+
+    attention = object.__new__(MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.attention = FakeAttention()
+    q = torch.randn(8, 2, 4)
+
+    attention._run_packed_attention(
+        q,
+        q,
+        q,
+        cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+        max_seqlen=5,
+        packed_total=8,
+    )
+
+    metadata = attention.attention.metadata
+    assert metadata is not None
+    assert metadata.attn_mask is None
+    assert metadata.extra["valid_kv_length"] == 5
+    assert metadata.extra["num_requests"] == 1
+
+
 def _fake_packed_attention(
     backend_name: str,
     *,

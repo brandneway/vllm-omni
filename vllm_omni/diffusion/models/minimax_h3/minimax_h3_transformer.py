@@ -543,7 +543,11 @@ class MiniMaxH3Attention(nn.Module):
             no_mask = not use_ring and (
                 self.attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding
             )
-            if used < packed_total and not no_mask:
+            # The USP executor owns the SP collectives and excludes padding by
+            # KV slicing (valid_kv_length -> kv_used_len) inside MindIE-SD, so
+            # the padding mask must never be materialized for it — independent
+            # of what the configured backend advertises.
+            if used < packed_total and not no_mask and not usp_active:
                 attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
