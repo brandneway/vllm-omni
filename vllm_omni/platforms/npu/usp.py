@@ -221,6 +221,14 @@ class AscendUSPExecutor:
             scatter_dim=scatter_dim,
             gather_dim=gather_dim,
         ):
+            # With a hybrid topology (ulysses x ring) the native fallback cannot
+            # run packed varlen layouts — surface the decline instead of dying
+            # later inside a native collective on a length mismatch.
+            logger.warning_once(
+                "Ascend USP executor declined this attention call (backend=%s); "
+                "falling back to the native sequence-parallel path.",
+                backend_name,
+            )
             return None
 
         module = self._load_usp_module()
