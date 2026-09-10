@@ -371,6 +371,41 @@ def test_resolve_usp_sparse_plan_multi_span_raises():
         make_impl().resolve_usp_sparse_plan(AttentionMetadata(extra={"max_seqlen_q": 12000}, video_layout=layout))
 
 
+def test_resolve_usp_sparse_plan_single_target_span_maps_to_single_span():
+    # H3 publishes a plain t2va video through the Ref2VA span contract as one
+    # target span; the USP path must read it as the legacy [prefix | video]
+    # geometry instead of rejecting it as Ref2VA.
+    video_rows = ALIGNED_GRID[0] * ALIGNED_GRID[1] * ALIGNED_GRID[2]
+    layout = VideoTokenLayout(
+        used_len=PREFIX_ROWS + video_rows,
+        video_spans=(VideoTokenSpan(start=PREFIX_ROWS, latent_grid=ALIGNED_GRID, role="target"),),
+    )
+    metadata = AttentionMetadata(extra={"max_seqlen_q": PREFIX_ROWS + video_rows}, video_layout=layout)
+
+    plan = make_impl(sparsity=0.8, precision="mix").resolve_usp_sparse_plan(metadata)
+
+    assert plan == {
+        "sparse": "rf_v3",
+        "sparsity": 0.8,
+        "sparse_precision": "mix",
+        "txt_len_kv": PREFIX_ROWS,
+        "latent_shape_kv": list(ALIGNED_GRID),
+        "kv_used_len": PREFIX_ROWS + video_rows,
+    }
+
+
+def test_resolve_usp_sparse_plan_single_span_not_tail_raises():
+    # A lone span that does not tail the packed document has rows the legacy
+    # [prefix | video] geometry cannot describe; that must be a loud error, not
+    # a silent dense fallback (the native ring fallback is unusable here).
+    layout = VideoTokenLayout(
+        used_len=12000,
+        video_spans=(VideoTokenSpan(start=128, latent_grid=(4, 16, 64), role="target"),),
+    )
+    with pytest.raises(ValueError, match="document tail"):
+        make_impl().resolve_usp_sparse_plan(AttentionMetadata(extra={"max_seqlen_q": 12000}, video_layout=layout))
+
+
 def test_resolve_usp_sparse_plan_invalid_multi_span_stays_dense():
     # Layouts that never produce a plan (dense on the native path too) must not
     # raise: the USP executor runs them through the dense path.

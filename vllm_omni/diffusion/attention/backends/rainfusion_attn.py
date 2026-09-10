@@ -282,19 +282,36 @@ class RainFusionAttentionImpl(AttentionImpl):
         if plan is None:
             return None
         if plan.video_spans:
-            raise ValueError(
-                "RAINFUSION_ATTN over the USP executor does not support Ref2VA multi-span video "
-                "layouts in v1 (heterogeneous Q/KV geometry is single-span only). Serve Ref2VA with "
-                "enable_usp=False."
-            )
-        if plan.prefix_len is None or plan.latent_shape is None:
-            raise ValueError("USP sparse plan requires a single-span layout with prefix_len and latent_shape.")
+            # H3 publishes even a plain t2va video through the Ref2VA span
+            # contract, as one target span. A single target span that tails the
+            # packed document is exactly the legacy [prefix | video] geometry,
+            # which the USP sparse path expresses directly.
+            if len(plan.video_spans) != 1:
+                raise ValueError(
+                    "RAINFUSION_ATTN over the USP executor does not support Ref2VA multi-span video "
+                    "layouts in v1 (heterogeneous Q/KV geometry is single-span only). Serve Ref2VA with "
+                    "enable_usp=False."
+                )
+            span = plan.video_spans[0]
+            prefix_len = int(span["start"])
+            latent_shape = [int(dim) for dim in span["latent_shape"]]
+            if prefix_len + math.prod(latent_shape) != plan.used_len:
+                raise ValueError(
+                    "RAINFUSION_ATTN over the USP executor requires the target video span to be the "
+                    f"packed document tail: start={prefix_len} grid={latent_shape} does not fill "
+                    f"used_len={plan.used_len}. Serve this layout with enable_usp=False."
+                )
+        else:
+            if plan.prefix_len is None or plan.latent_shape is None:
+                raise ValueError("USP sparse plan requires a single-span layout with prefix_len and latent_shape.")
+            prefix_len = plan.prefix_len
+            latent_shape = list(plan.latent_shape)
         return {
             "sparse": "rf_v3",
             "sparsity": self.rainfusion.sparsity,
             "sparse_precision": self.rainfusion.precision,
-            "txt_len_kv": plan.prefix_len,
-            "latent_shape_kv": list(plan.latent_shape),
+            "txt_len_kv": prefix_len,
+            "latent_shape_kv": latent_shape,
             "kv_used_len": plan.used_len,
         }
 

@@ -563,6 +563,11 @@ class MiniMaxH3Attention(nn.Module):
                 "max_seqlen_q": max_seqlen,
                 "max_seqlen_k": max_seqlen,
                 "valid_kv_length": used,
+                # Host-side request count for the packed forward. Single-request
+                # packing is [0, used, packed_total] (document + padding tail),
+                # so cu_seqlens length alone cannot tell it from a multi-request
+                # batch; consumers that are single-request-only gate on this.
+                "num_requests": num_requests,
                 # Opt the NPU flash backend into the packed varlen path so the
                 # quadratic full_qk mask is never materialized. Ring attention
                 # is excluded: it keeps the aligned padding rows for its

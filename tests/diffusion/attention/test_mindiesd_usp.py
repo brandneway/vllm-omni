@@ -319,11 +319,14 @@ def _sparse_plan():
 def _h3_metadata():
     return AttentionMetadata(
         extra={
-            "cu_seqlens_q": torch.zeros(2, dtype=torch.int32),
-            "cu_seqlens_k": torch.zeros(2, dtype=torch.int32),
+            # Single-request H3 packing is [0, used, packed_total]: one real
+            # document plus a padding-tail document.
+            "cu_seqlens_q": torch.tensor([0, _USED, _USED + 100], dtype=torch.int32),
+            "cu_seqlens_k": torch.tensor([0, _USED, _USED + 100], dtype=torch.int32),
             "max_seqlen_q": _USED,
             "max_seqlen_k": _USED,
             "valid_kv_length": _USED,
+            "num_requests": 1,
             "npu_attn_varlen": True,
         }
     )
@@ -423,10 +426,30 @@ def test_sparse_plan_multi_request_packing_raises(monkeypatch):
     usp_attention = Mock(return_value=torch.zeros(1, _LOCAL_ROWS, 4, 8))
     monkeypatch.setattr(executor, "_load_usp_module", lambda: _usp_module(usp_attention))
 
-    metadata = AttentionMetadata(extra={"cu_seqlens_q": torch.zeros(3, dtype=torch.int32), "valid_kv_length": _USED})
+    metadata = AttentionMetadata(
+        extra={
+            "cu_seqlens_q": torch.tensor([0, 1000, 2000], dtype=torch.int32),
+            "valid_kv_length": 2000,
+            "num_requests": 2,
+        }
+    )
     with pytest.raises(ValueError, match="single-request"):
         _try(executor, sparse_plan=_sparse_plan(), metadata=metadata)
     usp_attention.assert_not_called()
+
+
+def test_single_request_three_entry_cu_seqlens_is_not_multi_request(monkeypatch):
+    # Regression: H3 single-request packing carries a padding-tail document, so
+    # cu_seqlens has 3 entries. The multi-request gate must read num_requests,
+    # not the cu_seqlens length.
+    executor = _executor(ulysses_degree=4, ring_degree=2)
+    usp_attention = Mock(return_value=torch.zeros(1, _LOCAL_ROWS, 4, 8))
+    monkeypatch.setattr(executor, "_load_usp_module", lambda: _usp_module(usp_attention))
+
+    out = _try(executor, metadata=_h3_metadata())
+
+    assert out is usp_attention.return_value
+    assert usp_attention.call_args.kwargs["kv_used_len"] == _USED
 
 
 def test_kv_used_len_falls_back_to_max_seqlen_q(monkeypatch):
