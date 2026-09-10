@@ -223,7 +223,7 @@ class RainFusionAttentionImpl(AttentionImpl):
         config = get_current_diffusion_config_or_none()
         parallel_config = getattr(config, "parallel_config", None)
         ring_degree = getattr(parallel_config, "ring_degree", 1)
-        if ring_degree > 1:
+        if ring_degree > 1 and not getattr(parallel_config, "enable_usp", False):
             # Ring gives each rank a slice of the sequence, so block selection
             # would score only local keys and the layer bypasses the backend
             # entirely (see Attention._run_ring_attention).
@@ -232,6 +232,9 @@ class RainFusionAttentionImpl(AttentionImpl):
                 f"(ring_degree={ring_degree}): rf_v2 needs the whole key sequence to rank "
                 "blocks. Use Ulysses SP (ring_degree=1) instead."
             )
+        # With enable_usp=True the ring group is used as the USP executor's
+        # KV-AllGather group: every rank materializes the whole key sequence
+        # before the sparse kernel, so the whole-key requirement still holds.
 
     def forward_cuda(
         self,
@@ -263,6 +266,37 @@ class RainFusionAttentionImpl(AttentionImpl):
         if plan is None:
             return self.dense_fallback.forward_npu(query, key, value, attn_metadata)
         return self._forward_sparse_npu(query, key, value, plan)
+
+    def resolve_usp_sparse_plan(self, attn_metadata: AttentionMetadata | None) -> dict[str, Any] | None:
+        """Translate the per-forward RainFusion plan into explicit MindIE USP sparse kwargs.
+
+        Used by the platform USP executor (enable_usp), which owns the SP
+        collectives and invokes ``mindiesd.layers.usp.usp_attention`` with the
+        local Q shard against the KV-AllGathered full sequence. Returns None when
+        this forward stays dense (same eligibility as the native path); the
+        executor then runs the dense USP path. Raises for sparse-eligible
+        layouts the USP path cannot express yet, because the native fallback
+        (true ring attention) is not usable in this configuration.
+        """
+        plan = self._resolve_plan(attn_metadata)
+        if plan is None:
+            return None
+        if plan.video_spans:
+            raise ValueError(
+                "RAINFUSION_ATTN over the USP executor does not support Ref2VA multi-span video "
+                "layouts in v1 (heterogeneous Q/KV geometry is single-span only). Serve Ref2VA with "
+                "enable_usp=False."
+            )
+        if plan.prefix_len is None or plan.latent_shape is None:
+            raise ValueError("USP sparse plan requires a single-span layout with prefix_len and latent_shape.")
+        return {
+            "sparse": "rf_v3",
+            "sparsity": self.rainfusion.sparsity,
+            "sparse_precision": self.rainfusion.precision,
+            "txt_len_kv": plan.prefix_len,
+            "latent_shape_kv": list(plan.latent_shape),
+            "kv_used_len": plan.used_len,
+        }
 
     def _resolve_plan(self, attn_metadata: AttentionMetadata | None) -> RainFusionPlan | None:
         """Return the rf_v2 geometry, or None when this forward must stay dense."""

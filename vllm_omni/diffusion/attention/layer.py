@@ -425,6 +425,12 @@ class Attention(nn.Module):
         # one and only one implementation owns the collectives for this forward.
         if self._usp_executor is not None and strategy is not self._no_parallel_strategy and not use_paged_attention:
             usp_metadata = self._with_kv_cache_dtype(attn_metadata)
+            # Backends with per-forward sparsity plans (e.g. RAINFUSION_ATTN)
+            # translate their own metadata into explicit executor kwargs. The
+            # resolver raises for layouts the executor cannot express, because
+            # the native fallback is not usable for those layouts either.
+            plan_resolver = getattr(self.attention, "resolve_usp_sparse_plan", None)
+            sparse_plan = plan_resolver(usp_metadata) if plan_resolver is not None else None
             usp_output = self._usp_executor.try_forward(
                 query,
                 key,
@@ -435,6 +441,7 @@ class Attention(nn.Module):
                 softmax_scale=self.softmax_scale,
                 scatter_dim=self.scatter_idx,
                 gather_dim=self.gather_idx,
+                sparse_plan=sparse_plan,
             )
             if usp_output is not None:
                 return usp_output

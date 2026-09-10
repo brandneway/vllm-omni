@@ -26,6 +26,7 @@ from vllm_omni.diffusion.attention.backends.rainfusion_attn import (
     RainFusionAttentionImpl,
     RainFusionPlan,
 )
+from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.npu]
@@ -334,3 +335,65 @@ def test_precision_non_bf16_passes_gate_when_supported():
             assert out is None
     finally:
         sys.modules.pop("mindiesd", None)
+
+
+def test_resolve_usp_sparse_plan_single_span():
+    impl = make_impl(sparsity=0.8, precision="mix")
+    plan = impl.resolve_usp_sparse_plan(make_metadata(ALIGNED_GRID))
+
+    assert plan == {
+        "sparse": "rf_v3",
+        "sparsity": 0.8,
+        "sparse_precision": "mix",
+        "txt_len_kv": PREFIX_ROWS,
+        "latent_shape_kv": list(ALIGNED_GRID),
+        "kv_used_len": PREFIX_ROWS + 59520,
+    }
+
+
+def test_resolve_usp_sparse_plan_dense_forwards_return_none():
+    # sparsity=0 -> RainFusion disabled -> no plan.
+    assert make_impl(sparsity=0.0).resolve_usp_sparse_plan(make_metadata(ALIGNED_GRID)) is None
+    # Sparse-capable impl but a forward without a video layout stays dense.
+    assert make_impl().resolve_usp_sparse_plan(AttentionMetadata()) is None
+    assert make_impl().resolve_usp_sparse_plan(None) is None
+
+
+def test_resolve_usp_sparse_plan_multi_span_raises():
+    layout = VideoTokenLayout(
+        used_len=12000,
+        video_spans=(
+            VideoTokenSpan(start=128, latent_grid=(4, 16, 64), role="reference"),
+            VideoTokenSpan(start=5000, latent_grid=(4, 16, 64), role="target"),
+        ),
+    )
+    with pytest.raises(ValueError, match="multi-span"):
+        make_impl().resolve_usp_sparse_plan(AttentionMetadata(extra={"max_seqlen_q": 12000}, video_layout=layout))
+
+
+def test_resolve_usp_sparse_plan_invalid_multi_span_stays_dense():
+    # Layouts that never produce a plan (dense on the native path too) must not
+    # raise: the USP executor runs them through the dense path.
+    layout = VideoTokenLayout(
+        used_len=12000,
+        video_spans=(
+            VideoTokenSpan(start=128, latent_grid=(4, 16, 64), role="reference"),
+            VideoTokenSpan(start=4000, latent_grid=(4, 16, 64), role="target"),
+        ),
+    )
+    assert (
+        make_impl().resolve_usp_sparse_plan(AttentionMetadata(extra={"max_seqlen_q": 12000}, video_layout=layout))
+        is None
+    )
+
+
+def test_ring_gate_rejects_ring_without_usp():
+    od_config = types.SimpleNamespace(parallel_config=types.SimpleNamespace(ring_degree=2, enable_usp=False))
+    with set_current_diffusion_config(od_config), pytest.raises(ValueError, match="not compatible with ring"):
+        make_impl()
+
+
+def test_ring_gate_allows_ring_as_usp_kv_gather():
+    od_config = types.SimpleNamespace(parallel_config=types.SimpleNamespace(ring_degree=2, enable_usp=True))
+    with set_current_diffusion_config(od_config):
+        make_impl()  # ring group is the KV-AllGather group under enable_usp

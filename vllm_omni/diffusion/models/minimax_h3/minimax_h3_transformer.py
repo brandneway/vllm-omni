@@ -508,6 +508,11 @@ class MiniMaxH3Attention(nn.Module):
             )
         attn_mask = None
         mask_free_packed_padding = False
+        # A USP executor owns the SP collectives before any ring dispatch and
+        # consumes the packed metadata without a mask (via kv_used_len), so
+        # when it is present the ring-specific mask behavior does not apply.
+        usp_active = getattr(self.attention, "_usp_executor", None) is not None
+        use_ring = getattr(self.attention, "use_ring", False) and not usp_active
         if num_requests > 1:
             # A step-mode batch packs one document per request, so its valid
             # rows are block-diagonal rather than a prefix: neither a KV prefix
@@ -534,7 +539,6 @@ class MiniMaxH3Attention(nn.Module):
             # supports_packed_mask_free: backend consumes the packed metadata
             # without ever reading attn_mask (CUDA packed varlen, NPU
             # npu_attn_varlen opt-in with its own fallback rebuild).
-            use_ring = getattr(self.attention, "use_ring", False)
             mask_free_packed_padding = not use_ring and self.attention.attn_backend.supports_packed_mask_free()
             no_mask = not use_ring and (
                 self.attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding
@@ -563,7 +567,7 @@ class MiniMaxH3Attention(nn.Module):
                 # quadratic full_qk mask is never materialized. Ring attention
                 # is excluded: it keeps the aligned padding rows for its
                 # fixed-size P2P buffers and still needs the mask.
-                "npu_attn_varlen": not getattr(self.attention, "use_ring", False),
+                "npu_attn_varlen": not use_ring,
                 # fp16-range protection for the ascend_laser_attention kernel
                 # (see MINIMAX_H3_LASER_INPUT_SCALE). Ignored by every other
                 # backend/path.
