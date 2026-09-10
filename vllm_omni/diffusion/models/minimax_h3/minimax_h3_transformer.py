@@ -541,7 +541,11 @@ class MiniMaxH3Attention(nn.Module):
             )
         attn_mask = None
         mask_free_packed_padding = False
-        use_ring = _ring_sequence_parallel_is_active(self.attention)
+        # A USP executor owns the SP collectives before any ring dispatch and
+        # consumes the packed metadata without a mask (via kv_used_len), so
+        # when it is present the ring-specific mask behavior does not apply.
+        usp_active = getattr(self.attention, "_usp_executor", None) is not None
+        use_ring = _ring_sequence_parallel_is_active(self.attention) and not usp_active
         if num_requests > 1:
             # A step-mode batch packs one document per request, so its valid
             # rows are block-diagonal rather than a prefix: neither a KV prefix
