@@ -151,6 +151,8 @@ def test_attention_delegates_before_native_sequence_parallel_collectives():
     layer._kv_cache_skip_steps = None
     layer._kv_cache_skip_layers = None
     layer.attn_backend = Mock(get_name=Mock(return_value="FLASH_ATTN"))
+    # No sparse-plan resolver on this backend (spec=[] keeps getattr at None).
+    layer.attention = Mock(spec=[])
     layer.causal = False
     layer.softmax_scale = 8**-0.5
     layer.scatter_idx = 2
