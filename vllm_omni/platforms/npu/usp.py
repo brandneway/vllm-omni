@@ -138,11 +138,15 @@ class AscendUSPExecutor:
         extra = attn_metadata.extra
         if not extra:
             return None
-        cu_seqlens = extra.get("cu_seqlens_q")
-        if cu_seqlens is not None and hasattr(cu_seqlens, "shape") and cu_seqlens.shape[0] > 2:
+        # A single-request H3 packing is [0, used_len, packed_total] (one real
+        # document plus a padding-tail document), so cu_seqlens length cannot
+        # distinguish it from a step-mode batch; the model publishes the host
+        # side request count instead.
+        num_requests = extra.get("num_requests", 1)
+        if num_requests != 1:
             raise ValueError(
                 "Ascend USP execution supports single-request packed sequences in v1: "
-                f"cu_seqlens_q has {cu_seqlens.shape[0]} entries (multi-request step-mode batching). "
+                f"num_requests={num_requests} (multi-request step-mode batching). "
                 "Run with enable_usp=False for batched requests."
             )
         used = extra.get("valid_kv_length")
