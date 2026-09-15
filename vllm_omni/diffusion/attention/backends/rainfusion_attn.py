@@ -6,6 +6,7 @@ from __future__ import annotations
 import functools
 import inspect
 import math
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -40,6 +41,29 @@ _INPUT_LAYOUT = "BSND"
 # precise setting because the sparsity knob is the intended perf lever, and on
 # A5 devices the kernel is routed to rf_v3, which overrides this anyway.
 _INNER_PRECISE = 0
+
+# --- estimate-mask (ada_bsa stage 1) experiment --------------------------------
+#
+# VLLM_OMNI_RAINFUSION_MASK_ALGO=estimate swaps the mask algorithm only: the
+# RainFusion pooling mask (spatial rearrange + avgpool scoring + inverse
+# rearrange) is replaced by the A5-native sparse_block_estimate operator,
+# while the execution kernel stays eagle_quant_block_sparse_attention with the
+# same EagleQBSA quantization. This mode performs no spatial rearrangement at
+# all — sparse_block_estimate scores 128-token blocks of the packed sequence
+# in place, so single-span and multi-span plans share one code path.
+_ESTIMATE_MASK_ALGO = "estimate"
+
+# sparse_block_estimate A5 kernel contract: Q/K downsampled by this stride.
+_ESTIMATE_STRIDE = 8
+
+# A5 rf_v3 convention for the EagleQBSA kernel (950 requires inner_precise=4).
+_ESTIMATE_INNER_PRECISE = 4
+
+# The A5 kernel accepts at most 2048 KV128 blocks (256K tokens).
+_ESTIMATE_MAX_KV_TOKENS = 2048 * _BLOCK_SIZE
+
+# The A5 kernel only implements head_dim 128.
+_ESTIMATE_HEAD_DIM = 128
 
 _WRONG_PLATFORM = (
     "RAINFUSION_ATTN runs the MindIE-SD rf_v2 kernel and is available on Ascend NPU only. "
@@ -87,6 +111,29 @@ def _supports_video_spans(sparse_attention: Any) -> bool:
     try:
         return "video_spans" in inspect.signature(sparse_attention).parameters
     except (TypeError, ValueError):
+        return False
+
+
+@functools.cache
+def _estimate_mask_requested() -> bool:
+    return os.environ.get("VLLM_OMNI_RAINFUSION_MASK_ALGO", "").lower() == _ESTIMATE_MASK_ALGO
+
+
+@functools.cache
+def _estimate_cdf_threshold() -> float:
+    try:
+        return float(os.environ.get("VLLM_OMNI_RAINFUSION_ESTIMATE_CDF", "1.0"))
+    except ValueError:
+        return 1.0
+
+
+@functools.cache
+def _mindiesd_has_estimate_mask() -> bool:
+    try:
+        from mindiesd.layers.flash_attn.sparse_flash_attn_ada_bsa import get_estimate_mask  # noqa: F401
+
+        return True
+    except Exception:
         return False
 
 
@@ -453,6 +500,142 @@ class RainFusionAttentionImpl(AttentionImpl):
         )
         return RainFusionPlan(used_len=int(used_len), video_spans=spans)
 
+    def _estimate_mask_eligible(
+        self, query: torch.Tensor, key: torch.Tensor, plan: RainFusionPlan
+    ) -> bool:
+        """Gate the estimate-mask experiment on the A5 kernel's hard contract.
+
+        sparse_block_estimate only implements BNSD fp16/bf16 with head_dim 128,
+        GQA-aligned heads and at most 2048 KV128 blocks, and refuses varlen and
+        causal inputs. Anything the model hands us outside that contract keeps
+        the proven rf_v2 path rather than failing the forward.
+        """
+        if not _mindiesd_has_estimate_mask():
+            logger.warning_once(
+                "estimate mask algo requested but mindiesd lacks "
+                "sparse_flash_attn_ada_bsa.get_estimate_mask; staying on the rf_v2 path."
+            )
+            return False
+        if query.shape[-1] != _ESTIMATE_HEAD_DIM:
+            logger.warning_once(
+                "estimate mask algo staying on the rf_v2 path: head_dim=%d but the A5 "
+                "sparse_block_estimate kernel only implements %d.",
+                query.shape[-1],
+                _ESTIMATE_HEAD_DIM,
+            )
+            return False
+        if query.shape[-2] % key.shape[-2] != 0:
+            logger.warning_once(
+                "estimate mask algo staying on the rf_v2 path: q_heads=%d is not divisible "
+                "by kv_heads=%d as the GQA flattening in sparse_block_estimate requires.",
+                query.shape[-2],
+                key.shape[-2],
+            )
+            return False
+        if plan.used_len > _ESTIMATE_MAX_KV_TOKENS:
+            logger.warning_once(
+                "estimate mask algo staying on the rf_v2 path: used_len=%d exceeds the A5 "
+                "sparse_block_estimate capacity of %d KV128 blocks.",
+                plan.used_len,
+                _ESTIMATE_MAX_KV_TOKENS,
+            )
+            return False
+        return True
+
+    def _forward_sparse_estimate_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        plan: RainFusionPlan,
+    ) -> torch.Tensor:
+        """ada_bsa feasibility path: estimate mask + EagleQBSA kernel.
+
+        Replaces the whole RainFusion mask algorithm — no spatial rearrangement
+        and no inverse rearrangement. sparse_block_estimate scores 128-token
+        blocks of the packed sequence in place (stride-8 downsampled QK with
+        online-softmax block scoring, sink/recent blocks always kept), the mask
+        is trimmed to the eagle layout (the estimate output pads its KV-block
+        columns to a multiple of 32; the eagle kernel derives its row stride
+        from the sequence length instead), and the exact rf_v3 'mix' execution
+        path runs unchanged: EagleQBSA quantization into
+        eagle_quant_block_sparse_attention.
+        """
+        import torch_npu
+
+        from mindiesd.layers.flash_attn.sparse_flash_attn_ada_bsa import get_estimate_mask
+        from mindiesd.layers.flash_attn.sparse_flash_attn_rf_v3 import _eagle_qbsa_quant_qkv
+
+        used = plan.used_len
+        batch = query.shape[0]
+        num_kv_heads = key.shape[-2]
+        # The estimate kernel and the eagle kernel both speak BNSD; the caller's
+        # BSND tensors are converted once and reused for scoring and quantization.
+        q = query[:, :used].transpose(1, 2).contiguous()
+        k = key[:, :used].transpose(1, 2).contiguous()
+        v = value[:, :used].transpose(1, 2).contiguous()
+
+        logger.info_once(
+            "estimate mask algo active: sparsity=%.2f, cdf_threshold=%.3f, used_len=%d, "
+            "q_heads=%d, kv_heads=%d. Blocks are packed-sequence 128-token strips; sink and "
+            "recent blocks are always kept.",
+            self.rainfusion.sparsity,
+            _estimate_cdf_threshold(),
+            used,
+            query.shape[-2],
+            num_kv_heads,
+        )
+
+        smask, _sct = get_estimate_mask(
+            q,
+            k,
+            v,
+            scale=self.softmax_scale,
+            head_num=query.shape[-2],
+            input_layout="BNSD",
+            keep_sink=True,
+            keep_recent=True,
+            sparsity=self.rainfusion.sparsity,
+            cdf_threshold=_estimate_cdf_threshold(),
+            sparse_size=_BLOCK_SIZE,
+            stride=_ESTIMATE_STRIDE,
+        )
+        kv_blocks = -(-used // _BLOCK_SIZE)
+        mask = smask[..., :kv_blocks].contiguous()
+
+        q_q, k_q, v_q, q_scales, k_scales, v_scales = _eagle_qbsa_quant_qkv(
+            q, k, v, block_size_q=64, layout="BNSD"
+        )
+        seq_lens = [used] * batch
+        out, _ = torch.ops.mindiesd.eagle_quant_block_sparse_attention(
+            query=q_q,
+            key=k_q,
+            value=v_q.view(torch.int8),
+            block_sparse_mask=mask,
+            block_shape=[_BLOCK_SIZE, _BLOCK_SIZE],
+            q_input_layout="BNSD",
+            kv_input_layout="BNSD",
+            num_key_value_heads=num_kv_heads,
+            scale_value=self.softmax_scale,
+            inner_precise=_ESTIMATE_INNER_PRECISE,
+            softmax_lse_flag=0,
+            actual_seq_lengths=seq_lens,
+            actual_seq_lengths_kv=seq_lens,
+            query_scale=q_scales,
+            key_scale=k_scales,
+            value_scale=v_scales,
+            query_dtype=torch.int8,
+            key_dtype=torch.int8,
+            value_dtype=torch_npu.float8_e4m3fn,
+            output_dtype=torch.bfloat16,
+        )
+        out = out.transpose(1, 2)
+        if used == query.shape[1]:
+            return out
+        padded = torch.zeros_like(query)
+        padded[:, :used] = out
+        return padded
+
     def _forward_sparse_npu(
         self,
         query: torch.Tensor,
@@ -460,6 +643,8 @@ class RainFusionAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         plan: RainFusionPlan,
     ) -> torch.Tensor:
+        if _estimate_mask_requested() and self._estimate_mask_eligible(query, key, plan):
+            return self._forward_sparse_estimate_npu(query, key, value, plan)
         try:
             from mindiesd import sparse_attention
         except ImportError:
