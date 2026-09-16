@@ -1227,14 +1227,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # straight into host memory keeps the load-time device peak at the
         # quantizable layers alone; sharding then distributes the fallback like
         # any other parameter. Broadcast loading excludes online quantization
-        # already, so the fallback factory below only ever matters on the
-        # ordinary per-rank branch -- but spanning both is harmless.
+        # already, so the context below only ever matters on the ordinary
+        # per-rank branch -- but spanning both is harmless.
         from vllm_omni.quantization.int8_config import load_unquantizable_fallback_on_cpu
 
-        fallback_factory = (
-            load_unquantizable_fallback_on_cpu if offload_after_quant else contextlib.nullcontext
-        )
-        with fallback_factory():
+        fallback_ctx = load_unquantizable_fallback_on_cpu() if offload_after_quant else contextlib.nullcontext()
+        with fallback_ctx:
             model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=True)
             world_size = 1
             rank = 0
@@ -1249,7 +1247,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
             if enable_broadcast and has_online_quant:
                 logger.info(
-                    "Worker %d: Online quantization detected; falling back to ordinary per-rank weight loading for HSDP",
+                    "Worker %d: Online quantization detected; falling back to ordinary "
+                    "per-rank weight loading for HSDP",
                     rank,
                 )
                 enable_broadcast = False

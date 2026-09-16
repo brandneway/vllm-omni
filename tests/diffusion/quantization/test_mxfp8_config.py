@@ -354,6 +354,16 @@ class TestOffloadAfterQuant:
     online MXFP8/MXFP4 methods, so pinning it here covers mxfp4 too.
     """
 
+    @pytest.fixture(autouse=True)
+    def _mock_tp(self, mocker: MockerFixture):
+        # create_weights resolves the TP group while computing per-partition
+        # shapes; these tests never initialize torch.distributed.
+        mock_group = mocker.Mock()
+        mock_group.rank_in_group = 0
+        mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=1)
+        mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_rank", return_value=0)
+        mocker.patch("vllm.distributed.parallel_state.get_tp_group", return_value=mock_group)
+
     def _make_method(self):
         from vllm_omni.quantization.mxfp8_config import (
             DiffusionMXFP8Config,

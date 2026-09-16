@@ -333,6 +333,14 @@ class LazyWeightMixin:
         """
         self._offload_after_quant = True
 
+    def _lazy_load_device(self) -> torch.device:
+        """Device the meta weight materializes on at first load.
+
+        Subclasses that never want the accelerator involved (e.g. the
+        over-wide host fallback) override this to return host memory.
+        """
+        return torch.get_default_device()
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -414,11 +422,11 @@ class LazyWeightMixin:
             weight_loader=patched_weight_loader,
         )
         # stash the correct device for `patched_weight_loader`
-        layer._load_device = torch.get_default_device()
+        layer._load_device = self._lazy_load_device()
         layer.register_parameter("weight", weight)
 
 
-class UnquantizedHostLinearMethod(UnquantizedLinearMethod):
+class UnquantizedHostLinearMethod(LazyWeightMixin, UnquantizedLinearMethod):
     """Unquantized linear method whose weight loads straight into host memory.
 
     Layers wider than ``NPU_QUANT_MATMUL_MAX_OUT_FEATURES`` cannot be quantized,
@@ -429,72 +437,29 @@ class UnquantizedHostLinearMethod(UnquantizedLinearMethod):
     weights end up pinned on the host either way and only visit the accelerator
     through the offload backend's runtime prefetch.
 
-    This method mirrors ``LazyWeightMixin``'s meta + just-in-time materialize
-    pattern, but materializes on CPU and skips quantization entirely.
+    This method reuses ``LazyWeightMixin``'s meta + just-in-time materialization
+    wholesale (the weight really is deferred on meta until loading, like the
+    online quant methods, so the loader's meta-aware bookkeeping treats the
+    layer correctly) and only overrides the materialization target to host
+    memory: checkpoint chunks are CPU tensors, so loading stays CPU->CPU with
+    no accelerator round trip.
     """
 
-    # The weight really is deferred on meta until loading, like the online
-    # quant methods, so the loader's meta-aware bookkeeping treats the layer
-    # correctly. Offload-after-quant marking is deliberately not advertised:
-    # the weight never visits the accelerator, so there is nothing to return.
-    uses_meta_device: bool = True
+    # Offload-after-quant marking is deliberately not advertised even though
+    # the mixin provides the hook: the weight never visits the accelerator,
+    # so there is nothing to return to host.
+    supports_offload_after_quant: bool = False
 
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        output_size_per_partition = sum(output_partition_sizes)
-        weight_loader = extra_weight_attrs.get("weight_loader")
+    def _lazy_load_device(self) -> torch.device:
+        return torch.device("cpu")
 
-        def patched_weight_loader(param, loaded_weight, *args, **kwargs):
-            # Materialize on host just-in-time: checkpoint chunks are CPU
-            # tensors, so loading stays CPU->CPU with no accelerator round trip.
-            if layer.weight.device.type == "meta":
-                weight = ModelWeightParameter(
-                    data=torch.empty_like(layer.weight, device="cpu"),
-                    input_dim=1,
-                    output_dim=0,
-                    weight_loader=patched_weight_loader,
-                )
-                _copy_missing_attrs(layer.weight, weight)
-                layer.register_parameter("weight", weight)
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        """Unquantized weights need no post-load transform.
 
-            # refresh the reference to `param` to reflect just-in-time
-            # materialization
-            param = layer.weight
-
-            copy_numel_counter = CopyNumelCounter()
-            with copy_numel_counter:
-                res = weight_loader(param, loaded_weight, *args, **kwargs)  # type: ignore[misc]
-            layer._loaded_numel = getattr(layer, "_loaded_numel", 0) + copy_numel_counter.copied_numel
-
-            if layer._loaded_numel == layer.weight.numel():
-                # process_weights_after_loading is a no-op for unquantized
-                # weights; the flag keeps the post-load sweep from bouncing the
-                # host tensor to the accelerator and back just to call it.
-                layer._already_called_process_weights_after_loading = True
-
-            return res
-
-        weight = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition,
-                # materialized just-in-time in `patched_weight_loader`
-                device="meta",
-                dtype=params_dtype,
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=patched_weight_loader,
-        )
-        layer.register_parameter("weight", weight)
+        The mixin calls this when the weight is fully loaded, right before it
+        flags the layer — and the flag is what keeps the loader's post-load
+        sweep from bouncing the host tensor to the accelerator and back.
+        """
 
 
 class Int8LinearMethod(BaseInt8LinearMethod):
