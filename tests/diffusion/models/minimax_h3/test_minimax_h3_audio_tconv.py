@@ -66,7 +66,7 @@ def test_depthwise_upsample_matches_native(channels, ratio, kernel):
     torch.testing.assert_close(value, reference, rtol=0, atol=1e-12)
 
 
-class _FakeUpSample1d(nn.Module):
+class UpSample1d(nn.Module):
     """Same name, buffers, and attributes as the checkpoint's remote class."""
 
     def __init__(self, ratio=2, kernel_size=12):
@@ -91,7 +91,7 @@ class _FakeUpSample1d(nn.Module):
 def _audio_graph() -> nn.Module:
     root = nn.Module()
     root.stage = nn.ConvTranspose1d(12, 8, 9, stride=5, padding=2)
-    root.act = _FakeUpSample1d()
+    root.act = UpSample1d()
     nested = nn.Module()
     nested.ups = nn.ModuleList([nn.ModuleList([root.stage]), nn.ModuleList([root.act])])
     root.nested = nested
@@ -105,7 +105,7 @@ def test_install_is_a_noop_without_env(monkeypatch):
     assert install_audio_vae_tconv_conv1d(root) == (0, 0)
     # Bound methods are recreated per attribute access; compare the underlying functions.
     assert root.stage.forward.__func__ is nn.ConvTranspose1d.forward
-    assert root.act.forward.__func__ is _FakeUpSample1d.forward
+    assert root.act.forward.__func__ is UpSample1d.forward
 
 
 def test_install_patches_both_families_and_cpu_output_is_unchanged(monkeypatch):
