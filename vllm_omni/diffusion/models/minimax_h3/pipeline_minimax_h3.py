@@ -2289,6 +2289,12 @@ class MiniMaxH3Pipeline(
                 del video
                 self._release_stage_cache()
                 audios.append(audio)
+        if videos and isinstance(videos[0], bytes):
+            video = videos[0] if len(videos) == 1 else videos
+            audio = None
+        else:
+            video = videos[0] if len(videos) == 1 else torch.cat(videos, dim=0)
+            audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
         return DiffusionOutput(
             output=(video, audio),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
