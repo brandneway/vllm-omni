@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 
 import vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 as pipeline_module
 import vllm_omni.diffusion.models.minimax_h3.taeh3 as taeh3_module
@@ -60,6 +61,30 @@ def test_taeh3_decode_video_rebuilds_17n5_frame_chunks(monkeypatch):
     video = decoder.decode_video(torch.zeros(1, 24, 37, 4, 4))
 
     assert video.shape[2] == 124
+
+
+def test_upsample_split_is_bit_exact():
+    torch.manual_seed(0)
+    block = nn.Upsample(scale_factor=2)
+    value = torch.randn(300, 8, 6, 10, dtype=torch.float64)
+
+    split = taeh3_module._upsample_nearest_safe(block, value)
+
+    torch.testing.assert_close(split, block(value), rtol=0, atol=0)
+    assert split.shape == (300, 8, 12, 20)
+
+
+def test_decoder_output_is_independent_of_upsample_chunking(monkeypatch):
+    torch.manual_seed(0)
+    with torch.no_grad():
+        decoder = TAEH3Decoder().double()
+        latent = torch.randn(1, 24, 102, 4, 4)  # 15 s timeline: stage upsampler hits batch 204
+
+        reference = decoder.decode_video(latent.clone())
+        monkeypatch.setattr(taeh3_module, "_UPSAMPLE_MAX_BATCH", 8)
+        chunked = decoder.decode_video(latent.clone())
+
+    torch.testing.assert_close(chunked, reference, rtol=0, atol=0)
 
 
 class _SpyVideoVAE:

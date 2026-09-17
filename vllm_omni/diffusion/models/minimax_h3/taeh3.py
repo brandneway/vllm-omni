@@ -79,6 +79,22 @@ class _TGrow(nn.Module):
         return self.conv(value).reshape(-1, channels, height, width)
 
 
+# CANN 25.7.rc1.6 (Ascend 950PR): nn.Upsample(mode='nearest') on 4-D input
+# silently skips writing the tail of the output once the flattened batch
+# exceeds a threshold measured between 165 (clean) and 200 (corrupt), leaving
+# stale device memory in the unwritten rows (first bad row observed at 170,
+# independent of total batch). The equivalent F.interpolate forms share the
+# same kernel. Splitting the call keeps every piece under the threshold;
+# nearest upsampling is per-sample, so the split is bit-exact.
+_UPSAMPLE_MAX_BATCH = 128
+
+
+def _upsample_nearest_safe(block: nn.Upsample, value: torch.Tensor) -> torch.Tensor:
+    if value.shape[0] <= _UPSAMPLE_MAX_BATCH:
+        return block(value)
+    return torch.cat([block(chunk) for chunk in value.split(_UPSAMPLE_MAX_BATCH, dim=0)], dim=0)
+
+
 def _apply_decoder_parallel(decoder: nn.Sequential, value: torch.Tensor) -> torch.Tensor:
     if value.ndim != 5:
         raise ValueError(f"TAEH3 expects NTCHW latent input, got {tuple(value.shape)}")
@@ -90,6 +106,8 @@ def _apply_decoder_parallel(decoder: nn.Sequential, value: torch.Tensor) -> torc
             shaped = value.reshape(batch, frames, value.shape[1], value.shape[2], value.shape[3])
             past = F.pad(shaped, (0, 0, 0, 0, 0, 0, 1, 0))[:, :frames]
             value = block(value, past.reshape_as(value))
+        elif isinstance(block, nn.Upsample):
+            value = _upsample_nearest_safe(block, value)
         else:
             value = block(value)
     frames = value.shape[0] // batch
