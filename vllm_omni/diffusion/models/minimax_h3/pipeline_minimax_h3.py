@@ -8,7 +8,7 @@ import json
 import math
 import os
 from collections.abc import Iterable, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
 from itertools import groupby
 from pathlib import Path
@@ -141,6 +141,8 @@ from .time_request import (
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
 
 if TYPE_CHECKING:
+    from PIL import Image
+
     from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import StepRequestState
 
