@@ -137,6 +137,71 @@ def _mindiesd_has_estimate_mask() -> bool:
         return False
 
 
+@functools.cache
+def _estimate_protections_enabled() -> bool:
+    """Replicate the rf_v2 mask contract (dense context + first frame) on the
+    estimate mask. On by default because prompt adherence relies on text key
+    blocks being unconditionally visible to every query row; set
+    VLLM_OMNI_RAINFUSION_ESTIMATE_PROTECT=0 to A/B the raw estimate mask."""
+    return os.environ.get("VLLM_OMNI_RAINFUSION_ESTIMATE_PROTECT", "1") != "0"
+
+
+def _estimate_protected_token_ranges(plan: RainFusionPlan) -> list[tuple[int, int]]:
+    """Token ranges the rf_v2 mask contract keeps dense, in packed order.
+
+    Mirrors get_blockwise_mask / get_multi_span_blockwise_mask: non-video
+    context rows and columns are always kept, and so is each clip's first
+    frame (t*h*w latent grid, first h*w rows).
+    """
+    if plan.video_spans is not None:
+        ranges: list[tuple[int, int]] = []
+        prev_end = 0
+        for span in sorted(plan.video_spans, key=lambda item: int(item["start"])):
+            start = int(span["start"])
+            t, h, w = (int(dim) for dim in span["latent_shape"])
+            if start > prev_end:
+                ranges.append((prev_end, start))
+            ranges.append((start, start + h * w))
+            prev_end = start + t * h * w
+        if plan.used_len > prev_end:
+            ranges.append((prev_end, plan.used_len))
+        return ranges
+    assert plan.prefix_len is not None and plan.latent_shape is not None
+    _, h, w = (int(dim) for dim in plan.latent_shape)
+    return [(0, int(plan.prefix_len) + h * w)]
+
+
+def _apply_estimate_protections(
+    mask: torch.Tensor, token_ranges: list[tuple[int, int]]
+) -> torch.Tensor:
+    """Force the protected block rows/columns to 1 on the trimmed estimate mask.
+
+    Token ranges are widened to whole 128-token blocks (a range straddling a
+    block boundary protects the whole block), which slightly over-protects —
+    the same trade the rf_v2 boundary-dense layout makes by construction.
+    """
+    n_blocks = mask.shape[-1]
+    block_ranges = sorted(
+        (start // _BLOCK_SIZE, -(-end // _BLOCK_SIZE))
+        for start, end in token_ranges
+        if end > start
+    )
+    merged: list[list[int]] = []
+    for lo, hi in block_ranges:
+        if merged and lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    for lo, hi in merged:
+        lo, hi = max(lo, 0), min(hi, n_blocks)
+        if hi > lo:
+            # Dense queries: these rows attend to every KV block.
+            mask[:, :, lo:hi, :] = 1
+            # Visible keys: every query row attends to these KV blocks.
+            mask[..., lo:hi] = 1
+    return mask
+
+
 @dataclass(frozen=True)
 class RainFusionConfig:
     """Resolved RainFusion controls for one attention layer.
@@ -577,13 +642,14 @@ class RainFusionAttentionImpl(AttentionImpl):
 
         logger.info_once(
             "estimate mask algo active: sparsity=%.2f, cdf_threshold=%.3f, used_len=%d, "
-            "q_heads=%d, kv_heads=%d. Blocks are packed-sequence 128-token strips; sink and "
-            "recent blocks are always kept.",
+            "q_heads=%d, kv_heads=%d, rf_contract_protections=%s. Blocks are packed-sequence "
+            "128-token strips; sink and recent blocks are always kept.",
             self.rainfusion.sparsity,
             _estimate_cdf_threshold(),
             used,
             query.shape[-2],
             num_kv_heads,
+            _estimate_protections_enabled(),
         )
 
         smask, _sct = get_estimate_mask(
@@ -602,6 +668,13 @@ class RainFusionAttentionImpl(AttentionImpl):
         )
         kv_blocks = -(-used // _BLOCK_SIZE)
         mask = smask[..., :kv_blocks].contiguous()
+        if _estimate_protections_enabled():
+            # The pooling mask unconditionally keeps non-video context (rows
+            # and columns) and each clip's first frame; sparse_block_estimate
+            # only guarantees the sink and recent blocks per row, which lets
+            # text key blocks lose the CDF competition on some rows and
+            # throttles prompt conditioning.
+            mask = _apply_estimate_protections(mask, _estimate_protected_token_ranges(plan))
 
         q_q, k_q, v_q, q_scales, k_scales, v_scales = _eagle_qbsa_quant_qkv(
             q, k, v, block_size_q=64, layout="BNSD"
