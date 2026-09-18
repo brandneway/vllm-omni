@@ -9,6 +9,8 @@ rebind only its own parameters while the other half stays on its pinned
 CPU master.
 """
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 import torch.nn as nn
@@ -152,11 +154,17 @@ def test_component_on_device_unwraps_proxy_for_sequential_offload(monkeypatch):
         pass
     with pipeline._component_on_device(vae.decoder_component):
         pass
-    # A component without an unwrapping property passes through unchanged.
+    # A plain component passes through unchanged.
     with pipeline._component_on_device(vae):
         pass
+    # Mocks auto-create any attribute, so the unwrap must be a type check:
+    # a Mock component must reach the sequential context as itself.
+    mock_vae = Mock()
+    pipeline._model_cpu_offload_modules = [mock_vae]
+    with pipeline._component_on_device(mock_vae):
+        pass
 
-    assert seen == [vae, vae, vae]
+    assert seen == [vae, vae, vae, mock_vae]
 
 
 def test_sequential_offload_target_is_the_hooked_module():

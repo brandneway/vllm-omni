@@ -138,7 +138,7 @@ from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_time_shift_sigmas,
 )
-from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
+from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _VideoVAEPartProxy
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -1356,8 +1356,11 @@ class MiniMaxH3Pipeline(
             # registers them on the discovered components, e.g. the real
             # video_vae). Split-residency proxies carry no hook, so unwrap to the
             # hooked module before entering the context — whole-module movement
-            # has no half-residency benefit anyway.
-            component = getattr(component, "sequential_offload_target", component)
+            # has no half-residency benefit anyway. The check is a type check, not
+            # getattr: Mock components auto-create any attribute, which would
+            # unwrap them to a child mock and break scope tracking.
+            if isinstance(component, _VideoVAEPartProxy):
+                component = component.sequential_offload_target
             with sequential_offload_component(component):
                 yield
             return
