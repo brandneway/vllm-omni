@@ -611,7 +611,6 @@ def _text_encoder_group_ranks(dit_world_size: int, tp_size: int) -> list[list[in
     return [list(range(offset, offset + tp_size)) for offset in range(0, dit_world_size, tp_size)]
 
 
-
 class MiniMaxH3Pipeline(
     nn.Module,
     DenoiseProgressMixin,
