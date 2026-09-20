@@ -102,6 +102,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
         if backend_kwargs:
             logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
+        # Lazily created Ascend causal masks for npu_fusion_attention
+        # sparse_mode 2/3, keyed by device. See _get_npu_causal_mask.
+        self._npu_causal_masks: dict = {}
 
     def _warn_fa_deterministic_non_dense(self, path: str) -> None:
         if not self.fa_deterministic:
@@ -529,6 +532,11 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+            raise NotImplementedError(
+                "NPU FP8 KV-quant attention does not support piecewise full_attn_spans yet; "
+                "disable KV quantization for models that emit block-causal span metadata."
+            )
         from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_rotate_quant_fa
 
         layout = self.qkv_layout or "BNSD"
@@ -550,6 +558,14 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         from mindiesd import attention_forward
+
+        # Piecewise block-causal path, mirroring the CUDA dispatch: causal
+        # segments go through npu_fusion_attention sparse_mode 2/3, full spans
+        # through FIA's default mask-free mode. This must run before the
+        # generic mask handling below, which would otherwise silently drop
+        # full_attn_spans and compute full attention.
+        if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+            return self._forward_piecewise_npu(query, key, value, attn_metadata)
 
         # Opt-in mask-free paths (mirror the CUDA cu_seqlens behavior): the
         # model marks extra["npu_attn_varlen"] and carries packed metadata, so
@@ -597,6 +613,121 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             opt_mode="manual",
             op_type="fused_attn_score",
             layout=layout,
+        )
+
+    # ── Ascend piecewise (block-causal) support ──
+    #
+    # sparse_mode of torch_npu.npu_fusion_attention:
+    #   2 leftUpCausal     — causal mask aligned at the top-left corner
+    #   3 rightDownCausal  — causal mask aligned at the bottom-right corner,
+    #                        which is FlashAttention's convention for
+    #                        ``attn(Q[:, s:e], K[:, :e], causal=True)`` and thus
+    #                        the one piecewise_attn's Segment contract requires
+    #                        when Sq != Skv.
+    # No sparse_mode applies causal masking internally without a mask (with
+    # atten_mask=None the sparse_mode parameter is ignored entirely), so modes
+    # 2/3 take the fixed compressed lower-triangular mask at exactly
+    # (2048, 2048); the kernel tiles it for longer sequences.
+    _NPU_SPARSE_LEFT_UP_CAUSAL = 2
+    _NPU_SPARSE_RIGHT_DOWN_CAUSAL = 3
+    _NPU_CAUSAL_MASK_SIZE = 2048
+
+    def _get_npu_causal_mask(self, device: torch.device) -> torch.Tensor:
+        """Return the cached (2048, 2048) causal mask for sparse_mode 2/3.
+
+        Ascend mask convention is inverted versus vllm-omni's: True marks a
+        position that is masked OUT, so the causal mask is the strict upper
+        triangle.
+        """
+        mask = self._npu_causal_masks.get(device)
+        if mask is None:
+            mask = torch.triu(
+                torch.ones(
+                    self._NPU_CAUSAL_MASK_SIZE,
+                    self._NPU_CAUSAL_MASK_SIZE,
+                    dtype=torch.bool,
+                    device=device,
+                ),
+                diagonal=1,
+            ).contiguous()
+            self._npu_causal_masks[device] = mask
+        return mask
+
+    def _npu_piecewise_attn_func(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        causal: bool,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        """``attn_func`` for ``piecewise_attn`` on Ascend.
+
+        Per-segment routing (Qwen-Image-2.1 block-causal):
+          - causal segments (text runs): ``torch_npu.npu_fusion_attention``
+            with the compressed (2048, 2048) causal mask. ``sparse_mode=2``
+            (leftUpCausal) when Sq == Skv and ``sparse_mode=3``
+            (rightDownCausal) when Sq < Skv — the two coincide for square QK
+            blocks, and the latter matches piecewise_attn's bottom-right
+            alignment promise.
+          - full segments (condition/target image blocks):
+            ``torch_npu.npu_fused_infer_attention_score`` in default mode
+            (``sparse_mode=0``, ``atten_mask=None``), i.e. plain bidirectional
+            attention with no mask constructed.
+
+        Inputs follow the model-side ``(B, S, H, D)`` convention == BSND.
+        """
+        import torch_npu
+
+        if not causal:
+            out, _ = torch_npu.npu_fused_infer_attention_score(
+                query,
+                key,
+                value,
+                num_heads=query.shape[2],
+                num_key_value_heads=key.shape[2],
+                scale=softmax_scale,
+                input_layout="BSND",
+            )
+            return out
+        q_len, kv_len = query.shape[1], key.shape[1]
+        sparse_mode = self._NPU_SPARSE_LEFT_UP_CAUSAL if q_len == kv_len else self._NPU_SPARSE_RIGHT_DOWN_CAUSAL
+        return torch_npu.npu_fusion_attention(
+            query,
+            key,
+            value,
+            head_num=query.shape[2],
+            input_layout="BSND",
+            atten_mask=self._get_npu_causal_mask(query.device),
+            scale=softmax_scale,
+            keep_prob=1.0,
+            sparse_mode=sparse_mode,
+        )[0]
+
+    def _forward_piecewise_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """Piecewise block-causal attention on Ascend, mirroring forward_cuda.
+
+        Same segment plan as the CUDA path (``piecewise_attn``); only the
+        per-segment kernel differs (npu_fusion_attention / FIA instead of
+        flash_attn).
+        """
+        self._warn_fa_deterministic_non_dense("piecewise-npu")
+        logger.debug("Using piecewise NPU attention for mixed causal/full mask")
+        return piecewise_attn(
+            query,
+            key,
+            value,
+            attn_metadata.full_attn_spans,
+            self.softmax_scale,
+            self._npu_piecewise_attn_func,
+            query_ranges=attn_metadata.query_ranges,
         )
 
     def _resolve_packed_seq_npu(
