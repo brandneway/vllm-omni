@@ -559,11 +559,11 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
     ) -> torch.Tensor:
         from mindiesd import attention_forward
 
-        # Piecewise block-causal path, mirroring the CUDA dispatch: causal
-        # segments go through npu_fusion_attention sparse_mode 2/3, full spans
-        # through FIA's default mask-free mode. This must run before the
-        # generic mask handling below, which would otherwise silently drop
-        # full_attn_spans and compute full attention.
+        # Piecewise block-causal path, mirroring the CUDA dispatch: both
+        # segment kinds go through npu_fusion_attention (causal via
+        # sparse_mode 2/3, full via default mask-free mode). This must run
+        # before the generic mask handling below, which would otherwise
+        # silently drop full_attn_spans and compute full attention.
         if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
             return self._forward_piecewise_npu(query, key, value, attn_metadata)
 
@@ -664,42 +664,38 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
     ) -> torch.Tensor:
         """``attn_func`` for ``piecewise_attn`` on Ascend.
 
-        Per-segment routing (Qwen-Image-2.1 block-causal):
-          - causal segments (text runs): ``torch_npu.npu_fusion_attention``
-            with the compressed (2048, 2048) causal mask. ``sparse_mode=2``
-            (leftUpCausal) when Sq == Skv and ``sparse_mode=3``
-            (rightDownCausal) when Sq < Skv — the two coincide for square QK
-            blocks, and the latter matches piecewise_attn's bottom-right
-            alignment promise.
-          - full segments (condition/target image blocks):
-            ``torch_npu.npu_fused_infer_attention_score`` in default mode
-            (``sparse_mode=0``, ``atten_mask=None``), i.e. plain bidirectional
-            attention with no mask constructed.
+        Both segment kinds use ``torch_npu.npu_fusion_attention``:
+          - causal segments (text runs): the compressed (2048, 2048) causal
+            mask with ``sparse_mode=2`` (leftUpCausal) when Sq == Skv and
+            ``sparse_mode=3`` (rightDownCausal) when Sq < Skv — the two
+            coincide for square QK blocks, and the latter matches
+            piecewise_attn's bottom-right alignment promise. (No sparse_mode
+            applies causal masking internally without a mask, so the fixed
+            pattern is passed explicitly.)
+          - full segments (condition/target image blocks): default
+            ``sparse_mode=0`` with ``atten_mask=None``, i.e. plain
+            bidirectional attention with no mask constructed.
 
         Inputs follow the model-side ``(B, S, H, D)`` convention == BSND.
         """
         import torch_npu
 
-        if not causal:
-            out, _ = torch_npu.npu_fused_infer_attention_score(
-                query,
-                key,
-                value,
-                num_heads=query.shape[2],
-                num_key_value_heads=key.shape[2],
-                scale=softmax_scale,
-                input_layout="BSND",
-            )
-            return out
         q_len, kv_len = query.shape[1], key.shape[1]
-        sparse_mode = self._NPU_SPARSE_LEFT_UP_CAUSAL if q_len == kv_len else self._NPU_SPARSE_RIGHT_DOWN_CAUSAL
+        if causal:
+            sparse_mode = (
+                self._NPU_SPARSE_LEFT_UP_CAUSAL if q_len == kv_len else self._NPU_SPARSE_RIGHT_DOWN_CAUSAL
+            )
+            atten_mask = self._get_npu_causal_mask(query.device)
+        else:
+            sparse_mode = 0
+            atten_mask = None
         return torch_npu.npu_fusion_attention(
             query,
             key,
             value,
             head_num=query.shape[2],
             input_layout="BSND",
-            atten_mask=self._get_npu_causal_mask(query.device),
+            atten_mask=atten_mask,
             scale=softmax_scale,
             keep_prob=1.0,
             sparse_mode=sparse_mode,
@@ -715,7 +711,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """Piecewise block-causal attention on Ascend, mirroring forward_cuda.
 
         Same segment plan as the CUDA path (``piecewise_attn``); only the
-        per-segment kernel differs (npu_fusion_attention / FIA instead of
+        per-segment kernel differs (npu_fusion_attention instead of
         flash_attn).
         """
         self._warn_fa_deterministic_non_dense("piecewise-npu")

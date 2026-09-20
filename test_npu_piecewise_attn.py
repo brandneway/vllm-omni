@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """对照测试：验证 NPU piecewise 注意力路由的数值正确性。
 
-causal 段走 torch_npu.npu_fusion_attention（sparse_mode=2/3 + 2048x2048 压缩
-因果 mask），full 段走 torch_npu.npu_fused_infer_attention_score 默认模式
-（sparse_mode=0，无 mask，全局双向）。
+causal 段与 full 段都走 torch_npu.npu_fusion_attention：causal 段用
+sparse_mode=2/3 + 2048x2048 压缩因果 mask，full 段用 sparse_mode=0 且
+atten_mask=None（无 mask，全局双向）。
 
 两种运行模式：
 
 1. 本地假机模式（默认）：无 NPU 环境，注入 fake torch_npu，用纯 PyTorch 严格
-   实现两个算子的 sparse_mode 语义（0=全注意力 / 2=leftUpCausal /
+   实现该算子的 sparse_mode 语义（0=全注意力 / 2=leftUpCausal /
    3=rightDownCausal，mask 约定 True=丢弃），校验路由选择与数值。
 2. 真机模式（TEST_REAL_NPU=1）：在 NPU 上用真实 torch_npu 算子，与稠密 4D
    block-causal mask 参考对比。
@@ -74,22 +74,12 @@ def fake_npu_fusion_attention(
     if sparse_mode in (2, 3):
         assert atten_mask is not None, "sparse_mode 2/3 必须传 atten_mask"
         _check_compressed_causal_mask(atten_mask)
+    else:
+        assert atten_mask is None, "sparse_mode=0 不应构造 mask"
     keep = _sparse_keep(query.shape[1], key.shape[1], sparse_mode)
     out = _torch_ref_attn(query, key, value, scale, keep)
     # 真实接口返回 (out, softmax_max, softmax_sum, softmax_out, seed, offset, numels)
     return out, torch.zeros(1), torch.zeros(1), torch.zeros(1), 0, 0, 0
-
-
-def fake_npu_fused_infer_attention_score(
-    query, key, value, *, atten_mask=None, num_heads, num_key_value_heads=0,
-    scale=1.0, input_layout="BSND", sparse_mode=0, **kwargs,
-):
-    """纯 PyTorch 实现 FIA 语义（仅 BSND layout、MHA、本测试用到的 sparse_mode）。"""
-    assert input_layout == "BSND"
-    assert key.shape[2] == num_key_value_heads and query.shape[2] == num_heads
-    keep = _sparse_keep(query.shape[1], key.shape[1], sparse_mode)
-    out = _torch_ref_attn(query, key, value, scale, keep)
-    return out, torch.zeros(1)  # (attn_out, lse)
 
 
 # ---- 导入目标模块 ----
@@ -103,7 +93,6 @@ if USE_REAL_NPU:
 else:
     fake_torch_npu = types.ModuleType("torch_npu")
     fake_torch_npu.npu_fusion_attention = fake_npu_fusion_attention
-    fake_torch_npu.npu_fused_infer_attention_score = fake_npu_fused_infer_attention_score
     sys.modules["torch_npu"] = fake_torch_npu
 
     fake_vllm = types.ModuleType("vllm")
@@ -204,7 +193,7 @@ def test_causal_segment_sparse_mode_selection():
 
 
 def test_full_segment_no_mask():
-    """非 causal 段（图像块）：FIA 默认模式无 mask，等价于截断 KV 的全注意力。"""
+    """非 causal 段（图像块）：sparse_mode=0 无 mask，等价于截断 KV 的全注意力。"""
     impl = make_impl()
     B, H, D = 1, 2, 8
     kv = torch.randn(B, 6, H, D, dtype=DTYPE, device=DEVICE)
