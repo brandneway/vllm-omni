@@ -1,9 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+"""Contract tests for the Ascend USP executor backed by mindiesd.parallel.
+
+The executor delegates only sparse-eligible RAINFUSION_ATTN calls to
+``mindiesd.parallel.distributed_sparse_attention`` (the quantized EagleQBSA
+chain, matching precision="mix" on A5). Everything else must decline so the
+native Ulysses path takes over.
+"""
+
 from dataclasses import dataclass, replace
 from types import ModuleType
-from typing import TypeAlias
 from unittest.mock import Mock
 
 import pytest
@@ -12,6 +19,7 @@ import torch
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.platforms.npu import usp as usp_module
 from vllm_omni.platforms.npu.usp import AscendUSPExecutor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -19,8 +27,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 @dataclass
 class _ParallelConfigStub:
-    ulysses_degree: int = 2
-    ring_degree: int = 2
+    ulysses_degree: int = 4
+    ring_degree: int = 1
     allgather_degree: int = 1
     ulysses_mode: str = "strict"
 
@@ -32,31 +40,47 @@ class _SPGroupsStub:
     ring_rank: int = 0
 
 
-USPErrorType: TypeAlias = type[BaseException]
+class _FakeParallelState:
+    """Stand-in for mindiesd.parallel.ParallelState (construction is counted)."""
+
+    instances: list["_FakeParallelState"] = []
+
+    def __init__(self, *, group=None):
+        self.group = group
+        self.stream = None
+        self.streams_made = 0
+        _FakeParallelState.instances.append(self)
+
+    def make_stream(self, device):
+        self.streams_made += 1
+        self.stream = object()
+
+
+@pytest.fixture(autouse=True)
+def _reset_process_state():
+    usp_module._PROCESS_STATE = None
+    _FakeParallelState.instances.clear()
+    yield
+    usp_module._PROCESS_STATE = None
+    _FakeParallelState.instances.clear()
 
 
 def _parallel_config(**overrides):
     return replace(_ParallelConfigStub(), **overrides)
 
 
-def _usp_module(usp_attention, usp_error: USPErrorType = RuntimeError) -> ModuleType:
-    module = ModuleType("mindiesd.layers.usp")
-    setattr(module, "usp_attention", usp_attention)
-    setattr(module, "USPError", usp_error)
-    # Mirror the real MindIE-SD hierarchy: USPNotSupported is the capability
-    # signal eligible for fallback; shape/topology errors are contract bugs and
-    # propagate.
-    setattr(module, "USPNotSupported", type("USPNotSupported", (usp_error,), {}))
-    setattr(module, "USPShapeError", type("USPShapeError", (usp_error,), {}))
+def _parallel_module(distributed_sparse_attention) -> ModuleType:
+    module = ModuleType("mindiesd.parallel")
+    setattr(module, "distributed_sparse_attention", distributed_sparse_attention)
+    setattr(module, "ParallelState", _FakeParallelState)
     return module
 
 
-def _executor(ring_rank: int = 0, **overrides):
+def _executor(**overrides):
     config = _parallel_config(**overrides)
     groups = _SPGroupsStub(
         ulysses_group=object(),
         ring_group=object(),
-        ring_rank=ring_rank,
     )
     return AscendUSPExecutor(
         sp_group=groups,
@@ -64,6 +88,49 @@ def _executor(ring_rank: int = 0, **overrides):
         ring_degree=config.ring_degree,
         allgather_degree=config.allgather_degree,
         ulysses_mode=config.ulysses_mode,
+    )
+
+
+# Geometry: 8 ranks, packed S=1224 rows = 100 prefix + 8x128 video + 100 pad.
+_TXT, _T, _H, _W = 100, 8, 16, 8
+_LOCAL_ROWS = 153  # 1224 / 8
+_USED = _TXT + _T * _H * _W  # 1124
+
+
+def _sparse_plan():
+    return {
+        "spans": [{"start": _TXT, "latent_shape": [_T, _H, _W]}],
+        "used_len": _USED,
+        "sparsity": 0.8,
+    }
+
+
+def _h3_metadata():
+    return AttentionMetadata(
+        extra={
+            # Single-request H3 packing is [0, used, packed_total]: one real
+            # document plus a padding-tail document.
+            "cu_seqlens_q": torch.tensor([0, _USED, _USED + 100], dtype=torch.int32),
+            "max_seqlen_q": _USED,
+            "valid_kv_length": _USED,
+            "num_requests": 1,
+            "npu_attn_varlen": True,
+        }
+    )
+
+
+def _try(executor, sparse_plan=None, metadata=None):
+    return executor.try_forward(
+        torch.randn(1, _LOCAL_ROWS, 4, 8),
+        torch.randn(1, _LOCAL_ROWS, 4, 8),
+        torch.randn(1, _LOCAL_ROWS, 4, 8),
+        attn_metadata=metadata,
+        backend_name="RAINFUSION_ATTN",
+        causal=False,
+        softmax_scale=8**-0.5,
+        scatter_dim=2,
+        gather_dim=1,
+        sparse_plan=sparse_plan,
     )
 
 
@@ -77,64 +144,131 @@ def test_parallel_config_exposes_technical_usp_switch():
     assert config.enable_usp is True
 
 
-def test_executor_maps_vllm_owned_state_to_explicit_mindie_contract(monkeypatch):
+def test_executor_maps_omni_state_to_mindiesd_parallel_contract(monkeypatch):
+    executor = _executor(ulysses_degree=8)
+    dsa = Mock(return_value=torch.full((1, _LOCAL_ROWS, 4, 8), 7.0))
+    monkeypatch.setattr(executor, "_load_parallel_module", lambda: _parallel_module(dsa))
+
+    output = _try(executor, sparse_plan=_sparse_plan(), metadata=_h3_metadata())
+
+    assert output is dsa.return_value
+    q, k, v, spans = dsa.call_args.args
+    assert q.shape == k.shape == v.shape == (1, _LOCAL_ROWS, 4, 8)
+    assert spans == [{"start": _TXT, "latent_shape": [_T, _H, _W]}]
+    kwargs = dsa.call_args.kwargs
+    assert kwargs["group"] is executor.sp_group.ulysses_group
+    assert kwargs["scale"] == pytest.approx(8**-0.5)
+    assert kwargs["sparsity"] == 0.8
+    assert kwargs["used_len"] == _USED
+    # The process-wide ParallelState is passed so the chain reuses one stream.
+    assert kwargs["state"] is _FakeParallelState.instances[0]
+
+
+def test_process_state_is_shared_and_stream_made_once(monkeypatch):
+    executor_a = _executor(ulysses_degree=8)
+    executor_b = _executor(ulysses_degree=8)
+    dsa = Mock(return_value=torch.zeros(1, _LOCAL_ROWS, 4, 8))
+    module = _parallel_module(dsa)
+    monkeypatch.setattr(executor_a, "_load_parallel_module", lambda: module)
+    monkeypatch.setattr(executor_b, "_load_parallel_module", lambda: module)
+
+    _try(executor_a, sparse_plan=_sparse_plan(), metadata=_h3_metadata())
+    _try(executor_b, sparse_plan=_sparse_plan(), metadata=_h3_metadata())
+
+    # Two layers, one ParallelState, one stream: the chain's one-issuer
+    # discipline depends on it.
+    assert len(_FakeParallelState.instances) == 1
+    assert _FakeParallelState.instances[0].streams_made == 1
+    assert dsa.call_args_list[0].kwargs["state"] is dsa.call_args_list[1].kwargs["state"]
+
+
+def test_dense_forward_without_sparse_plan_declines(monkeypatch):
     executor = _executor()
-    usp_attention = Mock(return_value=torch.full((1, 3, 4, 8), 7.0))
-    module = _usp_module(usp_attention)
-    monkeypatch.setattr(executor, "_load_usp_module", lambda: module)
+    dsa = Mock(return_value=torch.zeros(1, _LOCAL_ROWS, 4, 8))
+    monkeypatch.setattr(executor, "_load_parallel_module", lambda: _parallel_module(dsa))
 
-    query = torch.randn(1, 3, 4, 8)
-    key = torch.randn(1, 3, 4, 8)
-    value = torch.randn(1, 3, 4, 8)
-    metadata = AttentionMetadata()
-
-    output = executor.try_forward(
-        query,
-        key,
-        value,
-        attn_metadata=metadata,
-        backend_name="FLASH_ATTN",
-        causal=False,
-        softmax_scale=8**-0.5,
-        scatter_dim=2,
-        gather_dim=1,
-    )
-
-    assert output is usp_attention.return_value
-    usp_attention.assert_called_once_with(
-        query,
-        key,
-        value,
-        ulysses_group=executor.sp_group.ulysses_group,
-        kv_gather_group=executor.sp_group.ring_group,
-    )
+    assert _try(executor, sparse_plan=None, metadata=_h3_metadata()) is None
+    dsa.assert_not_called()
 
 
-def test_executor_maps_pure_ring_to_kv_gather(monkeypatch):
-    executor = _executor(ulysses_degree=1, ring_degree=2)
-    usp_attention = Mock(return_value=torch.zeros(1, 3, 4, 8))
+def test_missing_parallel_module_declines():
+    executor = _executor()
+    executor._parallel_module = None
+    executor._load_attempted = True  # pretend the import already failed
+
+    assert _try(executor, sparse_plan=_sparse_plan(), metadata=_h3_metadata()) is None
+
+
+def test_loader_rejects_module_without_parallel_chain(monkeypatch):
+    executor = _executor()
     monkeypatch.setattr(
-        executor,
-        "_load_usp_module",
-        lambda: _usp_module(usp_attention),
-    )
-    query = torch.randn(1, 3, 4, 8)
-
-    executor.try_forward(
-        query,
-        query,
-        query,
-        attn_metadata=None,
-        backend_name="FLASH_ATTN",
-        causal=False,
-        softmax_scale=8**-0.5,
-        scatter_dim=2,
-        gather_dim=1,
+        "importlib.import_module",
+        lambda name: ModuleType("mindiesd.parallel"),  # no distributed_sparse_attention
     )
 
-    kwargs = usp_attention.call_args.kwargs
-    assert kwargs["ulysses_group"] is None
-    assert kwargs["kv_gather_group"] is executor.sp_group.ring_group
+    assert executor._load_parallel_module() is None
+
+
+@pytest.mark.parametrize(
+    ("executor_overrides", "call_overrides", "metadata", "sparse_plan"),
+    [
+        # Dense backend: the parallel chain has no dense arm.
+        ({}, {"backend_name": "FLASH_ATTN"}, None, _sparse_plan()),
+        # Pure Ulysses only: no ring / allgather composition, and SP must be on.
+        ({"ring_degree": 2}, {}, None, _sparse_plan()),
+        ({"allgather_degree": 2}, {}, None, _sparse_plan()),
+        ({"ulysses_degree": 1, "ring_degree": 1}, {}, None, _sparse_plan()),
+        ({}, {"causal": True}, None, _sparse_plan()),
+        ({}, {"scatter_dim": 1}, None, _sparse_plan()),
+        ({}, {}, AttentionMetadata(joint_query=torch.zeros(1, 1, 4, 8)), _sparse_plan()),
+        ({}, {}, AttentionMetadata(attn_mask=torch.ones(1, 3, dtype=torch.bool)), _sparse_plan()),
+        ({}, {}, AttentionMetadata(full_attn_spans=[[(0, 1)]]), _sparse_plan()),
+        ({}, {}, AttentionMetadata(extra={"kv_cache_dtype": "fp8"}), _sparse_plan()),
+        # Multi-request step-mode batches cannot be expressed by one span set.
+        ({}, {}, AttentionMetadata(extra={"num_requests": 2}), _sparse_plan()),
+    ],
+)
+def test_executor_declines_what_the_chain_cannot_express(
+    monkeypatch,
+    executor_overrides,
+    call_overrides,
+    metadata,
+    sparse_plan,
+):
+    executor = _executor(**executor_overrides)
+    dsa = Mock(return_value=torch.zeros(1, _LOCAL_ROWS, 4, 8))
+    monkeypatch.setattr(executor, "_load_parallel_module", lambda: _parallel_module(dsa))
+    call = {
+        "attn_metadata": metadata,
+        "backend_name": "RAINFUSION_ATTN",
+        "causal": False,
+        "softmax_scale": 8**-0.5,
+        "scatter_dim": 2,
+        "gather_dim": 1,
+        "sparse_plan": sparse_plan,
+    }
+    call.update(call_overrides)
+
+    assert (
+        executor.try_forward(
+            torch.randn(1, _LOCAL_ROWS, 4, 8),
+            torch.randn(1, _LOCAL_ROWS, 4, 8),
+            torch.randn(1, _LOCAL_ROWS, 4, 8),
+            **call,
+        )
+        is None
+    )
+    dsa.assert_not_called()
+
+
+def test_mindiesd_errors_propagate(monkeypatch):
+    """The parallel chain has no structured capability exception: errors are real."""
+    executor = _executor(ulysses_degree=8)
+    dsa = Mock(side_effect=RuntimeError("stale state"))
+    monkeypatch.setattr(executor, "_load_parallel_module", lambda: _parallel_module(dsa))
+
+    with pytest.raises(RuntimeError, match="stale state"):
+        _try(executor, sparse_plan=_sparse_plan(), metadata=_h3_metadata())
 
 
 def test_attention_delegates_before_native_sequence_parallel_collectives():
@@ -150,7 +284,7 @@ def test_attention_delegates_before_native_sequence_parallel_collectives():
     layer._disable_kv_quant = False
     layer._kv_cache_skip_steps = None
     layer._kv_cache_skip_layers = None
-    layer.attn_backend = Mock(get_name=Mock(return_value="FLASH_ATTN"))
+    layer.attn_backend = Mock(get_name=Mock(return_value="RAINFUSION_ATTN"))
     # No sparse-plan resolver on this backend (spec=[] keeps getattr at None).
     layer.attention = Mock(spec=[])
     layer.causal = False
@@ -193,287 +327,3 @@ def test_attention_does_not_delegate_outside_sp_sharded_region():
     layer._forward_impl(query, query, query)
 
     layer._usp_executor.try_forward.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    ("executor_overrides", "call_overrides", "metadata"),
-    [
-        ({}, {"backend_name": "TORCH_SDPA"}, None),
-        ({}, {"causal": True}, None),
-        ({}, {"softmax_scale": 0.25}, None),
-        ({"ulysses_mode": "advanced_uaa"}, {}, None),
-        ({"ulysses_degree": 1, "ring_degree": 1, "allgather_degree": 2}, {}, None),
-        ({}, {}, AttentionMetadata(joint_query=torch.zeros(1, 1, 4, 8))),
-        ({}, {}, AttentionMetadata(attn_mask=torch.ones(1, 3, dtype=torch.bool))),
-        ({}, {}, AttentionMetadata(full_attn_spans=[[(0, 1)]])),
-        ({}, {}, AttentionMetadata(extra={"kv_cache_dtype": "fp8"})),
-    ],
-)
-def test_executor_skips_semantics_not_covered_by_mindie(
-    monkeypatch,
-    executor_overrides,
-    call_overrides,
-    metadata,
-):
-    executor = _executor(**executor_overrides)
-    usp_attention = Mock(return_value=torch.zeros(1, 3, 4, 8))
-    monkeypatch.setattr(
-        executor,
-        "_load_usp_module",
-        lambda: _usp_module(usp_attention),
-    )
-    query = torch.randn(1, 3, 4, 8)
-    call = {
-        "attn_metadata": metadata,
-        "backend_name": "FLASH_ATTN",
-        "causal": False,
-        "softmax_scale": 8**-0.5,
-        "scatter_dim": 2,
-        "gather_dim": 1,
-    }
-    call.update(call_overrides)
-
-    assert executor.try_forward(query, query, query, **call) is None
-    usp_attention.assert_not_called()
-
-
-def test_executor_falls_back_only_for_structured_mindie_errors(monkeypatch):
-    class USPError(RuntimeError):
-        pass
-
-    executor = _executor()
-    module = _usp_module(Mock(), USPError)
-    usp_attention = Mock(side_effect=module.USPNotSupported("unsupported shape"))
-    monkeypatch.setattr(
-        executor,
-        "_load_usp_module",
-        lambda: module,
-    )
-    module.usp_attention = usp_attention
-    query = torch.randn(1, 3, 4, 8)
-
-    assert (
-        executor.try_forward(
-            query,
-            query,
-            query,
-            attn_metadata=None,
-            backend_name="FLASH_ATTN",
-            causal=False,
-            softmax_scale=8**-0.5,
-            scatter_dim=2,
-            gather_dim=1,
-        )
-        is None
-    )
-
-    # Shape/topology contract violations are bugs, not capability signals.
-    usp_attention.side_effect = module.USPShapeError("broken geometry")
-    with pytest.raises(module.USPShapeError, match="broken geometry"):
-        executor.try_forward(
-            query,
-            query,
-            query,
-            attn_metadata=None,
-            backend_name="FLASH_ATTN",
-            causal=False,
-            softmax_scale=8**-0.5,
-            scatter_dim=2,
-            gather_dim=1,
-        )
-
-    usp_attention.side_effect = ValueError("programming error")
-    with pytest.raises(ValueError, match="programming error"):
-        executor.try_forward(
-            query,
-            query,
-            query,
-            attn_metadata=None,
-            backend_name="FLASH_ATTN",
-            causal=False,
-            softmax_scale=8**-0.5,
-            scatter_dim=2,
-            gather_dim=1,
-        )
-
-
-# --- USP + RainFusion (KV-AllGather sparse) extension -------------------------
-
-# Geometry: 8 ranks (usp4 x cp2), packed S=1224 rows = 100 prefix + 8x128 video
-# + 100 pad; the CP boundary at S/2=612 lands exactly on frame 4.
-_TXT, _T, _H, _W = 100, 8, 16, 8
-_FRAME_ROWS = _H * _W  # 128
-_LOCAL_ROWS = 153  # 1224 / 8
-_USED = _TXT + _T * _FRAME_ROWS  # 1124
-
-
-def _sparse_plan():
-    return {
-        "sparse": "rf_v3",
-        "sparsity": 0.8,
-        "sparse_precision": "mix",
-        "txt_len_kv": _TXT,
-        "latent_shape_kv": [_T, _H, _W],
-        "kv_used_len": _USED,
-    }
-
-
-def _h3_metadata():
-    return AttentionMetadata(
-        extra={
-            # Single-request H3 packing is [0, used, packed_total]: one real
-            # document plus a padding-tail document.
-            "cu_seqlens_q": torch.tensor([0, _USED, _USED + 100], dtype=torch.int32),
-            "cu_seqlens_k": torch.tensor([0, _USED, _USED + 100], dtype=torch.int32),
-            "max_seqlen_q": _USED,
-            "max_seqlen_k": _USED,
-            "valid_kv_length": _USED,
-            "num_requests": 1,
-            "npu_attn_varlen": True,
-        }
-    )
-
-
-def _try(executor, sparse_plan=None, metadata=None):
-    return executor.try_forward(
-        torch.randn(1, _LOCAL_ROWS, 4, 8),
-        torch.randn(1, _LOCAL_ROWS, 4, 8),
-        torch.randn(1, _LOCAL_ROWS, 4, 8),
-        attn_metadata=metadata,
-        backend_name="RAINFUSION_ATTN",
-        causal=False,
-        softmax_scale=8**-0.5,
-        scatter_dim=2,
-        gather_dim=1,
-        sparse_plan=sparse_plan,
-    )
-
-
-def test_rainfusion_backend_is_eligible_and_dense_consumes_kv_used_len(monkeypatch):
-    executor = _executor(ulysses_degree=4, ring_degree=2)
-    usp_attention = Mock(return_value=torch.zeros(1, _LOCAL_ROWS, 4, 8))
-    monkeypatch.setattr(executor, "_load_usp_module", lambda: _usp_module(usp_attention))
-
-    out = _try(executor, metadata=_h3_metadata())
-
-    assert out is usp_attention.return_value
-    kwargs = usp_attention.call_args.kwargs
-    assert kwargs["kv_used_len"] == _USED
-    assert "sparse" not in kwargs
-    # H3 packed extras are consumed, not rejected.
-    assert kwargs["ulysses_group"] is executor.sp_group.ulysses_group
-    assert kwargs["kv_gather_group"] is executor.sp_group.ring_group
-
-
-def test_sparse_plan_first_segment_geometry(monkeypatch):
-    executor = _executor(ring_rank=0, ulysses_degree=4, ring_degree=2)
-    usp_attention = Mock(return_value=torch.zeros(1, _LOCAL_ROWS, 4, 8))
-    monkeypatch.setattr(executor, "_load_usp_module", lambda: _usp_module(usp_attention))
-
-    _try(executor, sparse_plan=_sparse_plan(), metadata=_h3_metadata())
-
-    kwargs = usp_attention.call_args.kwargs
-    assert kwargs["sparse"] == "rf_v3"
-    assert kwargs["sparsity"] == 0.8
-    assert kwargs["sparse_precision"] == "mix"
-    assert kwargs["q_row_offset"] == 0
-    assert kwargs["txt_len_q"] == _TXT
-    assert kwargs["txt_len_kv"] == _TXT
-    assert "latent_shape_q" not in kwargs  # derived MindIE-side
-    assert kwargs["latent_shape_kv"] == [_T, _H, _W]
-    assert kwargs["kv_used_len"] == _USED
-
-
-def test_sparse_plan_second_segment_geometry(monkeypatch):
-    executor = _executor(ring_rank=1, ulysses_degree=4, ring_degree=2)
-    usp_attention = Mock(return_value=torch.zeros(1, _LOCAL_ROWS, 4, 8))
-    monkeypatch.setattr(executor, "_load_usp_module", lambda: _usp_module(usp_attention))
-
-    _try(executor, sparse_plan=_sparse_plan(), metadata=_h3_metadata())
-
-    kwargs = usp_attention.call_args.kwargs
-    assert kwargs["q_row_offset"] == 612
-    assert kwargs["txt_len_q"] == 0
-    assert kwargs["txt_len_kv"] == _TXT
-
-
-def test_sparse_plan_mid_frame_boundary_passes_through(monkeypatch):
-    executor = _executor(ring_rank=0, ulysses_degree=4, ring_degree=2)
-    usp_attention = Mock(return_value=torch.zeros(1, 154, 4, 8))
-    monkeypatch.setattr(executor, "_load_usp_module", lambda: _usp_module(usp_attention))
-
-    # 154 local rows -> S=1232 -> boundary at 616, which cuts frame 4 mid-way.
-    # MindIE splits the partial-frame rows to dense FA, so this must NOT raise.
-    out = executor.try_forward(
-        torch.randn(1, 154, 4, 8),
-        torch.randn(1, 154, 4, 8),
-        torch.randn(1, 154, 4, 8),
-        attn_metadata=_h3_metadata(),
-        backend_name="RAINFUSION_ATTN",
-        causal=False,
-        softmax_scale=8**-0.5,
-        scatter_dim=2,
-        gather_dim=1,
-        sparse_plan=_sparse_plan(),
-    )
-
-    assert out is usp_attention.return_value
-    kwargs = usp_attention.call_args.kwargs
-    assert kwargs["q_row_offset"] == 0
-    assert kwargs["kv_used_len"] == _USED
-
-
-def test_sparse_plan_multi_request_packing_raises(monkeypatch):
-    executor = _executor(ulysses_degree=4, ring_degree=2)
-    usp_attention = Mock(return_value=torch.zeros(1, _LOCAL_ROWS, 4, 8))
-    monkeypatch.setattr(executor, "_load_usp_module", lambda: _usp_module(usp_attention))
-
-    metadata = AttentionMetadata(
-        extra={
-            "cu_seqlens_q": torch.tensor([0, 1000, 2000], dtype=torch.int32),
-            "valid_kv_length": 2000,
-            "num_requests": 2,
-        }
-    )
-    with pytest.raises(ValueError, match="single-request"):
-        _try(executor, sparse_plan=_sparse_plan(), metadata=metadata)
-    usp_attention.assert_not_called()
-
-
-def test_single_request_three_entry_cu_seqlens_is_not_multi_request(monkeypatch):
-    # Regression: H3 single-request packing carries a padding-tail document, so
-    # cu_seqlens has 3 entries. The multi-request gate must read num_requests,
-    # not the cu_seqlens length.
-    executor = _executor(ulysses_degree=4, ring_degree=2)
-    usp_attention = Mock(return_value=torch.zeros(1, _LOCAL_ROWS, 4, 8))
-    monkeypatch.setattr(executor, "_load_usp_module", lambda: _usp_module(usp_attention))
-
-    out = _try(executor, metadata=_h3_metadata())
-
-    assert out is usp_attention.return_value
-    assert usp_attention.call_args.kwargs["kv_used_len"] == _USED
-
-
-def test_kv_used_len_falls_back_to_max_seqlen_q(monkeypatch):
-    executor = _executor(ulysses_degree=4, ring_degree=2)
-    usp_attention = Mock(return_value=torch.zeros(1, _LOCAL_ROWS, 4, 8))
-    monkeypatch.setattr(executor, "_load_usp_module", lambda: _usp_module(usp_attention))
-
-    metadata = AttentionMetadata(extra={"max_seqlen_q": 777})
-    _try(executor, metadata=metadata)
-
-    assert usp_attention.call_args.kwargs["kv_used_len"] == 777
-
-
-def test_pure_ulysses_sparse_plan_uses_full_grid(monkeypatch):
-    # ring_degree=1: no KV gather, the whole sequence is local after the A2A.
-    executor = _executor(ring_rank=0, ulysses_degree=8, ring_degree=1)
-    usp_attention = Mock(return_value=torch.zeros(1, _LOCAL_ROWS, 4, 8))
-    monkeypatch.setattr(executor, "_load_usp_module", lambda: _usp_module(usp_attention))
-
-    _try(executor, sparse_plan=_sparse_plan(), metadata=_h3_metadata())
-
-    kwargs = usp_attention.call_args.kwargs
-    assert kwargs["kv_gather_group"] is None
-    assert kwargs["q_row_offset"] == 0
-    assert kwargs["txt_len_q"] == _TXT

@@ -349,24 +349,29 @@ def test_resolve_usp_sparse_plan_single_span():
     plan = impl.resolve_usp_sparse_plan(make_metadata(ALIGNED_GRID))
 
     assert plan == {
-        "sparse": "rf_v3",
+        "spans": [{"start": PREFIX_ROWS, "latent_shape": list(ALIGNED_GRID)}],
+        "used_len": PREFIX_ROWS + 59520,
         "sparsity": 0.8,
-        "sparse_precision": "mix",
-        "txt_len_kv": PREFIX_ROWS,
-        "latent_shape_kv": list(ALIGNED_GRID),
-        "kv_used_len": PREFIX_ROWS + 59520,
     }
+
+
+def test_resolve_usp_sparse_plan_requires_mix_precision():
+    # The mindiesd.parallel chain implements exactly the quantized EagleQBSA
+    # contract (Q/K INT8 + V FP8); any other precision stays on the native path.
+    assert make_impl(sparsity=0.8, precision="bf16").resolve_usp_sparse_plan(make_metadata(ALIGNED_GRID)) is None
+    assert make_impl(sparsity=0.8, precision="fp8").resolve_usp_sparse_plan(make_metadata(ALIGNED_GRID)) is None
 
 
 def test_resolve_usp_sparse_plan_dense_forwards_return_none():
     # sparsity=0 -> RainFusion disabled -> no plan.
-    assert make_impl(sparsity=0.0).resolve_usp_sparse_plan(make_metadata(ALIGNED_GRID)) is None
+    assert make_impl(sparsity=0.0, precision="mix").resolve_usp_sparse_plan(make_metadata(ALIGNED_GRID)) is None
     # Sparse-capable impl but a forward without a video layout stays dense.
-    assert make_impl().resolve_usp_sparse_plan(AttentionMetadata()) is None
-    assert make_impl().resolve_usp_sparse_plan(None) is None
+    assert make_impl(precision="mix").resolve_usp_sparse_plan(AttentionMetadata()) is None
+    assert make_impl(precision="mix").resolve_usp_sparse_plan(None) is None
 
 
-def test_resolve_usp_sparse_plan_multi_span_raises():
+def test_resolve_usp_sparse_plan_multi_span_passes_through():
+    # Ref2VA multi-span layouts are native to the chain's multi-span geometry.
     layout = VideoTokenLayout(
         used_len=12000,
         video_spans=(
@@ -374,14 +379,23 @@ def test_resolve_usp_sparse_plan_multi_span_raises():
             VideoTokenSpan(start=5000, latent_grid=(4, 16, 64), role="target"),
         ),
     )
-    with pytest.raises(ValueError, match="multi-span"):
-        make_impl().resolve_usp_sparse_plan(AttentionMetadata(extra={"max_seqlen_q": 12000}, video_layout=layout))
+    plan = make_impl(precision="mix").resolve_usp_sparse_plan(
+        AttentionMetadata(extra={"max_seqlen_q": 12000}, video_layout=layout)
+    )
+
+    assert plan == {
+        "spans": [
+            {"start": 128, "latent_shape": [4, 16, 64]},
+            {"start": 5000, "latent_shape": [4, 16, 64]},
+        ],
+        "used_len": 12000,
+        "sparsity": 0.8,
+    }
 
 
-def test_resolve_usp_sparse_plan_single_target_span_maps_to_single_span():
+def test_resolve_usp_sparse_plan_single_target_span():
     # H3 publishes a plain t2va video through the Ref2VA span contract as one
-    # target span; the USP path must read it as the legacy [prefix | video]
-    # geometry instead of rejecting it as Ref2VA.
+    # target span; it maps to the chain's single-span [prefix | video] geometry.
     video_rows = ALIGNED_GRID[0] * ALIGNED_GRID[1] * ALIGNED_GRID[2]
     layout = VideoTokenLayout(
         used_len=PREFIX_ROWS + video_rows,
@@ -392,30 +406,15 @@ def test_resolve_usp_sparse_plan_single_target_span_maps_to_single_span():
     plan = make_impl(sparsity=0.8, precision="mix").resolve_usp_sparse_plan(metadata)
 
     assert plan == {
-        "sparse": "rf_v3",
+        "spans": [{"start": PREFIX_ROWS, "latent_shape": list(ALIGNED_GRID)}],
+        "used_len": PREFIX_ROWS + video_rows,
         "sparsity": 0.8,
-        "sparse_precision": "mix",
-        "txt_len_kv": PREFIX_ROWS,
-        "latent_shape_kv": list(ALIGNED_GRID),
-        "kv_used_len": PREFIX_ROWS + video_rows,
     }
-
-
-def test_resolve_usp_sparse_plan_single_span_not_tail_raises():
-    # A lone span that does not tail the packed document has rows the legacy
-    # [prefix | video] geometry cannot describe; that must be a loud error, not
-    # a silent dense fallback (the native ring fallback is unusable here).
-    layout = VideoTokenLayout(
-        used_len=12000,
-        video_spans=(VideoTokenSpan(start=128, latent_grid=(4, 16, 64), role="target"),),
-    )
-    with pytest.raises(ValueError, match="document tail"):
-        make_impl().resolve_usp_sparse_plan(AttentionMetadata(extra={"max_seqlen_q": 12000}, video_layout=layout))
 
 
 def test_resolve_usp_sparse_plan_invalid_multi_span_stays_dense():
     # Layouts that never produce a plan (dense on the native path too) must not
-    # raise: the USP executor runs them through the dense path.
+    # raise: the executor declines them and the native path runs them dense.
     layout = VideoTokenLayout(
         used_len=12000,
         video_spans=(
@@ -424,7 +423,9 @@ def test_resolve_usp_sparse_plan_invalid_multi_span_stays_dense():
         ),
     )
     assert (
-        make_impl().resolve_usp_sparse_plan(AttentionMetadata(extra={"max_seqlen_q": 12000}, video_layout=layout))
+        make_impl(precision="mix").resolve_usp_sparse_plan(
+            AttentionMetadata(extra={"max_seqlen_q": 12000}, video_layout=layout)
+        )
         is None
     )
 
@@ -435,8 +436,10 @@ def test_ring_gate_rejects_ring_without_usp():
         make_impl()
 
 
-def test_ring_gate_allows_ring_as_usp_kv_gather():
+def test_ring_gate_rejects_ring_even_with_usp():
+    # The executor takes pure Ulysses topologies only (the mindiesd.parallel
+    # chain has no KV-gather group), so enable_usp does not rescue ring.
     od_config = types.SimpleNamespace(parallel_config=types.SimpleNamespace(ring_degree=2, enable_usp=True))
-    with set_current_diffusion_config(od_config):
-        make_impl()  # ring group is the KV-AllGather group under enable_usp
+    with set_current_diffusion_config(od_config), pytest.raises(ValueError, match="not compatible with ring"):
+        make_impl()
 

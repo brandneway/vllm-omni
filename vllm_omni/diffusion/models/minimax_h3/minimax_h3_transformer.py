@@ -542,7 +542,7 @@ class MiniMaxH3Attention(nn.Module):
         attn_mask = None
         mask_free_packed_padding = False
         # A USP executor owns the SP collectives before any ring dispatch and
-        # consumes the packed metadata without a mask (via kv_used_len), so
+        # consumes the packed metadata without a mask (via used_len), so
         # when it is present the ring-specific mask behavior does not apply.
         usp_active = getattr(self.attention, "_usp_executor", None) is not None
         use_ring = _ring_sequence_parallel_is_active(self.attention) and not usp_active
@@ -581,9 +581,9 @@ class MiniMaxH3Attention(nn.Module):
             # query-length check. Ring consumes valid_kv_length directly and
             # trims the circulated K/V blocks instead.
             # The USP executor owns the SP collectives and excludes padding by
-            # KV slicing (valid_kv_length -> kv_used_len) inside MindIE-SD, so
-            # the padding mask must never be materialized for it — independent
-            # of what the configured backend advertises.
+            # the used-length contract (valid_kv_length -> used_len) inside
+            # MindIE-SD, so the padding mask must never be materialized for it
+            # — independent of what the configured backend advertises.
             if used < packed_total and not no_mask and not use_ring and not usp_active:
                 attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(

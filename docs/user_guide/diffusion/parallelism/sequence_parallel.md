@@ -87,39 +87,45 @@ omni = Omni(
 
 ### Optional unified SP executor (Ascend NPU)
 
-On Ascend NPU, vLLM-Omni can delegate the complete Ulysses and ring-group
-attention hot path to the platform's unified sequence-parallel (USP) executor.
-The public attention backend remains `FLASH_ATTN`; this option only replaces
-its sequence-parallel communication and local FA execution. The Ascend
-implementation is provided by MindIE-SD, and receives the configured ring
-process group as `kv_gather_group`.
+On Ascend NPU, vLLM-Omni can delegate the sequence-parallel attention hot path
+to the platform's unified sequence-parallel (USP) executor. The Ascend
+implementation is provided by MindIE-SD's `mindiesd.parallel` package — the
+multi-rank form of the quantized block-sparse attention chain (Q/K per-block
+INT8, V per-channel FP8, the EagleQBSA device operator), which is what
+`RAINFUSION_ATTN` with `precision="mix"` already executes on A5 hardware.
 
 ```python
 omni = Omni(
-    model="Qwen/Qwen-Image",
+    model="MiniMax/MiniMax-H3",
     parallel_config=DiffusionParallelConfig(
-        ulysses_degree=2,
-        ring_degree=2,
+        ulysses_degree=8,
         enable_usp=True,
     ),
 )
 ```
 
-The initial integration intentionally exposes only the technical `enable_usp`
-switch. vLLM-Omni passes its Ulysses group and its ring group (as
-`kv_gather_group`) while the platform executor uses its own defaults for
-chunking, communication dtype, overlap, and FA backend selection.
+The integration intentionally exposes only the technical `enable_usp` switch.
+vLLM-Omni passes its Ulysses process group and the per-forward sparse geometry
+(spans, used length, sparsity) translated from the RainFusion plan; the
+MindIE-SD chain uses its own defaults for chunking, communication packing, and
+overlap.
 
-The Ascend implementation requires a MindIE-SD build that provides
-`mindiesd.layers.usp`. If the package is absent or MindIE-SD raises one of its
-structured `USPError` capability exceptions, vLLM-Omni logs the reason once
-and uses its existing native Ulysses/Ring implementation. Unexpected errors
-are not hidden.
+Scope of the current integration:
 
-The first integration supports strict, non-causal, dense `FLASH_ATTN`
-execution. Advanced UAA, Scheduler-paged KV, piecewise/packed attention,
-attention masks, custom softmax scales, and joint-query attention remain on
-the native path.
+- **Only** sparse-eligible `RAINFUSION_ATTN` calls with `precision="mix"` are
+  delegated. Dense forwards, other precisions, and all other backends fall
+  back to vLLM-Omni's native Ulysses/Ring implementation.
+- Pure Ulysses topologies only (`ring_degree=1`, `allgather_degree=1`): the
+  MindIE-SD chain takes a single process group and has no KV-gather group to
+  compose with.
+- Single-request packed sequences only; padding is excluded by the used-length
+  contract inside MindIE-SD, so no padding mask is materialized.
+
+The executor requires a MindIE-SD build that provides `mindiesd.parallel`. If
+the package is absent, vLLM-Omni logs the reason once and uses its existing
+native Ulysses implementation. Errors raised by the chain itself (geometry,
+state mismatches) propagate — they are contract violations, not capability
+signals.
 
 ---
 

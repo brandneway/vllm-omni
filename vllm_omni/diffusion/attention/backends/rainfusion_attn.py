@@ -234,18 +234,16 @@ class RainFusionAttentionImpl(AttentionImpl):
         if getattr(parallel_config, "allgather_degree", 1) > 1:
             raise ValueError("RAINFUSION_ATTN requires full Q/K/V sequences; AllGather-KV SP is unsupported.")
         ring_degree = getattr(parallel_config, "ring_degree", 1)
-        if ring_degree > 1 and not getattr(parallel_config, "enable_usp", False):
+        if ring_degree > 1:
             # Ring gives each rank a slice of the sequence, so block selection
             # would score only local keys and the layer bypasses the backend
-            # entirely (see Attention._run_ring_attention).
+            # entirely (see Attention._run_ring_attention). The USP executor
+            # does not rescue this: it takes pure Ulysses topologies only.
             raise ValueError(
                 "RAINFUSION_ATTN is not compatible with ring sequence parallelism "
                 f"(ring_degree={ring_degree}): rf_v2 needs the whole key sequence to rank "
                 "blocks. Use Ulysses SP (ring_degree=1) instead."
             )
-        # With enable_usp=True the ring group is used as the USP executor's
-        # KV-AllGather group: every rank materializes the whole key sequence
-        # before the sparse kernel, so the whole-key requirement still holds.
 
     def forward_cuda(
         self,
@@ -281,51 +279,36 @@ class RainFusionAttentionImpl(AttentionImpl):
         return self._forward_sparse_npu(query, key, value, plan, attn_metadata)
 
     def resolve_usp_sparse_plan(self, attn_metadata: AttentionMetadata | None) -> dict[str, Any] | None:
-        """Translate the per-forward RainFusion plan into explicit MindIE USP sparse kwargs.
+        """Translate the per-forward RainFusion plan into MindIE-SD parallel-chain kwargs.
 
         Used by the platform USP executor (enable_usp), which owns the SP
-        collectives and invokes ``mindiesd.layers.usp.usp_attention`` with the
-        local Q shard against the KV-AllGathered full sequence. Returns None when
-        this forward stays dense (same eligibility as the native path); the
-        executor then runs the dense USP path. Raises for sparse-eligible
-        layouts the USP path cannot express yet, because the native fallback
-        (true ring attention) is not usable in this configuration.
+        collectives and invokes ``mindiesd.parallel.distributed_sparse_attention``.
+        That chain implements exactly one sparse contract — the quantized
+        EagleQBSA path (Q/K per-block INT8, V per-channel FP8), i.e. what
+        ``precision="mix"`` already runs on A5 — so only ``mix`` forwards are
+        translated; any other precision returns None and stays on the native
+        path. Dense-ineligible forwards likewise return None (same eligibility
+        as the native path). Multi-span Ref2VA layouts are supported natively
+        by the chain's multi-span geometry.
         """
         plan = self._resolve_plan(attn_metadata)
         if plan is None:
             return None
+        if self.rainfusion.precision != "mix":
+            return None
         if plan.video_spans:
-            # H3 publishes even a plain t2va video through the Ref2VA span
-            # contract, as one target span. A single target span that tails the
-            # packed document is exactly the legacy [prefix | video] geometry,
-            # which the USP sparse path expresses directly.
-            if len(plan.video_spans) != 1:
-                raise ValueError(
-                    "RAINFUSION_ATTN over the USP executor does not support Ref2VA multi-span video "
-                    "layouts in v1 (heterogeneous Q/KV geometry is single-span only). Serve Ref2VA with "
-                    "enable_usp=False."
-                )
-            span = plan.video_spans[0]
-            prefix_len = int(span["start"])
-            latent_shape = [int(dim) for dim in span["latent_shape"]]
-            if prefix_len + math.prod(latent_shape) != plan.used_len:
-                raise ValueError(
-                    "RAINFUSION_ATTN over the USP executor requires the target video span to be the "
-                    f"packed document tail: start={prefix_len} grid={latent_shape} does not fill "
-                    f"used_len={plan.used_len}. Serve this layout with enable_usp=False."
-                )
+            spans = [
+                {"start": int(span["start"]), "latent_shape": [int(dim) for dim in span["latent_shape"]]}
+                for span in plan.video_spans
+            ]
         else:
             if plan.prefix_len is None or plan.latent_shape is None:
                 raise ValueError("USP sparse plan requires a single-span layout with prefix_len and latent_shape.")
-            prefix_len = plan.prefix_len
-            latent_shape = list(plan.latent_shape)
+            spans = [{"start": int(plan.prefix_len), "latent_shape": [int(dim) for dim in plan.latent_shape]}]
         return {
-            "sparse": "rf_v3",
+            "spans": spans,
+            "used_len": plan.used_len,
             "sparsity": self.rainfusion.sparsity,
-            "sparse_precision": self.rainfusion.precision,
-            "txt_len_kv": prefix_len,
-            "latent_shape_kv": latent_shape,
-            "kv_used_len": plan.used_len,
         }
 
     def _resolve_plan(self, attn_metadata: AttentionMetadata | None) -> RainFusionPlan | None:

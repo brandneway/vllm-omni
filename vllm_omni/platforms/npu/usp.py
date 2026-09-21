@@ -1,12 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Ascend implementation of unified sequence-parallel attention."""
+"""Ascend unified sequence-parallel attention executor backed by MindIE-SD.
+
+The executor delegates sparse-eligible RAINFUSION_ATTN calls to
+``mindiesd.parallel.distributed_sparse_attention`` — the multi-rank form of the
+quantized block-sparse chain (Q/K per-block INT8, V per-channel FP8, the
+EagleQBSA device operator). Dense calls and every other backend return
+``None`` so the portable attention layer falls back to vLLM-Omni's native
+Ulysses/Ring implementation without duplicating collectives.
+
+Scope is deliberately narrow: pure Ulysses topologies only (a single process
+group — the MindIE-SD chain has no KV-gather group concept), single-request
+packed sequences, and the ``mix`` sparse precision (the only contract the
+parallel chain implements).
+"""
 
 from __future__ import annotations
 
 import importlib
-import math
+import threading
 from types import ModuleType
 from typing import TYPE_CHECKING, Protocol
 
@@ -17,6 +30,13 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 
 logger = init_logger(__name__)
+
+# One ParallelState per process: it owns the single long-lived collective
+# stream and the layer-invariant plan/engine caches. Creating one per layer
+# would spawn one collective-issuing side stream per layer — the exact
+# double-issuer hazard the MindIE-SD chain documents (stale a2a receives).
+_PROCESS_STATE = None
+_PROCESS_STATE_LOCK = threading.Lock()
 
 
 class SequenceParallelGroups(Protocol):
@@ -48,41 +68,47 @@ class AscendUSPExecutor:
         self.ring_degree = ring_degree
         self.allgather_degree = allgather_degree
         self.ulysses_mode = ulysses_mode
-        self._usp_module: ModuleType | None = None
+        self._parallel_module: ModuleType | None = None
         self._load_attempted = False
 
-    def _load_usp_module(self) -> ModuleType | None:
+    def _load_parallel_module(self) -> ModuleType | None:
         if self._load_attempted:
-            return self._usp_module
+            return self._parallel_module
         self._load_attempted = True
         try:
-            module = importlib.import_module("mindiesd.layers.usp")
+            module = importlib.import_module("mindiesd.parallel")
         except ImportError as exc:
             logger.warning_once(
-                "Ascend USP is enabled but mindiesd.layers.usp is unavailable; "
+                "Ascend USP is enabled but mindiesd.parallel is unavailable; "
                 "using vLLM-Omni native sequence-parallel attention: %s",
                 exc,
             )
             return None
 
-        required = ("usp_attention",)
-        error_types = ("USPError", "USPNotSupported")
-        if not all(callable(getattr(module, name, None)) for name in required) or not all(
-            isinstance(getattr(module, name, None), type) for name in error_types
+        if not callable(getattr(module, "distributed_sparse_attention", None)) or not isinstance(
+            getattr(module, "ParallelState", None), type
         ):
             logger.warning_once(
-                "Ascend USP is enabled but the installed MindIE-SD API is incompatible; "
-                "using vLLM-Omni native sequence-parallel attention."
+                "Ascend USP is enabled but the installed MindIE-SD lacks the "
+                "mindiesd.parallel sparse chain; using vLLM-Omni native "
+                "sequence-parallel attention."
             )
             return None
-        self._usp_module = module
-        logger.info_once("Using the Ascend unified sequence-parallel attention executor.")
+        self._parallel_module = module
+        logger.info_once("Using the Ascend unified sequence-parallel attention executor (mindiesd.parallel).")
         return module
 
-    def _groups(self) -> tuple[object | None, object | None]:
-        ulysses_group = self.sp_group.ulysses_group if self.ulysses_degree > 1 else None
-        kv_gather_group = self.sp_group.ring_group if self.ring_degree > 1 else None
-        return ulysses_group, kv_gather_group
+    def _process_state(self, module: ModuleType, group: object, device: torch.device):
+        """Return the one process-wide ParallelState, creating it on first use."""
+        global _PROCESS_STATE
+        with _PROCESS_STATE_LOCK:
+            if _PROCESS_STATE is None:
+                state = module.ParallelState(group=group)
+                # One long-lived collective stream for the whole process; the
+                # chain's overlap pipeline is built on it.
+                state.make_stream(device)
+                _PROCESS_STATE = state
+            return _PROCESS_STATE
 
     def _supports_call(
         self,
@@ -91,19 +117,20 @@ class AscendUSPExecutor:
         *,
         backend_name: str,
         causal: bool,
-        softmax_scale: float,
         scatter_dim: int,
         gather_dim: int,
     ) -> bool:
-        if backend_name not in ("FLASH_ATTN", "RAINFUSION_ATTN"):
+        # The MindIE-SD parallel chain is the quantized block-sparse path only;
+        # dense calls and all other backends stay on the native path.
+        if backend_name != "RAINFUSION_ATTN":
             return False
-        if self.allgather_degree > 1 or self.ulysses_degree * self.ring_degree == 1:
+        # Pure Ulysses only: the chain takes a single process group and has no
+        # KV-gather group to compose with.
+        if self.ulysses_degree <= 1 or self.ring_degree > 1 or self.allgather_degree > 1:
             return False
-        if self.ulysses_mode != "strict" or causal:
+        if causal:
             return False
         if scatter_dim != 2 or gather_dim != 1 or query.ndim != 4:
-            return False
-        if not math.isclose(float(softmax_scale), query.shape[-1] ** -0.5, rel_tol=1e-6, abs_tol=1e-8):
             return False
         if attn_metadata is None:
             return True
@@ -121,81 +148,19 @@ class AscendUSPExecutor:
             return False
         if attn_metadata.full_attn_spans is not None or attn_metadata.query_ranges is not None:
             return False
+        # The chain accepts single-request packed sequences only: the spans
+        # geometry describes one document, and padding is excluded by used_len.
+        num_requests = attn_metadata.extra.get("num_requests", 1)
+        if num_requests != 1:
+            return False
         # packed_padding / video_layout and the packed-varlen extras are
-        # consumed by the executor (kv_used_len derivation, sparse plan), not
-        # passed through blindly.
+        # consumed by the sparse plan resolver, not passed through blindly.
         unsupported_extra = {
             "gate_compress",
             "kv_cache_dtype",
             "seq_lens",
         }
         return not unsupported_extra.intersection(attn_metadata.extra)
-
-    def _resolve_kv_used_len(self, attn_metadata: AttentionMetadata | None) -> int | None:
-        """Derive the valid (non-padding) prefix length of the packed sequence."""
-        if attn_metadata is None:
-            return None
-        extra = attn_metadata.extra
-        if not extra:
-            return None
-        # A single-request H3 packing is [0, used_len, packed_total] (one real
-        # document plus a padding-tail document), so cu_seqlens length cannot
-        # distinguish it from a step-mode batch; the model publishes the host
-        # side request count instead.
-        num_requests = extra.get("num_requests", 1)
-        if num_requests != 1:
-            raise ValueError(
-                "Ascend USP execution supports single-request packed sequences in v1: "
-                f"num_requests={num_requests} (multi-request step-mode batching). "
-                "Run with enable_usp=False for batched requests."
-            )
-        used = extra.get("valid_kv_length")
-        if isinstance(used, int):
-            return used
-        max_seqlen_q = extra.get("max_seqlen_q")
-        if isinstance(max_seqlen_q, int):
-            return max_seqlen_q
-        return None
-
-    def _derive_sparse_geometry(
-        self,
-        query: torch.Tensor,
-        sparse_plan: dict,
-        kv_used_len: int,
-    ) -> dict:
-        """Map this rank's post-A2A Q segment to explicit MindIE sparse kwargs.
-
-        After the Ulysses A2A, each rank holds a contiguous ``S / ring_degree``
-        row segment of the packed sequence (the kv-gather group index selects
-        which one). All computations are host-side. Segment boundaries may cut
-        a video frame mid-way; MindIE-SD splits those rows to dense FA.
-        """
-        sp_size = self.ulysses_degree * self.ring_degree
-        s_global = query.shape[1] * sp_size
-        if s_global % self.ring_degree != 0:
-            raise ValueError(f"packed length {s_global} is not divisible by ring_degree={self.ring_degree}.")
-        segment_rows = s_global // self.ring_degree
-        half_index = int(getattr(self.sp_group, "ring_rank")) if self.ring_degree > 1 else 0
-        q_row_offset = half_index * segment_rows
-
-        prefix_len = int(sparse_plan["txt_len_kv"])
-        if q_row_offset == 0 and segment_rows < prefix_len:
-            raise ValueError(
-                f"the first CP segment ({segment_rows} rows) does not cover the prefix "
-                f"({prefix_len} rows); lower ring_degree or use a longer sequence."
-            )
-        # Whole/partial video-frame splitting happens MindIE-side: a mid-frame
-        # segment boundary is legal and only routes those rows through dense FA.
-        return {
-            "sparse": sparse_plan["sparse"],
-            "sparsity": sparse_plan["sparsity"],
-            "sparse_precision": sparse_plan["sparse_precision"],
-            "txt_len_q": prefix_len if q_row_offset == 0 else 0,
-            "txt_len_kv": prefix_len,
-            "latent_shape_kv": [int(x) for x in sparse_plan["latent_shape_kv"]],
-            "q_row_offset": q_row_offset,
-            "kv_used_len": int(kv_used_len),
-        }
 
     def try_forward(
         self,
@@ -217,13 +182,9 @@ class AscendUSPExecutor:
             attn_metadata,
             backend_name=backend_name,
             causal=causal,
-            softmax_scale=softmax_scale,
             scatter_dim=scatter_dim,
             gather_dim=gather_dim,
         ):
-            # With a hybrid topology (ulysses x ring) the native fallback cannot
-            # run packed varlen layouts — surface the decline instead of dying
-            # later inside a native collective on a length mismatch.
             logger.warning_once(
                 "Ascend USP executor declined this attention call (backend=%s); "
                 "falling back to the native sequence-parallel path.",
@@ -231,40 +192,28 @@ class AscendUSPExecutor:
             )
             return None
 
-        module = self._load_usp_module()
+        # A forward without a sparse plan is dense by definition; the parallel
+        # chain has no dense arm, so the native path takes it.
+        if sparse_plan is None:
+            return None
+
+        module = self._load_parallel_module()
         if module is None:
             return None
 
-        ulysses_group, kv_gather_group = self._groups()
+        state = self._process_state(module, self.sp_group.ulysses_group, query.device)
 
-        kv_used_len = self._resolve_kv_used_len(attn_metadata)
-        sparse_kwargs: dict = {}
-        if sparse_plan is not None:
-            if kv_used_len is None:
-                raise ValueError(
-                    "USP sparse execution needs the packed used length (valid_kv_length/max_seqlen_q) "
-                    "in attention metadata extras."
-                )
-            sparse_kwargs = self._derive_sparse_geometry(query, sparse_plan, kv_used_len)
-        elif kv_used_len is not None:
-            sparse_kwargs = {"kv_used_len": kv_used_len}
-
-        try:
-            return module.usp_attention(
-                query,
-                key,
-                value,
-                ulysses_group=ulysses_group,
-                kv_gather_group=kv_gather_group,
-                **sparse_kwargs,
-            )
-        except module.USPNotSupported as exc:
-            logger.warning_once(
-                "Ascend USP rejected the current attention contract; "
-                "using vLLM-Omni native sequence-parallel attention: %s",
-                exc,
-            )
-            return None
+        return module.distributed_sparse_attention(
+            query,
+            key,
+            value,
+            sparse_plan["spans"],
+            group=self.sp_group.ulysses_group,
+            scale=float(softmax_scale),
+            sparsity=float(sparse_plan["sparsity"]),
+            used_len=int(sparse_plan["used_len"]),
+            state=state,
+        )
 
 
 __all__ = ["AscendUSPExecutor"]

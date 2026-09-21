@@ -451,15 +451,16 @@ class Attention(nn.Module):
             if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
                 raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
 
-        # A platform USP executor owns the complete Ulysses + ring-group KV
-        # gather + FA hot path. Invoke it before Omni performs communication so
-        # one and only one implementation owns the collectives for this forward.
+        # A platform USP executor owns the complete sequence-parallel attention
+        # hot path when it supports the call. Invoke it before Omni performs
+        # communication so one and only one implementation owns the collectives
+        # for this forward.
         if self._usp_executor is not None and strategy is not self._no_parallel_strategy and not use_paged_attention:
             usp_metadata = self._with_kv_cache_dtype(attn_metadata)
             # Backends with per-forward sparsity plans (e.g. RAINFUSION_ATTN)
-            # translate their own metadata into explicit executor kwargs. The
-            # resolver raises for layouts the executor cannot express, because
-            # the native fallback is not usable for those layouts either.
+            # translate their own metadata into explicit executor kwargs; a
+            # None plan means this forward stays dense and the executor will
+            # decline it.
             plan_resolver = getattr(self.attention, "resolve_usp_sparse_plan", None)
             sparse_plan = plan_resolver(usp_metadata) if plan_resolver is not None else None
             usp_output = self._usp_executor.try_forward(
