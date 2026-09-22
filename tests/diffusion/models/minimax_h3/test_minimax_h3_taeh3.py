@@ -13,8 +13,10 @@ import torch.nn as nn
 import vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 as pipeline_module
 import vllm_omni.diffusion.models.minimax_h3.taeh3 as taeh3_module
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+    _TAEH3_CHECKPOINT_ENV,
     _TAEH3_ENABLE_ENV,
     MiniMaxH3Pipeline,
+    _resolve_taeh3_checkpoint_source,
     _resolve_taeh3_enabled,
 )
 from vllm_omni.diffusion.models.minimax_h3.taeh3 import TAEH3Decoder
@@ -188,3 +190,22 @@ def test_resolve_taeh3_enabled_precedence(monkeypatch, config, env, expected):
         monkeypatch.setenv(_TAEH3_ENABLE_ENV, env)
 
     assert _resolve_taeh3_enabled(config) is expected
+
+
+@pytest.mark.parametrize(
+    ("config", "env", "expected"),
+    [
+        ({}, None, taeh3_module.TAEH3_CHECKPOINT_URL),
+        ({}, "/models/taeh3.pth", "/models/taeh3.pth"),
+        ({}, " /models/spaced.pth ", "/models/spaced.pth"),
+        ({"taeh3_checkpoint": "/cfg/taeh3.pth"}, None, "/cfg/taeh3.pth"),
+        # An explicit config value suppresses the env escape hatch.
+        ({"taeh3_checkpoint": "/cfg/taeh3.pth"}, "/env/taeh3.pth", "/cfg/taeh3.pth"),
+    ],
+)
+def test_resolve_taeh3_checkpoint_source_precedence(monkeypatch, config, env, expected):
+    monkeypatch.delenv(_TAEH3_CHECKPOINT_ENV, raising=False)
+    if env is not None:
+        monkeypatch.setenv(_TAEH3_CHECKPOINT_ENV, env)
+
+    assert _resolve_taeh3_checkpoint_source(config) == expected

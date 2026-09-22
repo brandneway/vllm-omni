@@ -188,6 +188,10 @@ MINIMAX_H3_TURBO_AUDIO_SHIFT = 3.0
 # Escape hatch to enable the lightweight TAEH3 video decoder when
 # ``additional_config["taeh3_decoder"]`` is not explicitly set.
 _TAEH3_ENABLE_ENV = "VLLM_OMNI_MINIMAX_H3_TAEH3"
+# Escape hatch to point the TAEH3 decoder at a local checkpoint when
+# ``additional_config["taeh3_checkpoint"]`` is not explicitly set: offline
+# containers cannot fall back to the upstream download URL.
+_TAEH3_CHECKPOINT_ENV = "VLLM_OMNI_MINIMAX_H3_TAEH3_CHECKPOINT"
 
 
 def _resolve_taeh3_enabled(additional_config: dict[str, Any]) -> bool:
@@ -196,6 +200,17 @@ def _resolve_taeh3_enabled(additional_config: dict[str, Any]) -> bool:
     if configured is not None:
         return bool(configured)
     return os.environ.get(_TAEH3_ENABLE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_taeh3_checkpoint_source(additional_config: dict[str, Any]) -> str:
+    """Explicit ``additional_config["taeh3_checkpoint"]`` wins; then the env var; then the upstream URL."""
+    configured = additional_config.get("taeh3_checkpoint")
+    if configured is not None:
+        return str(configured)
+    from_env = os.environ.get(_TAEH3_CHECKPOINT_ENV, "").strip()
+    if from_env:
+        return from_env
+    return TAEH3_CHECKPOINT_URL
 
 
 MINIMAX_H3_DOWNLOAD_PATTERNS = [
@@ -1060,7 +1075,7 @@ class MiniMaxH3Pipeline(
         self.taeh3_decoder: TAEH3Decoder | None = None
         additional_config = getattr(od_config, "additional_config", {}) or {}
         if _resolve_taeh3_enabled(additional_config):
-            taeh3_source = additional_config.get("taeh3_checkpoint", TAEH3_CHECKPOINT_URL)
+            taeh3_source = _resolve_taeh3_checkpoint_source(additional_config)
             self.taeh3_decoder = TAEH3Decoder.from_checkpoint(taeh3_source, device=self.device)
             logger.info(
                 "MiniMax-H3 lightweight TAEH3 video decoder enabled (checkpoint=%s); "
