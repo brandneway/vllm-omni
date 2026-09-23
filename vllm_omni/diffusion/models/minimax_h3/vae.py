@@ -37,6 +37,7 @@ from .chunked_decode import decode_h3_chunks
 from .npu.audio_tconv import install_audio_vae_tconv_conv1d
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .vae_common import match_param_dtype
 from .vae_temporal import install_temporal_stream_patches
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
@@ -996,7 +997,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         if getattr(self, "encode_only", False):
             raise RuntimeError("MiniMax H3 encode-only video VAE cannot decode latents")
         with self._decode_tiling_context(latent):
-            decoded = self.model.decode_base(self._denormalize_latent(latent))
+            decoded = self.model.decode_base(match_param_dtype(self.model, self._denormalize_latent(latent)))
         if decoded.dtype == torch.uint8:
             # The streaming uint8 write-back already ran the revert and the
             # output quantizer inside write_part; nothing remains but the
@@ -1219,7 +1220,7 @@ class MiniMaxH3AudioVAE(nn.Module):
             device=latent.device,
             dtype=latent.dtype,
         ).view(1, channels, 1)
-        waveform = self.remote.decode(latent * std + mean)
+        waveform = self.remote.decode(match_param_dtype(self.remote, latent * std + mean))
         if waveform.ndim != 3 or waveform.shape[1] != 1:
             raise ValueError(f"unexpected decoded audio shape {tuple(waveform.shape)}")
         return waveform.permute(1, 0, 2).contiguous().float()

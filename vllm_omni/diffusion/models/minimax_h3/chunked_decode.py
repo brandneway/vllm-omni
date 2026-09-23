@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 
 from .temporal_chunks import decode_temporal_chunks
+from .vae_common import match_param_dtype
 
 MiniMaxH3VideoChunkCallback = Callable[[torch.Tensor], None]
 
@@ -63,7 +64,7 @@ def decode_h3_chunks(
     sink = publish if owner else ((lambda _frames: None) if streaming else None)
     result = decode_temporal_chunks(
         host.model,
-        host._denormalize_latent(latent),
+        match_param_dtype(host.model, host._denormalize_latent(latent)),
         sink,
     )
 
