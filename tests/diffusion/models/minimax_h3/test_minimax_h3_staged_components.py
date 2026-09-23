@@ -126,6 +126,7 @@ def test_te_stager_created_once_and_cached(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
 
     encoder = object.__new__(MiniMaxH3Qwen3VLEncoder)
+    nn.Module.__init__(encoder)
     encoder.device_target = torch.device("meta")
     encoder.vision = nn.Linear(2, 2)
     encoder.text_model = nn.Linear(2, 2)
