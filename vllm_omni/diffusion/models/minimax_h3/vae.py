@@ -49,6 +49,28 @@ _VAE_ENCODE_LEGACY_PREP_ENV = "VLLM_OMNI_VAE_ENCODE_LEGACY_PREP"
 
 logger = init_logger(__name__)
 
+# Opt-in reduced-precision residency for the video/audio VAEs. The checkpoint
+# contract is FP32 and the reference decode/encode paths are written against
+# it, so this trades a small numerical margin for ~half the VAE footprint --
+# only worth it on cards where the FP32 VAEs do not fit (MiniMax-H3's video
+# VAE is ~9.7 GiB FP32). "fp16" matches what the H3 decode autocast already
+# rounds decoder inputs to; "bf16" keeps more exponent range.
+_VAE_DTYPE_ENV = "VLLM_OMNI_MINIMAX_H3_VAE_DTYPE"
+_VAE_DTYPES: dict[str, torch.dtype] = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+}
+
+
+def _resolve_vae_dtype() -> torch.dtype:
+    raw = os.environ.get(_VAE_DTYPE_ENV, "").strip().lower()
+    if not raw:
+        return torch.float32
+    if raw not in _VAE_DTYPES:
+        raise ValueError(f"Unknown {_VAE_DTYPE_ENV}={raw!r}; choose from: {', '.join(sorted(_VAE_DTYPES))}")
+    return _VAE_DTYPES[raw]
+
 
 @contextmanager
 def _minimax_h3_keyframe_encode_context(
@@ -357,11 +379,24 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # those same tensors through CUDA autocast on every tile.
         initial_device = load_device or device
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
+        vae_dtype = _resolve_vae_dtype()
         decoder = getattr(self.remote.model, "decoder", None)
+        optimizations_installed = False
         if decoder is not None:
-            install_h3_vae_optimizations(
+            optimizations_installed = install_h3_vae_optimizations(
                 decoder,
                 device=device,
+            )
+        if vae_dtype is not torch.float32 and not optimizations_installed:
+            # The fused decoder path installs only onto FP32 weights. When it
+            # is unavailable (no operators for this device), the precision
+            # budget is better spent on residency; when it did install, its
+            # FP16 block weights and fused kernels are kept as-is.
+            self.remote.to(dtype=vae_dtype)
+            logger.info(
+                "MiniMax-H3 video VAE loaded in %s instead of FP32: the fused decoder "
+                "optimizations are unavailable on this device",
+                vae_dtype,
             )
         install_temporal_stream_patches(self.remote.model)
         self.model = self.remote.model
@@ -1077,6 +1112,10 @@ class MiniMaxH3AudioVAE(nn.Module):
         # encoding and waveform decoding.
         initial_device = load_device or device
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
+        audio_vae_dtype = _resolve_vae_dtype()
+        if audio_vae_dtype is not torch.float32:
+            self.remote.to(dtype=audio_vae_dtype)
+            logger.info("MiniMax-H3 audio VAE loaded in %s instead of FP32", audio_vae_dtype)
         self._stager = None
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
             self._stager = PinnedModuleStager(

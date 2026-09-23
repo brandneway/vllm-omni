@@ -4,6 +4,7 @@
 """CPU tests for the MiniMax-H3 staged-component residency switch."""
 
 import pytest
+import torch
 import torch.nn as nn
 
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
@@ -67,3 +68,37 @@ def test_bare_pipeline_offload_identity_not_equality():
     shape must never be staged."""
     pipeline = _bare_pipeline([nn.Linear(4, 4)])
     assert not pipeline._uses_manual_component_offload(nn.Linear(4, 4))
+
+
+# ---------------------------------------------------------------------------
+# VAE dtype switch
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_vae_dtype_defaults_to_fp32(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.vae import _VAE_DTYPE_ENV, _resolve_vae_dtype
+
+    monkeypatch.delenv(_VAE_DTYPE_ENV, raising=False)
+    assert _resolve_vae_dtype() is torch.float32
+
+    monkeypatch.setenv(_VAE_DTYPE_ENV, "  ")
+    assert _resolve_vae_dtype() is torch.float32
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("fp32", torch.float32), ("fp16", torch.float16), ("bf16", torch.bfloat16), ("BF16", torch.bfloat16)],
+)
+def test_resolve_vae_dtype_accepts_known_values(monkeypatch, value, expected):
+    from vllm_omni.diffusion.models.minimax_h3.vae import _VAE_DTYPE_ENV, _resolve_vae_dtype
+
+    monkeypatch.setenv(_VAE_DTYPE_ENV, value)
+    assert _resolve_vae_dtype() is expected
+
+
+def test_resolve_vae_dtype_rejects_unknown(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.vae import _VAE_DTYPE_ENV, _resolve_vae_dtype
+
+    monkeypatch.setenv(_VAE_DTYPE_ENV, "int8")
+    with pytest.raises(ValueError, match="int8"):
+        _resolve_vae_dtype()
