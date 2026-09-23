@@ -196,6 +196,28 @@ def _resolve_taeh3_checkpoint_source(additional_config: dict[str, Any]) -> str:
     return TAEH3_CHECKPOINT_URL
 
 
+# Opt-in staged residency for the non-DiT components on memory-tight cards:
+# the named components wait in host memory and only reach the device inside
+# the pipeline phase that uses them (the same split-residency machinery the
+# layerwise path drives). "vae" keeps the fp32 video/audio VAEs off the
+# device outside encode/decode; "te" offloads the text encoder between
+# encode phases. DiT stays resident either way.
+_STAGED_COMPONENTS_ENV = "VLLM_OMNI_MINIMAX_H3_STAGED_COMPONENTS"
+_STAGED_COMPONENT_CHOICES = ("te", "vae")
+
+
+def _resolve_staged_components() -> frozenset[str]:
+    raw = os.environ.get(_STAGED_COMPONENTS_ENV, "")
+    names = {item.strip().lower() for item in raw.split(",") if item.strip()}
+    unknown = sorted(names - set(_STAGED_COMPONENT_CHOICES))
+    if unknown:
+        raise ValueError(
+            f"Unknown {_STAGED_COMPONENTS_ENV} entry: {', '.join(unknown)}; "
+            f"choose from: {', '.join(_STAGED_COMPONENT_CHOICES)}"
+        )
+    return frozenset(names)
+
+
 MINIMAX_H3_DOWNLOAD_PATTERNS = [
     "FL2VA/**",
     "Ref2VA/model_index.json",
@@ -1071,7 +1093,10 @@ class MiniMaxH3Pipeline(
         # Preserve the legacy MiniMax-H3 low-residency path. The compact API
         # deliberately limits explicit component selection to dit/text_encoder,
         # so VAEs stay resident for new configurations.
-        component_load_device = torch.device("cpu") if legacy_manual_components else self.device
+        staged_components = _resolve_staged_components()
+        staged_vae = "vae" in staged_components
+        self._staged_components = staged_components
+        component_load_device = torch.device("cpu") if (legacy_manual_components or staged_vae) else self.device
         self.video_vae = MiniMaxH3VideoVAE(
             os.path.join(vae_model_path, "video_vae"),
             device=self.device,
@@ -1089,6 +1114,19 @@ class MiniMaxH3Pipeline(
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
         trace_startup_memory("after_vae_construct", device=self.device)
+        # Objects the staged-residency switch drives through
+        # load_to_device/offload_to_cpu around their pipeline phases.
+        if staged_vae:
+            self._staged_component_objects = [
+                self.video_vae,
+                self.video_vae.encoder_component,
+                self.video_vae.decoder_component,
+                self.audio_vae,
+            ]
+        else:
+            self._staged_component_objects = []
+        if "te" in staged_components and self.text_encoder is not None:
+            self._staged_component_objects.append(self.text_encoder)
 
         # Optional lightweight video decoder (~22 MB, resident on device): a
         # drop-in replacement for the full VAE *decode* only. The full VAE is
@@ -1377,6 +1415,9 @@ class MiniMaxH3Pipeline(
 
     def _uses_manual_component_offload(self, component: nn.Module) -> bool:
         od_config = getattr(self, "od_config", None)
+        staged_objects = getattr(self, "_staged_component_objects", None)
+        if staged_objects and any(component is obj for obj in staged_objects):
+            return True
         if od_config is None:
             return False
         if getattr(od_config, "diffusion_offload_config", None) is None:

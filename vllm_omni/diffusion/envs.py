@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     CUDA_HOME: str | None = None
     LOCAL_RANK: int = 0
     VLLM_OMNI_DIFFUSION_SKIP_POST_LOAD_EMPTY_CACHE: str | None = None
+    VLLM_OMNI_MINIMAX_H3_STAGED_COMPONENTS: str | None = None
     VLLM_OMNI_DIFFUSION_STAGGER_COMPONENT_LOAD: str | None = None
     VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE: str | None = None
     VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE_LAYERS: str | None = None
@@ -59,6 +60,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE_LAYERS": lambda: os.environ.get(
         "VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE_LAYERS", None
     ),
+    # Comma-separated MiniMax-H3 components ("te", "vae") that wait in host
+    # memory and only reach the device inside the pipeline phase using them;
+    # empty keeps every component device-resident.
+    "VLLM_OMNI_MINIMAX_H3_STAGED_COMPONENTS": lambda: os.environ.get("VLLM_OMNI_MINIMAX_H3_STAGED_COMPONENTS", None),
 }
 
 
