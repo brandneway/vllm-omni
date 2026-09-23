@@ -79,6 +79,7 @@ from vllm_omni.diffusion.sched.interface import (
     NewRequestData,
     validate_new_request_data_identity,
 )
+from vllm_omni.diffusion.utils.startup_memory_trace import trace_startup_memory
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
@@ -464,6 +465,7 @@ class DiffusionWorker:
                 )
                 return int(override)
 
+            trace_startup_memory("before_profile_run")
             with memory_profiling(
                 self.init_snapshot,
                 weights_memory=self.model_runner.model_memory_usage,
@@ -471,6 +473,7 @@ class DiffusionWorker:
                 self.model_runner.profile_run(profile_requests)
 
             current_omni_platform.empty_cache()
+            trace_startup_memory("after_profile_run")
 
             available_memory = self.requested_memory - profile_result.non_kv_cache_memory
             if available_memory <= 0:

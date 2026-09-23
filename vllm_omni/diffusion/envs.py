@@ -15,6 +15,10 @@ if TYPE_CHECKING:
     MASTER_PORT: int | None = None
     CUDA_HOME: str | None = None
     LOCAL_RANK: int = 0
+    VLLM_OMNI_DIFFUSION_SKIP_POST_LOAD_EMPTY_CACHE: str | None = None
+    VLLM_OMNI_DIFFUSION_STAGGER_COMPONENT_LOAD: str | None = None
+    VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE: str | None = None
+    VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE_LAYERS: str | None = None
     VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS: str | None = None
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -34,6 +38,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "0" = always fuse; unset = each consumer's own measured default. Raw
     # string or None; validated by fused_qk_norm_rope_min_tokens().
     "VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS": lambda: os.environ.get("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", None),
+    # Escape hatch keeping the caching-allocator pages freed by the online
+    # quantization stream (reusable bf16 workspaces) after model load; set "1"
+    # to skip the post-load empty_cache on the loader device.
+    "VLLM_OMNI_DIFFUSION_SKIP_POST_LOAD_EMPTY_CACHE": lambda: os.environ.get(
+        "VLLM_OMNI_DIFFUSION_SKIP_POST_LOAD_EMPTY_CACHE", None
+    ),
+    # Set "1" to stage the pipeline's encoders/VAEs on the host while the DiT
+    # online-quantization weight stream runs, restoring them once the load
+    # finishes (startup-load peak reduction; final residency unchanged).
+    "VLLM_OMNI_DIFFUSION_STAGGER_COMPONENT_LOAD": lambda: os.environ.get(
+        "VLLM_OMNI_DIFFUSION_STAGGER_COMPONENT_LOAD", None
+    ),
+    # Set "1" to log stage-wise accelerator memory snapshots during diffusion
+    # model startup (construction, per-layer online quantization, load tail,
+    # startup profile run).
+    "VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE": lambda: os.environ.get("VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE", None),
+    # Every N finished online-quantized layers, emit one startup-mem line
+    # (default 10 when the trace is enabled).
+    "VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE_LAYERS": lambda: os.environ.get(
+        "VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE_LAYERS", None
+    ),
 }
 
 

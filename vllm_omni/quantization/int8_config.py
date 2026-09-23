@@ -402,6 +402,10 @@ class LazyWeightMixin:
                 if self._offload_after_quant:
                     layer.to("cpu")
 
+                from vllm_omni.diffusion.utils.startup_memory_trace import note_online_quant_layer
+
+                note_online_quant_layer(device=layer.weight.device)
+
                 # Note that we keep `layer._loaded_numel` around just in case
                 # there is logic added to vllm in the future which calls a
                 # weight loader twice - we do not want to re-initialize in

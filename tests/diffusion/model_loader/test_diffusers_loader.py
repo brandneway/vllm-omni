@@ -2089,3 +2089,220 @@ def test_hsdp_broadcast_weight_load_online_quant_multiprocess():
             )
         assert os.path.exists(os.path.join(temp_dir, "rank_0_success.flag"))
         assert os.path.exists(os.path.join(temp_dir, "rank_1_success.flag"))
+
+
+# ---------------------------------------------------------------------------
+# Non-DLO online-quant startup memory helpers
+# ---------------------------------------------------------------------------
+
+
+class _RecordingStagerModule(nn.Module):
+    """A tiny stand-in encoder/VAE that records every device move."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(4, 4)
+        self.to_calls: list = []
+
+    def to(self, *args, **kwargs):
+        self.to_calls.append(args[0] if args else kwargs.get("device"))
+        return super().to(*args, **kwargs)
+
+
+def _non_dlo_online_quant_config() -> OmniDiffusionConfig:
+    return OmniDiffusionConfig(
+        model="",
+        dtype=torch.float32,
+        quantization_config="int8",
+    )
+
+
+def _build_online_quant_layer(out_features: int = 16) -> nn.Module:
+    from vllm_omni.quantization.int8_config import (
+        DiffusionInt8Config,
+        NPUInt8OnlineLinearMethod,
+    )
+
+    quant_config = DiffusionInt8Config(is_checkpoint_int8_serialized=False, activation_scheme="dynamic")
+    method = NPUInt8OnlineLinearMethod(quant_config)
+    layer = nn.Module()
+    layer.quant_method = method
+    method.create_weights(
+        layer,
+        input_size_per_partition=8,
+        output_partition_sizes=[out_features],
+        input_size=8,
+        output_size=out_features,
+        params_dtype=torch.bfloat16,
+        weight_loader=lambda param, loaded_weight, *args, **kwargs: param.data.copy_(loaded_weight),
+    )
+    return layer
+
+
+def _mock_online_quant_stream(mocker):
+    torch_npu = mocker.MagicMock()
+    mocker.patch("vllm_omni.quantization.int8_config.torch_npu", return_value=torch_npu)
+    mocker.patch(
+        "vllm_omni.quantization.int8_config.torch_npu.npu_dynamic_quant",
+        return_value=(torch.zeros(16, 8, dtype=torch.int8), torch.ones(16)),
+    )
+    return torch_npu
+
+
+def _stub_loader_io(loader, mocker, build_model, load_weights):
+    loader._init_from_load_format = build_model  # type: ignore[method-assign]
+    loader.load_weights = load_weights  # type: ignore[method-assign]
+    loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
+    mocker.patch(
+        "vllm.model_executor.model_loader.reload.layerwise.finalize_layerwise_processing",
+        lambda *_args, **_kwargs: None,
+    )
+
+
+def test_non_dlo_online_quant_load_releases_allocator_cache_after_load(monkeypatch, mocker):
+    """Without DLO, an online-quantized load must hand the quantization
+    workspace pages back to the driver before the startup profile run."""
+    platform_stub = SimpleNamespace(synchronize=MagicMock(), empty_cache=MagicMock())
+    monkeypatch.setattr(loader_module, "current_omni_platform", platform_stub)
+    _mock_online_quant_stream(mocker)
+    loader = DiffusersPipelineLoader(LoadConfig(), _non_dlo_online_quant_config())
+
+    def build_model(*_args, **_kwargs):
+        model = nn.Module()
+        model.transformer = _build_online_quant_layer()
+        return model
+
+    def load_weights(_model, **_kwargs):
+        loaded = torch.arange(16 * 8, dtype=torch.float32).reshape(16, 8).to(torch.bfloat16)
+        _model.transformer.weight.weight_loader(_model.transformer.weight, loaded)
+
+    _stub_loader_io(loader, mocker, build_model, load_weights)
+
+    loader.load_model(load_device="meta", device=torch.device("meta"))
+
+    platform_stub.synchronize.assert_called()
+    platform_stub.empty_cache.assert_called()
+
+
+def test_post_load_empty_cache_escape_hatch(monkeypatch, mocker):
+    monkeypatch.setenv("VLLM_OMNI_DIFFUSION_SKIP_POST_LOAD_EMPTY_CACHE", "1")
+    platform_stub = SimpleNamespace(synchronize=MagicMock(), empty_cache=MagicMock())
+    monkeypatch.setattr(loader_module, "current_omni_platform", platform_stub)
+    _mock_online_quant_stream(mocker)
+    loader = DiffusersPipelineLoader(LoadConfig(), _non_dlo_online_quant_config())
+
+    def build_model(*_args, **_kwargs):
+        model = nn.Module()
+        model.transformer = _build_online_quant_layer()
+        return model
+
+    _stub_loader_io(loader, mocker, build_model, lambda _model, **_kwargs: None)
+
+    loader.load_model(load_device="meta", device=torch.device("meta"))
+
+    platform_stub.synchronize.assert_not_called()
+    platform_stub.empty_cache.assert_not_called()
+
+
+def test_post_load_empty_cache_skipped_without_online_quant(monkeypatch, mocker):
+    platform_stub = SimpleNamespace(synchronize=MagicMock(), empty_cache=MagicMock())
+    monkeypatch.setattr(loader_module, "current_omni_platform", platform_stub)
+    loader = DiffusersPipelineLoader(
+        LoadConfig(),
+        OmniDiffusionConfig(model="", dtype=torch.float32),
+    )
+
+    def build_model(*_args, **_kwargs):
+        model = nn.Module()
+        model.transformer = nn.Linear(8, 16)
+        return model
+
+    _stub_loader_io(loader, mocker, build_model, lambda _model, **_kwargs: None)
+
+    loader.load_model(load_device="meta", device=torch.device("meta"))
+
+    platform_stub.synchronize.assert_not_called()
+    platform_stub.empty_cache.assert_not_called()
+
+
+def test_stagger_moves_components_to_cpu_during_quant_load(monkeypatch, mocker):
+    """Opt-in stagger: encoders/VAEs wait on the host while the quantization
+    stream runs, and return to the loader device before load_model returns."""
+    monkeypatch.setenv("VLLM_OMNI_DIFFUSION_STAGGER_COMPONENT_LOAD", "1")
+    platform_stub = SimpleNamespace(synchronize=MagicMock(), empty_cache=MagicMock())
+    monkeypatch.setattr(loader_module, "current_omni_platform", platform_stub)
+    _mock_online_quant_stream(mocker)
+    loader = DiffusersPipelineLoader(LoadConfig(), _non_dlo_online_quant_config())
+    devices_during_load: list[str] = []
+
+    def build_model(*_args, **_kwargs):
+        model = nn.Module()
+        model.transformer = _build_online_quant_layer()
+        model.text_encoder = _RecordingStagerModule().to(torch.device("meta"))
+        model.vae = _RecordingStagerModule().to(torch.device("meta"))
+        return model
+
+    def load_weights(_model, **_kwargs):
+        devices_during_load.append(_model.text_encoder.linear.weight.device.type)
+        loaded = torch.arange(16 * 8, dtype=torch.float32).reshape(16, 8).to(torch.bfloat16)
+        _model.transformer.weight.weight_loader(_model.transformer.weight, loaded)
+
+    _stub_loader_io(loader, mocker, build_model, load_weights)
+
+    model = loader.load_model(load_device="meta", device=torch.device("meta"))
+
+    # Components waited on the host during the weight stream...
+    assert devices_during_load == ["cpu"]
+    assert model.text_encoder.to_calls[0] == "cpu"
+    assert model.vae.to_calls[0] == "cpu"
+    # ...and were restored to the loader device before returning.
+    assert model.text_encoder.linear.weight.device.type == "meta"
+    assert model.vae.linear.weight.device.type == "meta"
+    # The release still ran alongside the restore.
+    platform_stub.empty_cache.assert_called()
+
+
+def test_stagger_skips_components_with_online_quant(monkeypatch, mocker):
+    monkeypatch.setenv("VLLM_OMNI_DIFFUSION_STAGGER_COMPONENT_LOAD", "1")
+    monkeypatch.setattr(
+        loader_module, "current_omni_platform", SimpleNamespace(synchronize=MagicMock(), empty_cache=MagicMock())
+    )
+    _mock_online_quant_stream(mocker)
+    loader = DiffusersPipelineLoader(LoadConfig(), _non_dlo_online_quant_config())
+
+    def build_model(*_args, **_kwargs):
+        model = nn.Module()
+        model.transformer = _build_online_quant_layer()
+        # An encoder that itself carries an online-quant method must stay on
+        # the loader device: its quantization kernels need the accelerator.
+        model.text_encoder = _RecordingStagerModule()
+        model.text_encoder.linear.quant_method = model.transformer.quant_method
+        return model
+
+    _stub_loader_io(loader, mocker, build_model, lambda _model, **_kwargs: None)
+
+    model = loader.load_model(load_device="meta", device=torch.device("meta"))
+
+    assert model.text_encoder.to_calls == []
+
+
+def test_stagger_disabled_by_default(monkeypatch, mocker):
+    monkeypatch.delenv("VLLM_OMNI_DIFFUSION_STAGGER_COMPONENT_LOAD", raising=False)
+    platform_stub = SimpleNamespace(synchronize=MagicMock(), empty_cache=MagicMock())
+    monkeypatch.setattr(loader_module, "current_omni_platform", platform_stub)
+    _mock_online_quant_stream(mocker)
+    loader = DiffusersPipelineLoader(LoadConfig(), _non_dlo_online_quant_config())
+
+    def build_model(*_args, **_kwargs):
+        model = nn.Module()
+        model.transformer = _build_online_quant_layer()
+        model.text_encoder = _RecordingStagerModule()
+        model.vae = _RecordingStagerModule()
+        return model
+
+    _stub_loader_io(loader, mocker, build_model, lambda _model, **_kwargs: None)
+
+    model = loader.load_model(load_device="meta", device=torch.device("meta"))
+
+    assert model.text_encoder.to_calls == []
+    assert model.vae.to_calls == []

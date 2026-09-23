@@ -49,9 +49,14 @@ from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
     resolve_offload,
 )
-from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery, PipelineModules
 from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
 from vllm_omni.diffusion.registry import initialize_model
+from vllm_omni.diffusion.utils.startup_memory_trace import (
+    skip_post_load_empty_cache,
+    stagger_component_load_enabled,
+    trace_startup_memory,
+)
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
@@ -694,6 +699,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 fallback_ctx = load_unquantizable_fallback_on_cpu() if offload_after_quant else contextlib.nullcontext()
                 with fallback_ctx:
                     model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=False)
+                trace_startup_memory("after_construct", device=target_device)
 
                 resolved_offload = resolve_offload(self.od_config)
                 distributed_offload = resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
@@ -706,6 +712,20 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 dlo_group_size = data_parallel_size if data_parallel_size > 1 else sequence_parallel_size
                 modules = ModuleDiscovery.discover(model)
                 plan = get_offload_plan(model)
+                # Startup-load stagger (opt-in): park the encoders/VAEs on the
+                # host while the DiT online-quantization weight stream runs.
+                # Only re-times startup residency; components come back before
+                # this function returns, so the resident set afterward is
+                # identical to the non-staggered path.
+                staged_components: list[tuple[str, nn.Module]] = []
+                if (
+                    stagger_component_load_enabled()
+                    and not offload_after_quant
+                    and target_device.type != "cpu"
+                    and self._has_online_quant(model)
+                ):
+                    staged_components = self._stage_non_dit_components_to_cpu(modules)
+                    trace_startup_memory("after_component_stage_off", device=target_device)
                 selected_encoders = [
                     encoder
                     for name, encoder in zip(modules.encoder_names, modules.encoders)
@@ -836,6 +856,16 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     self._maybe_fuse_distilled_lora(model)
                     self._process_weights_after_loading(model, target_device)
 
+                if not offload_after_quant:
+                    # The per-layer quantization stream frees each bf16 weight
+                    # as soon as its quantized copy exists, but the storages
+                    # stay in the caching allocator as reusable pages. The DLO
+                    # streaming path releases them as it goes; without it,
+                    # return them before the startup profile run needs the
+                    # working room (and before staged components return).
+                    self._release_post_quant_allocator_cache(model, target_device)
+                    self._restore_staged_components(staged_components, target_device)
+
                 # A warm final-layout hit has already completed all
                 # byte-changing work through the restorer.  Shared runtime
                 # finalization happens once at the end for both cold and warm
@@ -871,6 +901,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     del model
                     return self.load_fresh_canonical_model()
             raise
+        trace_startup_memory("after_load_finalize", device=target_device)
         self._log_w4a8_fallback_load_summaries(model)
         self._attach_offload_startup_state(model)
         return model
@@ -919,6 +950,59 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         materialization onto the ``meta`` device (upstream vLLM
         ``uses_meta_device=True``, e.g. online FP8)."""
         return has_online_quantization(model)
+
+    def _release_post_quant_allocator_cache(self, model: nn.Module, target_device: torch.device) -> None:
+        """Return the online-quantization workspace pages to the driver.
+
+        The per-layer stream materializes one bf16 weight at a time and swaps
+        in the quantized copy; each freed bf16 storage stays in the caching
+        allocator as a reusable page, so right after load a quantized model
+        can carry several GiB of retained pages that the startup profile run
+        then cannot use. No-op on CPU targets, without online quantization,
+        or when VLLM_OMNI_DIFFUSION_SKIP_POST_LOAD_EMPTY_CACHE=1.
+        """
+        if skip_post_load_empty_cache():
+            return
+        if target_device.type == "cpu" or not self._has_online_quant(model):
+            return
+        from vllm_omni.platforms import current_omni_platform
+
+        current_omni_platform.synchronize()
+        current_omni_platform.empty_cache()
+        trace_startup_memory("after_load_empty_cache", device=target_device)
+
+    @staticmethod
+    def _stage_non_dit_components_to_cpu(modules: PipelineModules) -> list[tuple[str, nn.Module]]:
+        """Park encoders/VAEs on the host during the quantization load.
+
+        Construction eagerly places the text encoder and the VAEs on the
+        loader device (several GiB per rank on MiniMax H3), where they would
+        sit beside the accumulating int8 weights and per-layer bf16 workspaces
+        during weight loading. Staging them shrinks that window; the weights
+        that stream in for staged components simply copy CPU→CPU. Components
+        carrying an online-quant method stay on the device — their
+        quantization kernels need the accelerator.
+        """
+        staged: list[tuple[str, nn.Module]] = []
+        components = [*zip(modules.encoder_names, modules.encoders), *zip(modules.vae_names, modules.vaes)]
+        for name, module in components:
+            if has_online_quantization(module):
+                logger.info("Startup component stagger keeps %s resident (online quantization needs it)", name)
+                continue
+            module.to("cpu")
+            staged.append((name, module))
+        if staged:
+            logger.info("Startup component stagger staged %s to host for the weight load", sorted(n for n, _ in staged))
+        return staged
+
+    @staticmethod
+    def _restore_staged_components(staged: list[tuple[str, nn.Module]], target_device: torch.device) -> None:
+        if not staged:
+            return
+        for name, module in staged:
+            module.to(target_device)
+        logger.info("Startup component stagger restored %s to %s", sorted(n for n, _ in staged), target_device)
+        trace_startup_memory("after_component_restore", device=target_device)
 
     @staticmethod
     def _unsupported_dlo_allgather_online_quant_methods(model: nn.Module) -> tuple[str, ...]:
@@ -1304,6 +1388,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # tensors. Some post-load transforms use operations (for example,
         # torch.unique in ModelOpt NVFP4) that do not support DTensor inputs.
         self._process_weights_after_loading(model, target_device)
+        if not offload_after_quant:
+            self._release_post_quant_allocator_cache(model, target_device)
 
         # Discover pipeline components (DiT, encoders, VAEs) via
         # ModuleDiscovery, which consults SupportsComponentDiscovery
