@@ -102,3 +102,47 @@ def test_resolve_vae_dtype_rejects_unknown(monkeypatch):
     monkeypatch.setenv(_VAE_DTYPE_ENV, "int8")
     with pytest.raises(ValueError, match="int8"):
         _resolve_vae_dtype()
+
+
+# ---------------------------------------------------------------------------
+# Text-encoder stager switch
+# ---------------------------------------------------------------------------
+
+
+def test_te_stager_flag_reads_env(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.encoder import _TE_STAGER_ENV, _te_stager_enabled
+
+    monkeypatch.delenv(_TE_STAGER_ENV, raising=False)
+    assert _te_stager_enabled() is False
+    for value in ("1", "true", "YES", " on "):
+        monkeypatch.setenv(_TE_STAGER_ENV, value)
+        assert _te_stager_enabled() is True
+    monkeypatch.setenv(_TE_STAGER_ENV, "0")
+    assert _te_stager_enabled() is False
+
+
+def test_te_stager_created_once_and_cached(monkeypatch):
+    """The whole-encoder master is built lazily and reused across phases."""
+    from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
+
+    encoder = object.__new__(MiniMaxH3Qwen3VLEncoder)
+    encoder.device_target = torch.device("meta")
+    encoder.vision = nn.Linear(2, 2)
+    encoder.text_model = nn.Linear(2, 2)
+    built: list = []
+
+    class _SpyStager:
+        def __init__(self, modules, device, **kwargs):
+            built.append((list(modules), device))
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.minimax_h3.encoder.PinnedModuleStager",
+        _SpyStager,
+    )
+
+    first = encoder._staged_component_stager()
+    second = encoder._staged_component_stager()
+
+    assert first is second
+    assert len(built) == 1
+    assert built[0][0] == [encoder.vision, encoder.text_model]

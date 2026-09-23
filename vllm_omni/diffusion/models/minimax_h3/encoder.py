@@ -31,6 +31,7 @@ complete ``[seq, 5120]`` hidden state.
 from __future__ import annotations
 
 import itertools
+import os
 import re
 from collections.abc import Iterable
 from typing import Any
@@ -52,6 +53,17 @@ MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 
 logger = init_logger(__name__)
+
+# Set "1" to keep a pinned host master for a staged text encoder. The layerwise
+# path gets that from its per-layer hooks; without them a staged encoder would
+# otherwise copy the whole weight set host-ward on every offload. One pinned
+# master turns each unload into a zero-copy rebind and each load into an
+# asynchronous copy from page-locked memory.
+_TE_STAGER_ENV = "VLLM_OMNI_MINIMAX_H3_TE_STAGER"
+
+
+def _te_stager_enabled() -> bool:
+    return os.environ.get(_TE_STAGER_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _validate_encoder_quant_config(quant_config: QuantizationConfig | None) -> None:
@@ -1233,6 +1245,9 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 self._omni_non_block_stager = stager
             stager.load()
             return
+        if _te_stager_enabled() and self.device_target.type != "cpu":
+            self._staged_component_stager().load()
+            return
         self.vision.to(self.device_target)
         self.text_model.to(self.device_target)
 
@@ -1253,9 +1268,31 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                     child.to("cpu")
                 self._release_omni_component_cache()
             return
+        if _te_stager_enabled() and self.device_target.type != "cpu":
+            stager = getattr(self, "_staged_component_stager_instance", None)
+            if stager is not None:
+                stager.offload()
+                return
         self.vision.to("cpu")
         self.text_model.to("cpu")
         torch.accelerator.empty_cache()
+
+    def _staged_component_stager(self) -> PinnedModuleStager:
+        """Lazily create the whole-encoder pinned master for staged residency.
+
+        Built on first use, when the encoder still holds its constructed
+        weights; the stager snapshots them into a pinned host master and
+        rebinds the parameters there, so every later unload is zero-copy.
+        """
+        stager = getattr(self, "_staged_component_stager_instance", None)
+        if stager is None:
+            stager = PinnedModuleStager(
+                [self.vision, self.text_model],
+                self.device_target,
+                pin_memory=True,
+            )
+            self._staged_component_stager_instance = stager
+        return stager
 
     def _omni_non_block_modules(self) -> list[nn.Module]:
         modules = [child for name, child in self.vision.named_children() if name != "blocks"]

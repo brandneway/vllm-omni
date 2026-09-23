@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     LOCAL_RANK: int = 0
     VLLM_OMNI_DIFFUSION_SKIP_POST_LOAD_EMPTY_CACHE: str | None = None
     VLLM_OMNI_MINIMAX_H3_STAGED_COMPONENTS: str | None = None
+    VLLM_OMNI_MINIMAX_H3_TE_STAGER: str | None = None
     VLLM_OMNI_MINIMAX_H3_VAE_DTYPE: str | None = None
     VLLM_OMNI_DIFFUSION_STAGGER_COMPONENT_LOAD: str | None = None
     VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE: str | None = None
@@ -65,6 +66,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory and only reach the device inside the pipeline phase using them;
     # empty keeps every component device-resident.
     "VLLM_OMNI_MINIMAX_H3_STAGED_COMPONENTS": lambda: os.environ.get("VLLM_OMNI_MINIMAX_H3_STAGED_COMPONENTS", None),
+    # Set "1" to give a staged text encoder a pinned host master, so each
+    # unload rebinds instead of copying the whole weight set back to the host.
+    "VLLM_OMNI_MINIMAX_H3_TE_STAGER": lambda: os.environ.get("VLLM_OMNI_MINIMAX_H3_TE_STAGER", None),
     # Precision for the MiniMax-H3 video/audio VAEs ("fp32" default, or
     # "fp16"/"bf16" to roughly halve their residency on memory-tight cards).
     "VLLM_OMNI_MINIMAX_H3_VAE_DTYPE": lambda: os.environ.get("VLLM_OMNI_MINIMAX_H3_VAE_DTYPE", None),
