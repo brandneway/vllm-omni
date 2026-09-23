@@ -107,7 +107,14 @@ def _try_extract_layer_index(prefix: str) -> int | None:
         return None
 
 
+@functools.cache
 def _supports_video_spans(sparse_attention: Any) -> bool:
+    """Whether the installed mindiesd ``sparse_attention`` accepts ``video_spans``.
+
+    Cached because ``inspect.signature`` rebuilds the signature on every call and
+    this runs once per attention layer per denoise step, while the installed
+    function object is fixed for the process.
+    """
     try:
         return "video_spans" in inspect.signature(sparse_attention).parameters
     except (TypeError, ValueError):
@@ -726,9 +733,11 @@ class RainFusionAttentionImpl(AttentionImpl):
         out = out.transpose(1, 2)
         if used == query.shape[1]:
             return out
-        padded = torch.zeros_like(query)
-        padded[:, :used] = out
-        return padded
+        # Same padding contract as the rf path below: only the first ``used`` rows
+        # are read back downstream, so the padding payload is free. Reuse the
+        # query tail instead of zero-filling a fresh buffer — one fewer
+        # full-sequence allocation and one less write, and always finite values.
+        return torch.cat([out, query[:, used:]], dim=1)
 
     def _forward_sparse_npu(
         self,
