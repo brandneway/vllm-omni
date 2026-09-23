@@ -66,15 +66,31 @@ def _gib(num_bytes: int | float) -> float:
     return float(num_bytes) / _GiB
 
 
+def _memory_module(device: torch.device | None):
+    """Pick the memory-stat module for the device.
+
+    ``torch.accelerator`` memory stats assert on NPU (its allocator is not a
+    torch ``DeviceAllocator``, hard-failing under expandable_segments), so
+    NPU reads go through ``torch.npu``; CUDA and others keep the generic API.
+    """
+    from vllm_omni.platforms import current_omni_platform
+
+    device_type = getattr(device, "type", None) or getattr(current_omni_platform, "device_type", None)
+    if device_type == "npu" and hasattr(torch, "npu") and hasattr(torch.npu, "memory_allocated"):
+        return torch.npu
+    return torch.accelerator
+
+
 def _accelerator_memory(device: torch.device | None) -> tuple[int, int, int]:
     """Return (allocated, reserved, peak-allocated) in bytes.
 
     ``max_memory_allocated`` postdates the other two on some accelerators;
     a missing API degrades the peak reading to 0 instead of failing the run.
     """
-    allocated = int(torch.accelerator.memory_allocated(device))
-    reserved = int(torch.accelerator.memory_reserved(device))
-    max_allocated = getattr(torch.accelerator, "max_memory_allocated", None)
+    module = _memory_module(device)
+    allocated = int(module.memory_allocated(device))
+    reserved = int(module.memory_reserved(device))
+    max_allocated = getattr(module, "max_memory_allocated", None)
     peak = int(max_allocated(device)) if callable(max_allocated) else 0
     return allocated, reserved, peak
 
