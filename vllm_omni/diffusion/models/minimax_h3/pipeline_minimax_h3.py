@@ -1127,6 +1127,12 @@ class MiniMaxH3Pipeline(
             self._staged_component_objects = []
         if "te" in staged_components and self.text_encoder is not None:
             self._staged_component_objects.append(self.text_encoder)
+            # Staged means host-resident between phases, so park the encoder
+            # right away: construction residency drops by the encoder's share
+            # and its weights load host-to-host. With the stager enabled this
+            # also pays the one-time pinned-master cost here instead of on the
+            # first request.
+            self.text_encoder.offload_to_cpu()
 
         # Optional lightweight video decoder (~22 MB, resident on device): a
         # drop-in replacement for the full VAE *decode* only. The full VAE is
