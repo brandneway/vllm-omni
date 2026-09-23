@@ -147,3 +147,88 @@ def test_te_stager_created_once_and_cached(monkeypatch):
     assert first is second
     assert len(built) == 1
     assert built[0][0] == [encoder.vision, encoder.text_model]
+
+
+# ---------------------------------------------------------------------------
+# Text-encoder resident-after-first-use switch
+# ---------------------------------------------------------------------------
+
+
+def test_te_resident_flag_reads_env(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.encoder import _TE_RESIDENT_ENV, _te_resident_enabled
+
+    monkeypatch.delenv(_TE_RESIDENT_ENV, raising=False)
+    assert _te_resident_enabled() is False
+    for value in ("1", "true", "YES", " on "):
+        monkeypatch.setenv(_TE_RESIDENT_ENV, value)
+        assert _te_resident_enabled() is True
+    monkeypatch.setenv(_TE_RESIDENT_ENV, "0")
+    assert _te_resident_enabled() is False
+
+
+def _bare_encoder(**attrs):
+    from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
+
+    encoder = object.__new__(MiniMaxH3Qwen3VLEncoder)
+    nn.Module.__init__(encoder)
+    encoder.device_target = torch.device("meta")
+    encoder.vision = nn.Linear(2, 2)
+    encoder.text_model = nn.Linear(2, 2)
+    for name, value in attrs.items():
+        setattr(encoder, name, value)
+    return encoder
+
+
+def test_resident_skips_offload_after_first_use(monkeypatch):
+    """Resident mode: the construction-time park still happens, but once the
+    encoder has been on the device it is never moved back."""
+    from vllm_omni.diffusion.models.minimax_h3.encoder import _TE_RESIDENT_ENV
+
+    monkeypatch.setenv(_TE_RESIDENT_ENV, "1")
+    encoder = _bare_encoder()
+    offloads: list = []
+    monkeypatch.setattr(type(encoder), "is_loaded", property(lambda self: True))
+    encoder.vision.to = lambda *a, **k: offloads.append(("vision", a))
+    encoder.text_model.to = lambda *a, **k: offloads.append(("text", a))
+
+    # Never loaded yet -> the construction-time park still applies.
+    encoder.offload_to_cpu()
+    assert [name for name, _ in offloads] == ["vision", "text"]
+
+    # After a load, resident mode leaves it alone.
+    encoder._omni_te_ever_on_device = True
+    offloads.clear()
+    encoder.offload_to_cpu()
+    assert offloads == []
+
+
+def test_without_resident_offload_always_runs(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.encoder import _TE_RESIDENT_ENV
+
+    monkeypatch.delenv(_TE_RESIDENT_ENV, raising=False)
+    encoder = _bare_encoder()
+    monkeypatch.setattr(type(encoder), "is_loaded", property(lambda self: True))
+    offloads: list = []
+    encoder.vision.to = lambda *a, **k: offloads.append("vision")
+    encoder.text_model.to = lambda *a, **k: offloads.append("text")
+    encoder._omni_te_ever_on_device = True
+
+    encoder.offload_to_cpu()
+
+    assert offloads == ["vision", "text"]
+
+
+def test_load_marks_encoder_as_ever_on_device(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.encoder import (
+        _TE_RESIDENT_ENV,
+        _TE_STAGER_ENV,
+    )
+
+    monkeypatch.delenv(_TE_STAGER_ENV, raising=False)
+    monkeypatch.delenv(_TE_RESIDENT_ENV, raising=False)
+    encoder = _bare_encoder()
+    monkeypatch.setattr(type(encoder), "is_loaded", property(lambda self: True))
+
+    encoder.load_to_device()
+
+    assert encoder._omni_te_ever_on_device is True

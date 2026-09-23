@@ -60,10 +60,21 @@ logger = init_logger(__name__)
 # master turns each unload into a zero-copy rebind and each load into an
 # asynchronous copy from page-locked memory.
 _TE_STAGER_ENV = "VLLM_OMNI_MINIMAX_H3_TE_STAGER"
+# Set "1" to let a staged text encoder stay on the device once it has been
+# loaded for the first time. The construction-time park still applies, so
+# startup residency stays low; only the per-phase copy-in disappears -- the
+# encoder never returns to the host after its first encode. The cost is that
+# its share is resident again during decode, which is the right trade when the
+# device has room and the same prompt-less loop runs request after request.
+_TE_RESIDENT_ENV = "VLLM_OMNI_MINIMAX_H3_TE_RESIDENT"
 
 
 def _te_stager_enabled() -> bool:
     return os.environ.get(_TE_STAGER_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _te_resident_enabled() -> bool:
+    return os.environ.get(_TE_RESIDENT_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _validate_encoder_quant_config(quant_config: QuantizationConfig | None) -> None:
@@ -1247,12 +1258,18 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             return
         if _te_stager_enabled() and self.device_target.type != "cpu":
             self._staged_component_stager().load()
+            self._omni_te_ever_on_device = True
             return
         self.vision.to(self.device_target)
         self.text_model.to(self.device_target)
+        self._omni_te_ever_on_device = True
 
     def offload_to_cpu(self) -> None:
         if not self.is_loaded:
+            return
+        if _te_resident_enabled() and getattr(self, "_omni_te_ever_on_device", False):
+            # Resident mode: the encoder has served at least one encode, so it
+            # stays where it is instead of returning to the host.
             return
         if getattr(self, "_omni_layerwise_enabled", False):
             for hook in self._omni_layerwise_hooks:
