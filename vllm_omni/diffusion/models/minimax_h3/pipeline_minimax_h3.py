@@ -142,6 +142,7 @@ from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_euler_eta0_step,
     minimax_h3_rf_v_to_x0,
 )
+from .taeh3 import TAEH3_CHECKPOINT_URL, TAEH3Decoder
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_time_shift_sigmas,
@@ -166,6 +167,33 @@ MINIMAX_H3_FPS = 24
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
+# Escape hatch to enable the lightweight TAEH3 video decoder when
+# ``additional_config["taeh3_decoder"]`` is not explicitly set.
+_TAEH3_ENABLE_ENV = "VLLM_OMNI_MINIMAX_H3_TAEH3"
+# Escape hatch to point the TAEH3 decoder at a local checkpoint when
+# ``additional_config["taeh3_checkpoint"]`` is not explicitly set: offline
+# containers cannot fall back to the upstream download URL.
+_TAEH3_CHECKPOINT_ENV = "VLLM_OMNI_MINIMAX_H3_TAEH3_CHECKPOINT"
+
+
+def _resolve_taeh3_enabled(additional_config: dict[str, Any]) -> bool:
+    """Explicit ``additional_config["taeh3_decoder"]`` wins; the env var is the fallback."""
+    configured = additional_config.get("taeh3_decoder")
+    if configured is not None:
+        return bool(configured)
+    return os.environ.get(_TAEH3_ENABLE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_taeh3_checkpoint_source(additional_config: dict[str, Any]) -> str:
+    """Explicit ``additional_config["taeh3_checkpoint"]`` wins; then the env var; then the upstream URL."""
+    configured = additional_config.get("taeh3_checkpoint")
+    if configured is not None:
+        return str(configured)
+    from_env = os.environ.get(_TAEH3_CHECKPOINT_ENV, "").strip()
+    if from_env:
+        return from_env
+    return TAEH3_CHECKPOINT_URL
+
 MINIMAX_H3_DOWNLOAD_PATTERNS = [
     "FL2VA/**",
     "Ref2VA/model_index.json",
@@ -1055,6 +1083,20 @@ class MiniMaxH3Pipeline(
         )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
+
+        # Optional lightweight video decoder (~22 MB, resident on device): a
+        # drop-in replacement for the full VAE *decode* only. The full VAE is
+        # still required for encoding conditions, and audio always uses it.
+        self.taeh3_decoder: TAEH3Decoder | None = None
+        additional_config = getattr(od_config, "additional_config", {}) or {}
+        if _resolve_taeh3_enabled(additional_config):
+            taeh3_source = _resolve_taeh3_checkpoint_source(additional_config)
+            self.taeh3_decoder = TAEH3Decoder.from_checkpoint(taeh3_source, device=self.device)
+            logger.info(
+                "MiniMax-H3 lightweight TAEH3 video decoder enabled (checkpoint=%s); "
+                "video decode bypasses the full VAE",
+                taeh3_source,
+            )
 
         self._dlo_component_cache = None
         offloads_text_encoder = should_offload_component(od_config, TEXT_ENCODER_COMPONENT)
@@ -1976,17 +2018,27 @@ class MiniMaxH3Pipeline(
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Denoise just ended: its freed activation pages must not stay mapped
-        # through the VAE decode peak. Decoding needs only the ViT decoder
-        # half of the VAE, so the CNN encoder stays off the device.
+        # through the VAE decode peak.
         self._release_stage_cache()
-        with self._component_on_device(self.video_vae.decoder_component):
-            with current_omni_platform.create_autocast_context(
-                device_type=self.device.type,
-                dtype=torch.float16,
-                enabled=True,
-            ):
-                video = self.video_vae.decode_latent(video_latent)
-        video = video[..., :height, :width].contiguous()
+        if self.taeh3_decoder is not None:
+            # TAEH3 consumes the normalized latent directly and reproduces the
+            # full 16x spatial / 4x temporal canvas, so it needs neither the
+            # denormalize step nor the fp16 autocast of the full VAE path.
+            video = self.taeh3_decoder.decode_video(video_latent)
+            video = video[..., :height, :width].contiguous()
+            if tuple(video.shape[-2:]) != (height, width):
+                raise ValueError(f"TAEH3 decoded {tuple(video.shape[-2:])} video but the request is {height}x{width}")
+        else:
+            # Decoding needs only the ViT decoder half of the VAE, so the CNN
+            # encoder stays off the device.
+            with self._component_on_device(self.video_vae.decoder_component):
+                with current_omni_platform.create_autocast_context(
+                    device_type=self.device.type,
+                    dtype=torch.float16,
+                    enabled=True,
+                ):
+                    video = self.video_vae.decode_latent(video_latent)
+            video = video[..., :height, :width].contiguous()
         with self._component_on_device(self.audio_vae):
             audio = self.audio_vae.decode_latent(audio_latent)
         audio = self._offload_model_cpu_stage_output(audio)

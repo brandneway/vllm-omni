@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+from vllm_omni.diffusion.attention.chunking import AttnChunkingOptions
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
@@ -270,6 +271,9 @@ class Attention(nn.Module):
         self._kv_cache_dtype: str | None = None
         self._kv_cache_skip_steps: set[int] | None = None
         self._kv_cache_skip_layers: set[int] | None = None
+        # Chunked-call scheduling options (None = single wide attention call);
+        # only meaningful together with an active kv_cache_dtype.
+        self._attn_chunking: AttnChunkingOptions | None = None
         # Per-layer opt-out from KV-cache quantization (set by model author).
         self._disable_kv_quant: bool = disable_kv_quant
         self._init_kv_cache_quantization(config)
@@ -340,6 +344,15 @@ class Attention(nn.Module):
         self._kv_cache_skip_layers = getattr(config, "diffusion_kv_cache_skip_layer_indices", None)
         if self._kv_cache_skip_layers and self.layer_idx is None and not self._disable_kv_quant:
             raise ValueError("Attention quantization skip_layers requires a parseable transformer block index.")
+        if dtype is not None:
+            options = AttnChunkingOptions(
+                q_chunk=getattr(config, "diffusion_attn_q_chunk", 1),
+                head_chunk=getattr(config, "diffusion_attn_head_chunk", 0),
+                head_chunk_min_kv=getattr(config, "diffusion_attn_head_chunk_min_kv", 50000),
+            )
+            # Inert defaults stay None so backends never see a "chunking" key
+            # they cannot honor.
+            self._attn_chunking = options if options.active else None
 
     def _should_apply_kv_cache_quant(self) -> bool:
         skip_steps = self._kv_cache_skip_steps
@@ -356,10 +369,10 @@ class Attention(nn.Module):
     def _with_kv_cache_dtype(self, attn_metadata: AttentionMetadata | None) -> AttentionMetadata | None:
         disabled = self._disable_kv_quant or not self._should_apply_kv_cache_quant()
         dtype = self._kv_cache_dtype
-        if dtype in (None, "float"):
+        if dtype in (None, "float", "auto") or disabled:
+            # Unquantized steps/layers carry no dtype key at all: the NPU
+            # backend routes any non-null kv_cache_dtype into the FP8 path.
             dtype = None
-        elif disabled:
-            dtype = "float"
         if dtype is None and (attn_metadata is None or "kv_cache_dtype" not in attn_metadata.extra):
             return attn_metadata
         extra = dict(attn_metadata.extra) if attn_metadata is not None else {}
@@ -367,6 +380,13 @@ class Attention(nn.Module):
         extra.pop("kv_cache_dtype", None)
         if dtype is not None:
             extra["kv_cache_dtype"] = dtype
+        # Chunking rides along only when quantization is active for this step
+        # and layer; the gates above drop both keys together, so backends
+        # never see chunking without a dtype.
+        if self._attn_chunking is not None:
+            extra["attn_chunking"] = self._attn_chunking
+        else:
+            extra.pop("attn_chunking", None)
         if attn_metadata is None:
             return AttentionMetadata(extra=extra) if extra else None
         return replace(attn_metadata, extra=extra)
