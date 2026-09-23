@@ -61,6 +61,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
 )
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.diffusion.utils.media_utils import normalize_preencode_batch_frames, normalize_video_codec_options
+from vllm_omni.diffusion.utils.startup_memory_trace import trace_startup_memory
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError, client_error_from_metadata
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -193,6 +194,7 @@ def _resolve_taeh3_checkpoint_source(additional_config: dict[str, Any]) -> str:
     if from_env:
         return from_env
     return TAEH3_CHECKPOINT_URL
+
 
 MINIMAX_H3_DOWNLOAD_PATTERNS = [
     "FL2VA/**",
@@ -1038,6 +1040,7 @@ class MiniMaxH3Pipeline(
                 )
             self.text_encoder_tp_size = text_encoder_tp_size
             self.text_encoder_group = self._build_text_encoder_group(text_encoder_tp_size)
+            trace_startup_memory("after_dit_construct", device=self.device)
             self.text_encoder = MiniMaxH3Qwen3VLEncoder(
                 os.path.join(model_path, "text_encoder"),
                 device=self.device,
@@ -1060,6 +1063,8 @@ class MiniMaxH3Pipeline(
             self.text_encoder_group = None
             self.text_encoder = None
             self._encoder_modules = []
+            trace_startup_memory("after_dit_construct", device=self.device)
+        trace_startup_memory("after_te_construct", device=self.device)
         legacy_manual_components = getattr(od_config, "diffusion_offload_config", None) is None and bool(
             od_config.enable_layerwise_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
         )
@@ -1083,6 +1088,7 @@ class MiniMaxH3Pipeline(
         )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
+        trace_startup_memory("after_vae_construct", device=self.device)
 
         # Optional lightweight video decoder (~22 MB, resident on device): a
         # drop-in replacement for the full VAE *decode* only. The full VAE is
