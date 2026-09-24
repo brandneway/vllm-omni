@@ -699,7 +699,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 fallback_ctx = load_unquantizable_fallback_on_cpu() if offload_after_quant else contextlib.nullcontext()
                 with fallback_ctx:
                     model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=False)
-                trace_startup_memory("after_construct", device=target_device)
+                trace_startup_memory("after_construct", device=target_device, model=model)
 
                 resolved_offload = resolve_offload(self.od_config)
                 distributed_offload = resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
@@ -725,7 +725,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     and self._has_online_quant(model)
                 ):
                     staged_components = self._stage_non_dit_components_to_cpu(modules)
-                    trace_startup_memory("after_component_stage_off", device=target_device)
+                    trace_startup_memory("after_component_stage_off", device=target_device, model=model)
                 selected_encoders = [
                     encoder
                     for name, encoder in zip(modules.encoder_names, modules.encoders)
@@ -901,7 +901,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     del model
                     return self.load_fresh_canonical_model()
             raise
-        trace_startup_memory("after_load_finalize", device=target_device)
+        trace_startup_memory("after_load_finalize", device=target_device, model=model)
         self._log_w4a8_fallback_load_summaries(model)
         self._attach_offload_startup_state(model)
         return model
@@ -969,7 +969,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
         current_omni_platform.synchronize()
         current_omni_platform.empty_cache()
-        trace_startup_memory("after_load_empty_cache", device=target_device)
+        trace_startup_memory("after_load_empty_cache", device=target_device, model=model)
 
     @staticmethod
     def _stage_non_dit_components_to_cpu(modules: PipelineModules) -> list[tuple[str, nn.Module]]:

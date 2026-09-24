@@ -12,6 +12,10 @@ profile run (``before_profile_run`` / ``after_profile_run``).
 
 Disabled by default: with the env unset, ``trace_startup_memory`` is a
 no-op that never touches a memory API.
+
+``trace_startup_memory`` is also the hook the opt-in startup memory snapshot
+collectors hang off (see ``startup_memory_snapshot``), so both diagnostics
+observe the same stages without duplicating call sites.
 """
 
 import os
@@ -100,8 +104,22 @@ def trace_startup_memory(
     *,
     extra: dict[str, Any] | None = None,
     device: torch.device | None = None,
+    model: Any = None,
+    snapshot: bool = True,
 ) -> None:
-    """Log one stage snapshot; no-op unless the trace env is enabled."""
+    """Record one startup stage: opt-in memory snapshots plus the trace line.
+
+    This is the single startup-memory hook, so both diagnostics fire from the
+    same call sites. The snapshot collectors are gated by their own env vars and
+    stay independent of ``VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE``; ``model`` is
+    only used for host-side per-component attribution, and ``snapshot=False``
+    keeps high-frequency stages (per-layer online quantization) off the disks.
+    """
+    if snapshot:
+        from vllm_omni.diffusion.utils.startup_memory_snapshot import capture_startup_snapshot
+
+        capture_startup_snapshot(stage, device=device, model=model)
+
     if not startup_mem_trace_enabled():
         return
     from vllm_omni.platforms import current_omni_platform
@@ -136,6 +154,8 @@ def note_online_quant_layer(device: torch.device | None = None) -> None:
         "online_quant_layers",
         extra={"layers": _online_quant_layer_count},
         device=device,
+        # Fires every N layers; a snapshot per firing would bury the disks.
+        snapshot=False,
     )
 
 

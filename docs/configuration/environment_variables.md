@@ -130,6 +130,26 @@ settings.
 Omni-owned variable, even though vLLM-Omni supplies a persistent default when
 it is unset.
 
+### Startup memory diagnostics and residency
+
+These switches describe and reshape accelerator residency during diffusion model
+startup. The diagnostics are read at each startup stage and are inert while
+unset; the residency controls change where weights sit during the load.
+
+| Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; default false | Stage-wise accelerator memory logging across diffusion startup (construction, per-layer online quantization, load tail); read at each startup stage | Environment-only diagnostic. Any other value means false. | Diagnostic |
+| `VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE_LAYERS` | Positive integer; default `10` | Interval, counted in finished online-quantized layers, between `online_quant_layers` trace lines; read when the trace emits | Environment-only. A non-integer or non-positive value falls back to the default. Ignored unless the trace is enabled. | Diagnostic |
+| `VLLM_OMNI_DIFFUSION_STARTUP_MEM_SNAPSHOT` | Truthy flag, or a comma-separated startup stage list; unset disables capture | Accelerator memory pickles (`_dump_snapshot`) written once per matching startup stage; recording starts at device init and stops when the model load finishes | Environment-only. A bare truthy value captures every default stage; a stage list captures only those. `online_quant_layers` is never in the default set. Expect roughly 100MiB per rank and stage. | Diagnostic |
+| `VLLM_OMNI_DIFFUSION_STARTUP_MEM_SNAPSHOT_HOST` | Same spellings as the accelerator snapshots | Host-side accounting per matching startup stage: `/proc` RSS and PSS, a census of live CPU tensor storages, and a per-component host/device weight split | Environment-only. This is the only view that covers host weight shards, which an accelerator snapshot cannot see. | Diagnostic |
+| `VLLM_OMNI_DIFFUSION_STARTUP_MEM_SNAPSHOT_DIR` | Directory path; default `startup_mem_snapshots` under the serving working directory | Output directory shared by both startup snapshot collectors | Environment-only. Created on demand. Size the volume before enabling every stage on every rank. | Diagnostic |
+| `VLLM_OMNI_DIFFUSION_SKIP_POST_LOAD_EMPTY_CACHE` | Boolean truthy spellings; default false | Keeps the caching-allocator pages the online-quantization stream frees after model load; read when the loader would release them | Environment-only escape hatch. Any other value means false. Measure before keeping: the retained pages reduce what the startup profile run can use. | Diagnostic and temporary |
+| `VLLM_OMNI_DIFFUSION_STAGGER_COMPONENT_LOAD` | Boolean truthy spellings; default false | Parks the pipeline's encoders and VAEs on the host while the DiT online-quantization weight stream runs, restoring them before the load returns | Environment-only. Any other value means false. Re-times startup residency only; the resident set afterward is unchanged. | Experimental performance control |
+| `VLLM_OMNI_MINIMAX_H3_STAGED_COMPONENTS` | Comma-separated component names (`te`, `vae`); empty keeps every component device-resident | MiniMax-H3 components that wait in host memory and reach the device only inside the pipeline phase using them | Environment-only. Unknown names are ignored. Lowers steady-state residency at the cost of a per-use host-to-device copy. | MiniMax-H3 specific |
+| `VLLM_OMNI_MINIMAX_H3_TE_STAGER` | Boolean truthy spellings; default false | Gives a staged MiniMax-H3 text encoder a pinned host master, so unloading rebinds instead of copying the weight set back to the host | Environment-only. Any other value means false. Only meaningful for a staged text encoder. | MiniMax-H3 specific |
+| `VLLM_OMNI_MINIMAX_H3_TE_RESIDENT` | Boolean truthy spellings; default false | Keeps a staged MiniMax-H3 text encoder on the device after its first encode; startup still parks it | Environment-only. Any other value means false. Trades steady-state residency back for a cheaper encode. | MiniMax-H3 specific |
+| `VLLM_OMNI_MINIMAX_H3_VAE_DTYPE` | `fp32` (default), `fp16`, or `bf16` | Parameter dtype for the MiniMax-H3 video and audio VAEs; applied when the VAE is installed | Environment-only. Applied only when the fused operators are unavailable; with them installed the existing precision is kept. Roughly halves VAE residency. | MiniMax-H3 specific |
+
 ## Per-stage environment
 
 Deploy configurations can set arbitrary environment keys for one stage:

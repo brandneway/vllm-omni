@@ -79,6 +79,7 @@ from vllm_omni.diffusion.sched.interface import (
     NewRequestData,
     validate_new_request_data_identity,
 )
+from vllm_omni.diffusion.utils.startup_memory_snapshot import enable_startup_device_snapshot
 from vllm_omni.diffusion.utils.startup_memory_trace import trace_startup_memory
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -317,6 +318,10 @@ class DiffusionWorker:
         # Setup device
         self.device = current_omni_platform.get_torch_device(rank)
         current_omni_platform.set_device(self.device)
+
+        # Opt-in startup memory snapshots must start before the model runner and
+        # the weight load allocate, so the history covers the whole startup.
+        enable_startup_device_snapshot(self.device)
 
         # Create vllm_config for parallel configuration. Pass explicit device_config
         # so DeviceConfig does not rely on current_platform in worker subprocesses.

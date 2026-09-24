@@ -23,6 +23,9 @@ if TYPE_CHECKING:
     VLLM_OMNI_DIFFUSION_STAGGER_COMPONENT_LOAD: str | None = None
     VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE: str | None = None
     VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE_LAYERS: str | None = None
+    VLLM_OMNI_DIFFUSION_STARTUP_MEM_SNAPSHOT: str | None = None
+    VLLM_OMNI_DIFFUSION_STARTUP_MEM_SNAPSHOT_HOST: str | None = None
+    VLLM_OMNI_DIFFUSION_STARTUP_MEM_SNAPSHOT_DIR: str | None = None
     VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS: str | None = None
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -62,6 +65,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (default 10 when the trace is enabled).
     "VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE_LAYERS": lambda: os.environ.get(
         "VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE_LAYERS", None
+    ),
+    # Set "1" to dump accelerator memory pickles (torch.npu.memory
+    # ``_dump_snapshot``) at every startup stage, or give a comma-separated
+    # stage list to capture only those. One pickle per rank and stage is
+    # ~100MiB, so the stage list is the disk guard.
+    "VLLM_OMNI_DIFFUSION_STARTUP_MEM_SNAPSHOT": lambda: os.environ.get(
+        "VLLM_OMNI_DIFFUSION_STARTUP_MEM_SNAPSHOT", None
+    ),
+    # Set "1" to write host-side startup accounting per stage (``/proc``
+    # RSS/PSS, a census of live CPU tensor storages, and a per-component
+    # host/device weight split). Covers the host weight shards DLO pins, which
+    # the accelerator snapshot cannot see. Accepts a stage list like the above.
+    "VLLM_OMNI_DIFFUSION_STARTUP_MEM_SNAPSHOT_HOST": lambda: os.environ.get(
+        "VLLM_OMNI_DIFFUSION_STARTUP_MEM_SNAPSHOT_HOST", None
+    ),
+    # Output directory for both startup snapshot collectors; defaults to
+    # ``startup_mem_snapshots`` under the serving working directory.
+    "VLLM_OMNI_DIFFUSION_STARTUP_MEM_SNAPSHOT_DIR": lambda: os.environ.get(
+        "VLLM_OMNI_DIFFUSION_STARTUP_MEM_SNAPSHOT_DIR", None
     ),
     # Comma-separated MiniMax-H3 components ("te", "vae") that wait in host
     # memory and only reach the device inside the pipeline phase using them;

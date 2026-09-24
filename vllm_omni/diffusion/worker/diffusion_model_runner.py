@@ -64,6 +64,7 @@ from vllm_omni.diffusion.sched.interface import (
     NewRequestData,
     validate_new_request_data_identity,
 )
+from vllm_omni.diffusion.utils.startup_memory_snapshot import disable_startup_device_snapshot
 from vllm_omni.diffusion.utils.startup_memory_trace import trace_startup_memory
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -355,7 +356,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
         self.model_memory_usage = int(m.consumed_memory)
         logger.info("Model runner: Model loaded successfully.")
-        trace_startup_memory("after_load", device=self.device)
+        trace_startup_memory("after_load", device=self.device, model=self.pipeline)
 
         if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
@@ -380,6 +381,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             self.pipeline,
             device=self.device,
         )
+        # The host/device split of offloaded weights is only settled here: the
+        # DLO backend has pinned its host shards and emptied the module storages,
+        # so this is the first stage where a snapshot has both sides final.
+        trace_startup_memory("after_offload_enable", device=self.device, model=self.pipeline)
 
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
@@ -445,6 +450,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self._interaction_coordinator = InteractionCoordinator.build(self.pipeline, self.od_config)
         if hasattr(self.pipeline, "_interaction_coordinator"):
             self.pipeline._interaction_coordinator = self._interaction_coordinator
+
+        # This worker's last startup stage: capture it and stop the memory
+        # recorder, so serving carries none of the history overhead.
+        trace_startup_memory("startup_complete", device=self.device, model=self.pipeline)
+        disable_startup_device_snapshot()
 
         logger.info("Model runner: Initialization complete.")
 
