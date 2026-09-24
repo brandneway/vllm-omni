@@ -81,6 +81,7 @@ from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
     PreparedEncoderInputs,
     encode_media,
     prepare_encoder_inputs,
+    resolve_minimax_h3_fps,
 )
 from vllm_omni.model_executor.models.minimax_h3.long_video import validate_encoded_frame_limit
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import build_minimax_h3_presentation
@@ -399,7 +400,18 @@ def resolve_minimax_h3_diffusion_model_path(
     return str(model_root / subdir)
 
 
-def _minimax_h3_post_process(output, output_type: str = "np"):
+def _request_output_fps(sampling_params: Any) -> int:
+    """Frame rate the muxer should stamp on the output.
+
+    The engine forwards the request's parameters to any post-processor that
+    declares ``sampling_params``; without one the H3 contract rate applies.
+    """
+    if sampling_params is None:
+        return MINIMAX_H3_FPS
+    return resolve_minimax_h3_fps(sampling_params)
+
+
+def _minimax_h3_post_process(output, output_type: str = "np", sampling_params: Any = None):
     """Convert the joint video/audio output without capturing worker state.
 
     The callable crosses the multiprocessing result queue, so it must remain a
@@ -409,6 +421,7 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     frames on the accelerator, so there is nothing left to scale or transpose
     here.
     """
+    fps = _request_output_fps(sampling_params)
     if not isinstance(output, tuple) or len(output) != 2:
         return output
     video, audio = output
@@ -423,7 +436,7 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
             "video": encoded_videos,
             "audio": [None] * len(encoded_videos),
             "audio_sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE,
-            "fps": MINIMAX_H3_FPS,
+            "fps": fps,
         }
     if video.dtype != torch.uint8 or video.ndim != 5 or video.shape[-1] not in (3, 4):
         # Float or channel-first frames would reach the muxer as a black or
@@ -441,7 +454,7 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
         "video": video,
         "audio": audio,
         "audio_sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE,
-        "fps": MINIMAX_H3_FPS,
+        "fps": fps,
     }
 
 
@@ -1997,6 +2010,7 @@ class MiniMaxH3Pipeline(
         max_pending: int = 2,
         batch_frames: int = 17,
         video_codec_options: dict[str, str] | None = None,
+        fps: int = MINIMAX_H3_FPS,
     ) -> bytes:
         """Decode and encode one output on the worker without full-video materialization.
 
@@ -2004,7 +2018,7 @@ class MiniMaxH3Pipeline(
         audio stream before temporal video chunks arrive. Everything after a
         chunk is committed -- crop, quantization, transfer, encoding -- is the
         shared consumer's job; this method only supplies what is specific to
-        H3: the audio waveform, the requested-size crop, and the fixed rate.
+        H3: the audio waveform, the requested-size crop, and the output rate.
 
         Every rank of a distributed VAE group drives the temporal collectives,
         but only the output owner receives chunks, so a peer rank returns empty
@@ -2028,7 +2042,7 @@ class MiniMaxH3Pipeline(
                 videos = decode_chunks_to_mp4(
                     self.video_vae,
                     video_latent,
-                    fps=MINIMAX_H3_FPS,
+                    fps=fps,
                     audio_waveforms=[audio_np],
                     audio_sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
                     batch_frames=batch_frames,
@@ -2414,7 +2428,8 @@ class MiniMaxH3Pipeline(
         continuation = resolve_continuation(
             extra, task=conditioning.task, step_execution=bool(getattr(self.od_config, "step_execution", False))
         )
-        validate_encoded_frame_limit(extra, conditioning.task, conditioning.num_frames)
+        fps = resolve_minimax_h3_fps(sampling)
+        validate_encoded_frame_limit(extra, conditioning.task, conditioning.num_frames, fps)
         if continuation is not None and (
             conditioning.video_edit_clean_rows is not None or conditioning.audio_edit_clean_rows is not None
         ):
@@ -2456,7 +2471,7 @@ class MiniMaxH3Pipeline(
                 f"MiniMax H3 encoder canvas must be divisible by 32, got {conditioning.width}x{conditioning.height}"
             )
         expected_latent_t = MINIMAX_H3_SHAPE_PLANNER.video_latent_t(conditioning.num_frames)
-        expected_audio_t = MINIMAX_H3_SHAPE_PLANNER.audio_latent_t(conditioning.num_frames / MINIMAX_H3_FPS)
+        expected_audio_t = MINIMAX_H3_SHAPE_PLANNER.audio_latent_t(conditioning.num_frames / fps)
         if (conditioning.latent_t, conditioning.audio_t) != (expected_latent_t, expected_audio_t):
             raise OmniClientError(
                 "MiniMax H3 encoder latent shape does not match its output frame count: "
@@ -2541,6 +2556,7 @@ class MiniMaxH3Pipeline(
             "task": task,
             "height": conditioning.height,
             "width": conditioning.width,
+            "fps": fps,
             "num_frames": conditioning.num_frames,
             "latent_t": conditioning.latent_t,
             "latent_h": conditioning.height // 16,
@@ -2621,6 +2637,7 @@ class MiniMaxH3Pipeline(
                         width=context["width"],
                         video_codec_options=context["video_codec_options"],
                         batch_frames=context["preencode_batch_frames"],
+                        fps=context["fps"],
                     )
                 )
                 audios.append(None)
@@ -2768,6 +2785,7 @@ class MiniMaxH3Pipeline(
                 _STEP_SHAPE: {
                     "height": context["height"],
                     "width": context["width"],
+                    "fps": context["fps"],
                     "latent_t": context["latent_t"],
                     "latent_h": context["latent_h"],
                     "latent_w": context["latent_w"],
@@ -3002,6 +3020,7 @@ class MiniMaxH3Pipeline(
                 width=shape["width"],
                 video_codec_options=shape.get("video_codec_options"),
                 batch_frames=shape.get("preencode_batch_frames", 17),
+                fps=shape.get("fps", MINIMAX_H3_FPS),
             )
             audio = None
         else:
