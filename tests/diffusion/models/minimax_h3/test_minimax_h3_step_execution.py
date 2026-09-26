@@ -397,6 +397,7 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     context = {
         "height": 96,
         "width": 64,
+        "fps": mod.MINIMAX_H3_FPS,
         "preencode_mp4": True,
         "preencode_batch_frames": batch_frames,
         "latent_t": 2,
