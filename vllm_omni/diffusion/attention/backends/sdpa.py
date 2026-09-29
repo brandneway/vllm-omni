@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Literal
 
 import torch
@@ -17,6 +18,116 @@ logger = init_logger(__name__)
 
 
 SDPAMaskMode = Literal["broadcast_k", "full_qk"]
+
+_PACKED_PREFIX_KEYS = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
+
+# Escape hatch for hardware A/B: set to "0" to force the original full_qk mask
+# path even when the packed prefix contract holds.
+_PREFIX_SLICE_ENV = "OMNI_DIFFUSION_SDPA_KV_PREFIX_SLICE"
+
+# (total_k, used) pairs whose 2D mask has already been verified to be exactly
+# ``arange(total_k) < used``. See _resolve_valid_kv_prefix.
+_VERIFIED_PREFIX: set[tuple[int, int]] = set()
+_VERIFIED_PREFIX_MAX = 8
+
+
+def _resolve_valid_kv_prefix(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: AttentionMetadata | None,
+    *,
+    causal: bool,
+) -> int | None:
+    """Length of the K/V prefix that can be dropped to avoid a quadratic mask.
+
+    MiniMax-H3 packs a real document followed by an alignment-padding document
+    (``cu_seqlens == [0, used, total]``) and masks the padding by building the
+    query-independent 2D prefix mask ``arange(total) < used``. The NPU SDPA
+    path expands that into a contiguous ``[B, 1, Sq, Skv]`` bool mask, which at
+    ``Skv ~ 202k`` is a 38 GiB allocation -- quadratic in the *padded* length
+    and therefore unavoidable whenever any padding exists.
+
+    Truncating K/V to ``[:used]`` reproduces the masked result exactly: the
+    excluded positions contribute softmax weight 0, so they can simply be
+    dropped. Query keeps its full length, so the output shape and row order are
+    unchanged and no re-assembly is needed. Note this is *stronger* than the
+    varlen contract -- because the mask does not depend on the query row,
+    padding-row outputs stay identical too.
+
+    Every check below reads host-side shape/type metadata only, so no device
+    sync is introduced. Returns ``None`` when the contract does not hold, which
+    means "fall back to materializing the mask" -- the pre-existing behaviour.
+    """
+    # Load-bearing: with a causal mask, dropping the K suffix would change the
+    # result for query rows that sit before it.
+    if causal:
+        return None
+    if attn_metadata is None:
+        return None
+
+    # Strategies that break the "every query row sees the same K prefix"
+    # premise, notably AllGather-KV (which slices Q to a shard and rewrites
+    # attn_mask while leaving ``extra`` untouched), and the joint-* variants.
+    if (
+        attn_metadata.query_ranges is not None
+        or attn_metadata.joint_query is not None
+        or attn_metadata.joint_key is not None
+        or attn_metadata.joint_attn_mask is not None
+        or attn_metadata.full_attn_spans is not None
+    ):
+        return None
+    if attn_metadata.attn_mask is None:
+        return None
+    if attn_metadata.attn_mask.dtype != torch.bool:
+        return None
+
+    extra = attn_metadata.extra
+    if any(name not in extra for name in _PACKED_PREFIX_KEYS):
+        return None
+    cu_q, cu_k = extra["cu_seqlens_q"], extra["cu_seqlens_k"]
+    used_q, used_k = extra["max_seqlen_q"], extra["max_seqlen_k"]
+    # Python ints, not tensors: reading their value never syncs.
+    if type(used_q) is not int or type(used_k) is not int or used_q != used_k:
+        return None
+    if getattr(cu_q, "shape", None) != (3,) or getattr(cu_k, "shape", None) != (3,):
+        # Exactly two documents: [real, pad].
+        return None
+
+    if query.shape[0] != 1 or key.shape[0] != 1:
+        return None
+    total = key.shape[1]
+    if query.shape[1] != total or value.shape != key.shape:
+        return None
+
+    attn_mask = attn_metadata.attn_mask
+    if attn_mask.ndim != 2 or attn_mask.shape != (1, total):
+        return None
+
+    used = used_k
+    if not 0 < used < total:
+        return None
+    if used < total - used:
+        # [real, pad] convention: the real document is the longer one. This is
+        # what distinguishes cu=[0, used, total] from cu=[0, pad, total]
+        # without reading the device tensor.
+        return None
+
+    # The structural checks above cannot prove the mask *threshold* equals
+    # ``used`` without touching device data. Verify once per shape: a missed
+    # detection only OOMs loudly, while a false positive silently produces
+    # wrong numbers, so the asymmetry is worth one sync per request.
+    token = (total, used)
+    if token not in _VERIFIED_PREFIX:
+        expected = torch.arange(total, device=attn_mask.device)[None] < used
+        if not bool(torch.equal(attn_mask.reshape(-1), expected.reshape(-1))):
+            return None
+        if len(_VERIFIED_PREFIX) >= _VERIFIED_PREFIX_MAX:
+            _VERIFIED_PREFIX.clear()
+        _VERIFIED_PREFIX.add(token)
+
+    logger.info_once("SDPA packed prefix slice active (used=%d, total=%d)", used, total)
+    return used
 
 
 def _maybe_reshape_attn_mask(
@@ -101,7 +212,21 @@ class SDPAImpl(AttentionImpl):
         # _maybe_reshape_attn_mask expects sequence length on dim=1.
         attention_mask = None
         if attn_metadata:
-            attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)
+            if mask_mode == "full_qk" and os.environ.get(_PREFIX_SLICE_ENV, "1") != "0":
+                # full_qk materializes [B, 1, Sq, Skv]; for the packed
+                # [real, pad] layout that is quadratic in the padded length.
+                # Drop the fully masked K/V suffix instead -- equivalent, and
+                # it leaves Sq (hence the output shape and row order) alone, so
+                # nothing has to be re-assembled.
+                used = _resolve_valid_kv_prefix(query, key, value, attn_metadata, causal=self.causal)
+                if used is not None:
+                    key = key[:, :used]
+                    value = value[:, :used]
+                    # Rebind the local only. Parallel strategies mutate the
+                    # caller's AttentionMetadata in place during pre_attention.
+                    attn_metadata = None
+            if attn_metadata is not None:
+                attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)
 
         enable_gqa = query.shape[2] != key.shape[2]
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))

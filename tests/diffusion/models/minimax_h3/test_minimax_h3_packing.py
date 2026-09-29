@@ -161,3 +161,48 @@ def test_condition_noise_accepts_a_reference_video_longer_than_the_target():
         noise_aug=0.5,
     )
     assert result.shape == rows.shape
+
+
+def test_ref2va_packing_matches_the_sdpa_packed_prefix_contract():
+    """Guard the contract SDPA's mask-free K/V prefix slice relies on.
+
+    MiniMax-H3 packs a real document followed by an alignment-padding one and
+    masks it with ``arange(total) < used``. ``SDPAImpl`` drops that suffix
+    instead of materializing the quadratic mask, but only while the produced
+    metadata keeps matching the contract. If the packing or the ``max_seqlen``
+    convention ever changes, this test is what makes it loud.
+    """
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+    from vllm_omni.diffusion.attention.backends.sdpa import _resolve_valid_kv_prefix
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
+        minimax_h3_packed_sequence_ref2va_blocks,
+    )
+
+    packed = minimax_h3_packed_sequence_ref2va_blocks(
+        text_len=8,
+        latent_t=8,
+        latent_h=8,
+        latent_w=8,
+        audio_t=8,
+        ref_blocks=[
+            {"kind": "image", "latent_h": 8, "latent_w": 8},
+            {"kind": "audio", "ref_audio_t": 4},
+        ],
+    )
+
+    cu = packed["cu_seqlens"]
+    assert cu.tolist()[0] == 0 and cu.shape == (3,)
+    used, total = int(cu[1]), int(cu[-1])
+    assert used >= total - used, f"fixture too small for the [real, pad] contract: used={used}, total={total}"
+
+    metadata = AttentionMetadata(
+        attn_mask=torch.arange(total)[None] < used,
+        extra={
+            "cu_seqlens_q": cu,
+            "cu_seqlens_k": cu.clone(),
+            "max_seqlen_q": used,
+            "max_seqlen_k": used,
+        },
+    )
+    rows = torch.randn(1, total, 2, 8)
+    assert _resolve_valid_kv_prefix(rows, rows, rows, metadata, causal=False) == used
