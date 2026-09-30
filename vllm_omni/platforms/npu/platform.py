@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import nullcontext
 from typing import Any
 
@@ -13,6 +14,16 @@ from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBa
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 logger = init_logger(__name__)
+
+# Diagnostic escape hatch for isolating autocast-driven CUDA/NPU divergence.
+# torch and torch_npu ship *separate* autocast implementations (different
+# classes, independently maintained cast policies), so a model can produce
+# different output under each -- e.g. MiniMax-H3's fp16 VAE decode.
+#   auto (default) -> torch.npu.amp.autocast  (unchanged behaviour)
+#   torch          -> torch.autocast(device_type="npu", ...)
+#   off            -> no autocast at all, so the wrapped ops keep their native dtype
+_AUTOCAST_ENV = "VLLM_OMNI_NPU_AUTOCAST"
+_AUTOCAST_MODES = ("auto", "torch", "off")
 
 _DIFFUSION_PACKED_MODULES_MAPPING = {
     "HunyuanImage3Pipeline": {
@@ -219,6 +230,38 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
             )
         if not enabled:
             return nullcontext()
+
+        # Diagnostic escape hatch; see _AUTOCAST_ENV. "auto" keeps the NPU
+        # default below, so an unset/short var changes nothing.
+        mode = os.environ.get(_AUTOCAST_ENV, "auto").strip().lower()
+        if mode not in _AUTOCAST_MODES:
+            logger.warning_once(
+                "Ignoring %s=%r; expected one of %s.",
+                _AUTOCAST_ENV,
+                mode,
+                _AUTOCAST_MODES,
+            )
+            mode = "auto"
+
+        if mode == "off":
+            logger.warning_once(
+                "%s=off: autocast disabled for npu/%s; wrapped ops keep their native dtype.",
+                _AUTOCAST_ENV,
+                dtype,
+            )
+            return nullcontext()
+
+        if mode == "torch":
+            logger.warning_once(
+                "%s=torch: using torch.autocast for npu/%s instead of torch.npu.amp.autocast.",
+                _AUTOCAST_ENV,
+                dtype,
+            )
+            return super().create_autocast_context(
+                device_type=device_type,
+                dtype=dtype,
+                enabled=enabled,
+            )
 
         # NPU-specific fallback
         try:
