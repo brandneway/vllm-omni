@@ -29,6 +29,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
+from vllm_omni.diffusion.models.minimax_h3.packed_sequence import _packed_dump_enabled
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -389,6 +390,19 @@ class MiniMaxH3Attention(nn.Module):
         attn_mask = None
         if used < packed_total:
             attn_mask = torch.arange(packed_total, device=q.device)[None] < used
+        if _packed_dump_enabled():
+            # Once per process: used/packed_total are fixed for the whole request,
+            # so one line per worker rank is enough to see the sharding and which
+            # masking branch this call takes.
+            logger.info_once(
+                "[attn] packed attention: q=%s k=%s  used=%d packed_total=%d padding=%d  -> %s",
+                tuple(q.shape),
+                tuple(k.shape),
+                used,
+                packed_total,
+                packed_total - used,
+                "padding mask built" if attn_mask is not None else "no padding, no mask",
+            )
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
             extra={
