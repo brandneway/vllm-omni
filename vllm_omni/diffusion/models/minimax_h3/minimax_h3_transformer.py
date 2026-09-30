@@ -53,6 +53,7 @@ from vllm_omni.diffusion.layers.indexed_modulation import (
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
+from vllm_omni.diffusion.models.minimax_h3.packed_sequence import _packed_dump_enabled
 from vllm_omni.platforms import current_omni_platform
 
 from .fasth3 import _resolve_native_target
@@ -619,6 +620,22 @@ class MiniMaxH3Attention(nn.Module):
             },
             video_layout=video_layout,
         )
+        if _packed_dump_enabled():
+            # Once per worker process: used/packed_total are fixed for the whole
+            # request, so a single line shows the per-rank sharding, how much of
+            # it is alignment padding, and which masking branch this call took.
+            logger.info_once(
+                "[attn] packed attention: q=%s k=%s  used=%d packed_total=%d padding=%d  "
+                "requests=%d  mask_free=%s  attn_mask=%s",
+                tuple(q.shape),
+                tuple(k.shape),
+                used,
+                packed_total,
+                packed_total - used,
+                num_requests,
+                mask_free_packed_padding,
+                "built" if attn_mask is not None else "not built",
+            )
         return self.attention(
             q.unsqueeze(0),
             k.unsqueeze(0),
