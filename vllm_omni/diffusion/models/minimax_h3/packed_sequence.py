@@ -13,10 +13,57 @@ Builder rules:
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping, Sequence
 
 import numpy as np
 import torch
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+# Diagnostic: dump the packed row map (what each span is, and which rows exist
+# only to round the length up to _SEQ_ALIGN). Off unless set to a truthy value.
+_PACKED_DUMP_ENV = "VLLM_OMNI_MINIMAX_H3_PACKED_DUMP"
+
+
+def _packed_dump_enabled() -> bool:
+    return os.environ.get(_PACKED_DUMP_ENV, "0").strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _dump_packed_layout(*, title: str, seq_len: int, used: int, segments: list[tuple[int, int, str]]) -> None:
+    """Log the packed row map.
+
+    ``segments`` must be an ordered, gap-free list of ``(start, stop, label)``
+    covering ``[0, seq_len)``.
+    """
+    if not _packed_dump_enabled():
+        return
+    logger.info(
+        "[packed] %s: seq_len=%d  participate=%d  padding=%d (align=%d)",
+        title,
+        seq_len,
+        used,
+        seq_len - used,
+        _SEQ_ALIGN,
+    )
+    for start, stop, label in segments:
+        logger.info(
+            "[packed]   %-11s %-20s %8d rows  %s",
+            "PARTICIPATE" if start < used else "PADDING",
+            f"[{start}, {stop})",
+            stop - start,
+            label,
+        )
+    if seq_len > used:
+        logger.info(
+            "[packed]   rows [%d, %d) exist only to round the packed length up to a multiple of "
+            "%d; they must not contribute to attention.",
+            used,
+            seq_len,
+            _SEQ_ALIGN,
+        )
+
 
 MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES: tuple[tuple[int, ...], ...] = (
     (0,),
@@ -219,6 +266,19 @@ def minimax_h3_packed_sequence(
     token_tags[text_sl] = 1  # TEXT (fl2va image-segment override happens upstream)
     token_tags[audio_sl] = 2  # AUDIO
     token_tags[img_pos] = 0  # VIDEO
+
+    _dump_packed_layout(
+        title=("fl2va" if include_keyframe_cond else "t2va"),
+        seq_len=seq_len,
+        used=used,
+        segments=[
+            (text_sl.start, text_sl.stop, "TEXT (prompt)"),
+            (cond_sl.start, cond_sl.stop, "IMGVID CONDITION"),
+            (audio_sl.start, audio_sl.stop, "TARGET audio"),
+            (video_sl.start, video_sl.stop, "TARGET video"),
+            (pad_sl.start, pad_sl.stop, "ALIGNMENT PADDING"),
+        ],
+    )
 
     cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
     doc = torch.zeros(seq_len, dtype=torch.int32)
@@ -574,6 +634,32 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         token_tags[_cat_ranges(ref_audio_pos_parts)] = 2  # AUDIO (reference)
     token_tags[audio_sl] = 2  # AUDIO (target)
     token_tags[img_pos] = 0  # VIDEO (refs + target)
+
+    segments: list[tuple[int, int, str]] = [(text_sl.start, text_sl.stop, "TEXT (prompt)")]
+    for ref_index, item in enumerate(block_slices, start=1):
+        kind = str(item["kind"])
+        if kind == "image":
+            sl = item["visual_sl"]
+            segments.append((sl.start, sl.stop, f"REF #{ref_index} image  ({item['latent_h']}x{item['latent_w']})"))
+        elif kind == "audio":
+            sl = item["audio_sl"]
+            segments.append((sl.start, sl.stop, f"REF #{ref_index} audio  (ref_audio_t={item['ref_audio_t']})"))
+        else:
+            a_sl, v_sl = item["audio_sl"], item["visual_sl"]
+            segments.append((a_sl.start, a_sl.stop, f"REF #{ref_index} {kind} audio"))
+            segments.append(
+                (
+                    v_sl.start,
+                    v_sl.stop,
+                    f"REF #{ref_index} {kind} video  ({item['latent_t']}f x {item['latent_h']}x{item['latent_w']})",
+                )
+            )
+    segments.append((audio_sl.start, audio_sl.stop, "TARGET audio"))
+    segments.append(
+        (video_sl.start, video_sl.stop, f"TARGET video  ({latent_t}f x {latent_h}x{latent_w})")
+    )
+    segments.append((pad_sl.start, pad_sl.stop, "ALIGNMENT PADDING"))
+    _dump_packed_layout(title="ref2va", seq_len=seq_len, used=used, segments=segments)
 
     cu = torch.tensor([0, used, seq_len], dtype=torch.int32)
     doc = torch.zeros(seq_len, dtype=torch.int32)
