@@ -54,6 +54,9 @@ CHECK_IMPORTS = {
             # STOP AND READ BEFORE YOU ADD ANYTHING ELSE TO THIS LIST:
             # pickle/cloudpickle are unsafe when deserializing untrusted data.
             "tests/diffusion/attention/test_attention_sp.py",
+            # Round-trips the decoder-handoff payload through pickle to prove it
+            # survives the stage boundary; only literals are deserialized.
+            "tests/model_executor/stage_input_processors/test_minimax_h3_decoder_handoff.py",
             "tests/helpers/process.py",
             "vllm_omni/diffusion/distributed/group_coordinator.py",
         },
