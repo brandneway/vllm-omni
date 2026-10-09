@@ -10,6 +10,7 @@ gate the real code applies to a module is still the real check.
 
 from __future__ import annotations
 
+import itertools
 import sys
 from types import SimpleNamespace
 
@@ -32,26 +33,28 @@ _ACL_FORMAT_FRACTAL_NZ = 29
 
 
 class _FakeTorchNpu:
-    """Records casts and remembers each storage's format, keyed by data_ptr.
+    """Records NZ allocations and remembers each storage's format by data_ptr.
 
-    ``npu_format_cast`` returns a fresh tensor, mirroring the real op, so the
-    post-cast readback in ``install_minimax_h3_dit_weight_nz`` is exercised
-    rather than assumed.
+    The production path allocates the NZ destination first and copies into it
+    (``npu_format_cast`` cannot convert a non-owning view -- see
+    ``maybe_cast_weight_to_nz``), so the fake models ``empty_with_format``.
+    The real ``Tensor.copy_`` runs unchanged against the returned tensor, which
+    is what makes the post-cast readback in the installer meaningful.
     """
 
     def __init__(self) -> None:
         self.cast_formats: list[int] = []
         self._formats: dict[int, int] = {}
         self.dropped = False
+        self.fail = False
 
-    def npu_format_cast(self, weight: torch.Tensor, fmt: int) -> torch.Tensor:
-        self.cast_formats.append(fmt)
-        if self.dropped:
-            # Mirrors a device where ``allow_internal_format`` is off: the op
-            # returns an ND tensor instead of raising.
-            return weight.clone()
-        out = weight.clone()
-        self._formats[out.untyped_storage().data_ptr()] = fmt
+    def empty_with_format(self, size, *, dtype=None, device=None, acl_format=2, **_kw) -> torch.Tensor:
+        if self.fail:
+            raise RuntimeError("unsupported shape")
+        self.cast_formats.append(acl_format)
+        out = torch.zeros(*size, dtype=dtype or torch.bfloat16)
+        # With ``allow_internal_format`` off the allocator hands back ND.
+        self._formats[out.untyped_storage().data_ptr()] = _ACL_FORMAT_ND if self.dropped else acl_format
         return out
 
     def get_npu_format(self, weight: torch.Tensor) -> int:
@@ -202,20 +205,22 @@ def test_silently_dropped_cast_is_reported(
     assert install_minimax_h3_dit_weight_nz(_model_with(_StubLinear(torch.bfloat16))) == 0
 
 
-def test_cast_failure_keeps_the_weight_and_continues(
+def test_a_failed_allocation_leaves_the_weight_and_the_run_intact(
     monkeypatch: pytest.MonkeyPatch, fake_torch_npu: _FakeTorchNpu, on_device: None
 ):
+    """One weight that cannot be converted must not abort the sweep."""
     monkeypatch.setenv(WEIGHT_NZ_ENV, "1")
     good = _StubLinear(torch.bfloat16)
     bad = _StubLinear(torch.bfloat16)
-    real_cast = fake_torch_npu.npu_format_cast
+    real_alloc = fake_torch_npu.empty_with_format
+    seen = itertools.count()
 
-    def fail_on_bad(weight: torch.Tensor, fmt: int) -> torch.Tensor:
-        if weight.untyped_storage().data_ptr() == bad.weight.untyped_storage().data_ptr():
+    def fail_the_first_allocation(size, **kwargs):
+        if next(seen) == 0:
             raise RuntimeError("unsupported shape")
-        return real_cast(weight, fmt)
+        return real_alloc(size, **kwargs)
 
-    monkeypatch.setattr(fake_torch_npu, "npu_format_cast", fail_on_bad)
+    monkeypatch.setattr(fake_torch_npu, "empty_with_format", fail_the_first_allocation)
 
     assert install_minimax_h3_dit_weight_nz(_model_with(bad, good)) == 1
     assert fake_torch_npu.get_npu_format(good.weight) == _ACL_FORMAT_FRACTAL_NZ

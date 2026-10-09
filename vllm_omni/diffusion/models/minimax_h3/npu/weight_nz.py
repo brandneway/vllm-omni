@@ -88,7 +88,22 @@ def maybe_cast_weight_to_nz(weight: torch.Tensor) -> torch.Tensor | None:
     import torch_npu
 
     try:
-        return torch_npu.npu_format_cast(weight.contiguous(), _ACL_FORMAT_FRACTAL_NZ)
+        # Allocate the NZ destination and copy into it, rather than
+        # ``npu_format_cast(weight.contiguous(), 29)``. The cast silently
+        # returns an ND tensor when the input does not own its storage, which
+        # is exactly the layerwise offload case (the weight is an as_strided
+        # view over a shared device buffer), and ``.contiguous()`` does not
+        # help: an already-contiguous view is returned unchanged and is still
+        # non-owning. Measured on Ascend910 -- the cast then costs a full
+        # copy + allocation and produces ND, so the matmul sees no NZ at all.
+        out = torch_npu.empty_with_format(
+            tuple(weight.shape),
+            dtype=weight.dtype,
+            device=weight.device,
+            acl_format=_ACL_FORMAT_FRACTAL_NZ,
+        )
+        out.copy_(weight)
+        return out
     except Exception as exc:
         logger.warning("MiniMax-H3 weight NZ: could not transpose %s, keeping ND: %s", tuple(weight.shape), exc)
         return None

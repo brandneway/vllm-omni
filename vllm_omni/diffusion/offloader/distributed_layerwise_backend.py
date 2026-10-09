@@ -153,6 +153,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         rank_local_mmap: bool = False,
         tensor_transforms: dict[int, Any] | None = None,
         materialization_probe_tensor: torch.Tensor | None = None,
+        nz_cast_weights: bool = False,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
         if type(dp_size) is not int or dp_size < 1:
@@ -182,8 +183,13 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # backend (see weight_nz.py), so the conversion happens here instead,
         # once per weight per upload. Resolved at construction: prefetch_layer
         # is hot, and a model-specific import has no business on that path.
+        #
+        # Scope is the DiT only. This installer is shared with the text
+        # encoder, and casting the encoder's weights reaches matmul shapes that
+        # aclnnMatmulWeightNz rejects outright (measured: error 161002), so the
+        # caller has to say which component it is installing.
         self._nz_cast_fn: Callable[[torch.Tensor], torch.Tensor | None] | None = None
-        if _weight_nz_requested():
+        if nz_cast_weights and _weight_nz_requested():
             from vllm_omni.diffusion.models.minimax_h3.npu.weight_nz import (
                 maybe_cast_weight_to_nz,
                 nz_cast_takes_effect,
@@ -192,7 +198,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             if nz_cast_takes_effect():
                 self._nz_cast_fn = maybe_cast_weight_to_nz
                 logger.info(
-                    "Layerwise offload will cast block weights to FRACTAL_NZ on every upload "
+                    "Layerwise offload will cast DiT block weights to FRACTAL_NZ on every upload "
                     "(%s): one extra conversion per weight per block",
                     _WEIGHT_NZ_ENV,
                 )
@@ -820,6 +826,7 @@ def apply_distributed_block_hook(
     rank_local_mmap: bool = False,
     tensor_transforms: dict[int, Any] | None = None,
     materialization_probe_tensor: torch.Tensor | None = None,
+    nz_cast_weights: bool = False,
 ) -> DistributedLayerwiseOffloadHook:
     """Register a DistributedLayerwiseOffloadHook on *module*."""
     registry = HookRegistry.get_or_create(module)
@@ -836,6 +843,7 @@ def apply_distributed_block_hook(
         rank_local_mmap=rank_local_mmap,
         tensor_transforms=tensor_transforms,
         materialization_probe_tensor=materialization_probe_tensor,
+        nz_cast_weights=nz_cast_weights,
     )
     registry.register_hook(DistributedLayerwiseOffloadHook._HOOK_NAME, hook)
     return hook
@@ -1541,6 +1549,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     rank_local_mmap=self._using_rank_local_mmap if use_dit_mmap else False,
                     tensor_transforms=self._mmap_transforms_by_tensor_id if use_dit_mmap else None,
                     materialization_probe_tensor=probes[id(block)],
+                    nz_cast_weights=component == DIT_COMPONENT,
                 )
             )
 
