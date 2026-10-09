@@ -77,6 +77,18 @@ Backend names for `DIFFUSION_ATTENTION_BACKEND` are the members of
 `SAGE_ATTN`, `FLASHINFER_ATTN`, and `TRTLLM_ATTN`. Platform support still
 depends on the installed kernels and model path.
 
+### RainFusion sparse attention
+
+These apply only when the RainFusion sparse attention backend is selected.
+Each is read once, through a cached accessor, at the first attention dispatch
+that consults it; restart the worker after changing one.
+
+| Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `VLLM_OMNI_RAINFUSION_MASK_ALGO` | `estimate`, or unset for the native pooling mask | Swaps the mask algorithm on the RainFusion path: `sparse_block_estimate` replaces spatial rearrange plus avgpool scoring, while the execution kernel and its quantization stay the same | Environment-only. Only the exact value `estimate` selects it; any other value keeps the native mask. Requires the `sparse_block_estimate` kernel in the installed MindIE-SD. | Experimental |
+| `VLLM_OMNI_RAINFUSION_ESTIMATE_CDF` | Float; default `1.0` | CDF threshold of the estimate mask; read on the estimate path | Environment-only. A value that does not parse as a float falls back to `1.0`. Ignored unless `VLLM_OMNI_RAINFUSION_MASK_ALGO=estimate`. | Experimental |
+| `VLLM_OMNI_RAINFUSION_ESTIMATE_PROTECT` | `0` disables; default `1` (on) | Keeps the native mask's dense context and first-frame protection on the estimate mask, so text key blocks stay visible to every query row | Environment-only. Only the exact value `0` disables it. Ignored unless `VLLM_OMNI_RAINFUSION_MASK_ALGO=estimate`. | Experimental |
+
 ### Serving and runtime
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
@@ -145,10 +157,16 @@ unset; the residency controls change where weights sit during the load.
 | `VLLM_OMNI_DIFFUSION_STARTUP_MEM_SNAPSHOT_DIR` | Directory path; default `startup_mem_snapshots` under the serving working directory | Output directory shared by both startup snapshot collectors | Environment-only. Created on demand. Size the volume before enabling every stage on every rank. | Diagnostic |
 | `VLLM_OMNI_DIFFUSION_SKIP_POST_LOAD_EMPTY_CACHE` | Boolean truthy spellings; default false | Keeps the caching-allocator pages the online-quantization stream frees after model load; read when the loader would release them | Environment-only escape hatch. Any other value means false. Measure before keeping: the retained pages reduce what the startup profile run can use. | Diagnostic and temporary |
 | `VLLM_OMNI_DIFFUSION_STAGGER_COMPONENT_LOAD` | Boolean truthy spellings; default false | Parks the pipeline's encoders and VAEs on the host while the DiT online-quantization weight stream runs, restoring them before the load returns | Environment-only. Any other value means false. Re-times startup residency only; the resident set afterward is unchanged. | Experimental performance control |
+| `VLLM_OMNI_MINIMAX_H3_AUDIO_TCONV_CONV1D` | Boolean truthy spellings; default false | Replaces the MiniMax-H3 audio VAE's transposed convolutions with a phase-decomposed `F.conv1d` evaluation; applied when the decoder graph is installed | Environment-only. Any other value means false. Algebraically identical to the native transposed convolution. | MiniMax-H3 specific |
 | `VLLM_OMNI_MINIMAX_H3_STAGED_COMPONENTS` | Comma-separated component names (`te`, `vae`); empty keeps every component device-resident | MiniMax-H3 components that wait in host memory and reach the device only inside the pipeline phase using them | Environment-only. Unknown names are ignored. Lowers steady-state residency at the cost of a per-use host-to-device copy. | MiniMax-H3 specific |
+| `VLLM_OMNI_MINIMAX_H3_TAEH3` | Boolean truthy spellings; default false | Swaps the MiniMax-H3 video VAE decoder for the lightweight TAEH3 decoder; read when the video VAE is installed | Environment-only. Any other value means false. `VLLM_OMNI_MINIMAX_H3_TAEH3_CHECKPOINT` overrides the decoder weights path. | MiniMax-H3 specific |
+| `VLLM_OMNI_MINIMAX_H3_TAEH3_CHECKPOINT` | Directory path; unset uses the checkpoint bundled with the TAEH3 feature | Source of the TAEH3 decoder weights, used only when `VLLM_OMNI_MINIMAX_H3_TAEH3` is on | Environment-only. Ignored while TAEH3 is disabled. | MiniMax-H3 specific |
 | `VLLM_OMNI_MINIMAX_H3_TE_STAGER` | Boolean truthy spellings; default false | Gives a staged MiniMax-H3 text encoder a pinned host master, so unloading rebinds instead of copying the weight set back to the host | Environment-only. Any other value means false. Only meaningful for a staged text encoder. | MiniMax-H3 specific |
 | `VLLM_OMNI_MINIMAX_H3_TE_RESIDENT` | Boolean truthy spellings; default false | Keeps a staged MiniMax-H3 text encoder on the device after its first encode; startup still parks it | Environment-only. Any other value means false. Trades steady-state residency back for a cheaper encode. | MiniMax-H3 specific |
+| `VLLM_OMNI_MINIMAX_H3_UNLOCK_FPS` | Boolean truthy spellings; default false | Unlocks frame rates other than the fixed MiniMax-H3 default on incoming requests; read when sampling parameters are resolved | Environment-only. Any other value means false. Values outside the supported range are still rejected. | MiniMax-H3 specific |
+| `VLLM_OMNI_MINIMAX_H3_UNLOCK_SHORT_EDGE` | Boolean truthy spellings; default false | Unlocks output short edges other than the fixed MiniMax-H3 default on incoming requests; read when the output canvas is resolved | Environment-only. Any other value means false. Values outside the supported range are still rejected. | MiniMax-H3 specific |
 | `VLLM_OMNI_MINIMAX_H3_VAE_DTYPE` | `fp32` (default), `fp16`, or `bf16` | Parameter dtype for the MiniMax-H3 video and audio VAEs; applied when the VAE is installed | Environment-only. Applied only when the fused operators are unavailable; with them installed the existing precision is kept. Roughly halves VAE residency. | MiniMax-H3 specific |
+| `VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ` | Boolean truthy spellings; default false | Pre-converts the MiniMax-H3 DiT's bf16/fp16 linear weights from ND to `FRACTAL_NZ` after the checkpoint loads; read in the DiT post-load hook | Environment-only. Any other value means false. Values are unchanged (bit-identical), but the layout is skipped under any CPU offload backend, which relocates the parameters. Requires `torch.npu.config.allow_internal_format`, which `NPUPlatform` enables. | MiniMax-H3 specific |
 
 ## Per-stage environment
 

@@ -16,10 +16,19 @@ if TYPE_CHECKING:
     CUDA_HOME: str | None = None
     LOCAL_RANK: int = 0
     VLLM_OMNI_DIFFUSION_SKIP_POST_LOAD_EMPTY_CACHE: str | None = None
+    VLLM_OMNI_MINIMAX_H3_AUDIO_TCONV_CONV1D: str | None = None
     VLLM_OMNI_MINIMAX_H3_STAGED_COMPONENTS: str | None = None
+    VLLM_OMNI_MINIMAX_H3_TAEH3: str | None = None
+    VLLM_OMNI_MINIMAX_H3_TAEH3_CHECKPOINT: str | None = None
     VLLM_OMNI_MINIMAX_H3_TE_RESIDENT: str | None = None
     VLLM_OMNI_MINIMAX_H3_TE_STAGER: str | None = None
+    VLLM_OMNI_MINIMAX_H3_UNLOCK_FPS: str | None = None
+    VLLM_OMNI_MINIMAX_H3_UNLOCK_SHORT_EDGE: str | None = None
     VLLM_OMNI_MINIMAX_H3_VAE_DTYPE: str | None = None
+    VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ: str | None = None
+    VLLM_OMNI_RAINFUSION_ESTIMATE_CDF: str | None = None
+    VLLM_OMNI_RAINFUSION_ESTIMATE_PROTECT: str | None = None
+    VLLM_OMNI_RAINFUSION_MASK_ALGO: str | None = None
     VLLM_OMNI_DIFFUSION_STAGGER_COMPONENT_LOAD: str | None = None
     VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE: str | None = None
     VLLM_OMNI_DIFFUSION_STARTUP_MEM_TRACE_LAYERS: str | None = None
@@ -98,6 +107,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Precision for the MiniMax-H3 video/audio VAEs ("fp32" default, or
     # "fp16"/"bf16" to roughly halve their residency on memory-tight cards).
     "VLLM_OMNI_MINIMAX_H3_VAE_DTYPE": lambda: os.environ.get("VLLM_OMNI_MINIMAX_H3_VAE_DTYPE", None),
+    # Set "1" to pre-convert the MiniMax-H3 DiT's bf16/fp16 linear weights from
+    # ND to FRACTAL_NZ after load, so each denoising step's matmul reads an NZ
+    # weight. Values are unchanged (bit-identical); skipped under any CPU
+    # offload backend, which relocates the parameters.
+    "VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ": lambda: os.environ.get("VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ", None),
 }
 
 
