@@ -28,11 +28,17 @@ Two prerequisites and one hazard are handled here:
   verified afterwards rather than assumed.
 * Quantized linears are skipped: their quant method owns the weight layout, and
   mxfp4 already casts its own weights to NZ.
-* Offloaded DiTs are skipped entirely. Every offload backend relocates the
+* Offloaded DiTs cannot be cast here. Every offload backend relocates the
   parameters after this hook -- the layerwise ones flatten them to pinned host
   memory, the sequential one moves whole modules -- and an internal-format
   tensor crossing that boundary transdata's back to ND, while the storage
-  descriptors only record logical strides and so would not notice.
+  descriptors only record logical strides and so would not notice. The one
+  layer that can still work is the layerwise upload path, which re-points the
+  parameters at a freshly filled device buffer every block: it calls
+  ``maybe_cast_weight_to_nz`` there instead, at the price of one ND->NZ
+  conversion per weight per upload. ``weight_nz_enabled`` is the shared
+  opt-in, and ``nz_cast_takes_effect`` lets that path fail loudly rather than
+  silently measure an unchanged baseline.
 """
 
 from __future__ import annotations
@@ -58,6 +64,50 @@ _NZ_DTYPES = (torch.bfloat16, torch.float16)
 
 def _weight_nz_env_enabled() -> bool:
     return os.environ.get(WEIGHT_NZ_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def weight_nz_enabled() -> bool:
+    """Public form of the opt-in, for callers outside this module."""
+    return _weight_nz_env_enabled()
+
+
+def maybe_cast_weight_to_nz(weight: torch.Tensor) -> torch.Tensor | None:
+    """Cast one weight to FRACTAL_NZ, or return ``None`` when it should stay ND.
+
+    The eligibility filter is deliberately shape/dtype-only: the layerwise
+    offload path re-points parameters from a flattened device buffer and has no
+    module handle, so it cannot consult ``quant_method``. Dtype does the same
+    job there -- quantized weights are int8/fp8 and the fp32 residents stay out
+    of ``_NZ_DTYPES`` -- and biases/norm scales are 1-D.
+
+    No readback check here: this runs once per weight per offload upload, and
+    the caller verifies the cast takes effect once at setup instead.
+    """
+    if weight.dim() != 2 or weight.dtype not in _NZ_DTYPES or not _is_npu_weight(weight):
+        return None
+    import torch_npu
+
+    try:
+        return torch_npu.npu_format_cast(weight.contiguous(), _ACL_FORMAT_FRACTAL_NZ)
+    except Exception as exc:
+        logger.warning("MiniMax-H3 weight NZ: could not transpose %s, keeping ND: %s", tuple(weight.shape), exc)
+        return None
+
+
+def nz_cast_takes_effect() -> bool:
+    """Probe once whether ``npu_format_cast`` actually produces NZ on this box.
+
+    With ``torch.npu.config.allow_internal_format`` off the cast silently
+    returns an ND tensor. Every caller of the offload-path cast checks this at
+    setup so a no-op cannot be mistaken for "NZ measured, no gain".
+    """
+    import torch_npu
+
+    try:
+        probe = torch.zeros(16, 16, dtype=torch.bfloat16, device="npu")
+        return _npu_format(torch_npu.npu_format_cast(probe, _ACL_FORMAT_FRACTAL_NZ)) == _ACL_FORMAT_FRACTAL_NZ
+    except Exception:
+        return False
 
 
 def _npu_format(tensor: torch.Tensor) -> int | None:
@@ -110,13 +160,12 @@ def install_minimax_h3_dit_weight_nz(model: nn.Module, od_config: Any | None = N
 
     if resolve_offload_strategy(od_config) is not OffloadStrategy.NONE:
         logger.info(
-            "MiniMax-H3 DiT weight NZ skipped (%s=%s): an offload backend owns the parameters",
+            "MiniMax-H3 DiT weight NZ deferred to the offload path (%s=%s): "
+            "an offload backend owns the parameters and re-casts at upload time",
             WEIGHT_NZ_ENV,
             os.environ.get(WEIGHT_NZ_ENV),
         )
         return 0
-
-    import torch_npu
 
     cast = 0
     skipped = 0
@@ -140,12 +189,11 @@ def install_minimax_h3_dit_weight_nz(model: nn.Module, od_config: Any | None = N
         if _npu_format(weight) == _ACL_FORMAT_FRACTAL_NZ:
             skipped += 1
             continue
-        try:
-            module.weight.data = torch_npu.npu_format_cast(weight.data.contiguous(), _ACL_FORMAT_FRACTAL_NZ)
-        except Exception as exc:
-            logger.warning("MiniMax-H3 DiT weight NZ: could not transpose %s, keeping ND: %s", name, exc)
+        cast_weight = maybe_cast_weight_to_nz(weight.data)
+        if cast_weight is None:
             skipped += 1
             continue
+        module.weight.data = cast_weight
         if _npu_format(module.weight) != _ACL_FORMAT_FRACTAL_NZ:
             # ``allow_internal_format`` is off, so the cast was silently dropped.
             logger.warning(
@@ -169,4 +217,7 @@ def install_minimax_h3_dit_weight_nz(model: nn.Module, od_config: Any | None = N
 __all__ = [
     "WEIGHT_NZ_ENV",
     "install_minimax_h3_dit_weight_nz",
+    "maybe_cast_weight_to_nz",
+    "nz_cast_takes_effect",
+    "weight_nz_enabled",
 ]

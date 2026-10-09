@@ -18,10 +18,12 @@ This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import weakref
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from functools import partial
 from itertools import chain
 from typing import Any
 
@@ -73,6 +75,18 @@ from .tensor_utils import (
 )
 
 logger = init_logger(__name__)
+
+# Read here rather than imported from the MiniMax-H3 module that owns the
+# policy: this module is imported by the offload package initializer, and
+# pulling a model package back through it risks a partially-initialized import.
+# The name is registered once in the environment-variable inventory.
+_WEIGHT_NZ_ENV = "VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ"
+
+
+def _weight_nz_requested() -> bool:
+    """Whether the MiniMax-H3 NZ opt-in is set (owner: models/minimax_h3/npu/weight_nz.py)."""
+    return os.environ.get(_WEIGHT_NZ_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
 
 # A backend normally owns both objects below. This process-lifetime safety
 # owner prevents HostWeightLease.__del__ from unmapping storage when cleanup
@@ -163,6 +177,31 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         self.copy_stream = copy_stream or current_omni_platform.Stream()
         self.comm_stream = comm_stream or current_omni_platform.Stream()
+
+        # Opt-in FRACTAL_NZ weights. The load-time cast cannot survive this
+        # backend (see weight_nz.py), so the conversion happens here instead,
+        # once per weight per upload. Resolved at construction: prefetch_layer
+        # is hot, and a model-specific import has no business on that path.
+        self._nz_cast_fn: Callable[[torch.Tensor], torch.Tensor | None] | None = None
+        if _weight_nz_requested():
+            from vllm_omni.diffusion.models.minimax_h3.npu.weight_nz import (
+                maybe_cast_weight_to_nz,
+                nz_cast_takes_effect,
+            )
+
+            if nz_cast_takes_effect():
+                self._nz_cast_fn = maybe_cast_weight_to_nz
+                logger.info(
+                    "Layerwise offload will cast block weights to FRACTAL_NZ on every upload "
+                    "(%s): one extra conversion per weight per block",
+                    _WEIGHT_NZ_ENV,
+                )
+            else:
+                logger.warning(
+                    "%s is set but npu_format_cast does not produce NZ on this device "
+                    "(torch.npu.config.allow_internal_format?); staying on ND",
+                    _WEIGHT_NZ_ENV,
+                )
 
         # Double buffers: either shared (from backend) or self-allocated (lazy)
         if shared_buffers is not None:
@@ -597,16 +636,51 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         if self._shared_slot_group is not None:
             self._shared_slot_group[slot] = self._group_id
 
-        # Re-point using cached metadata (avoids per-layer dict lookups).
-        for target, dtype, offset, numel, shape, stride in self._cached_repoint:
-            set_tensor_storage(
-                target,
-                torch.as_strided(
+        self._repoint_block(gpu_weights, slot)
+
+    def _repoint_block(self, gpu_weights: dict[torch.dtype, torch.Tensor], slot: int) -> None:
+        """Point this block's parameters at the buffer just filled for *slot*.
+
+        With the NZ opt-in on, each 2-D bf16/fp16 weight is converted on the
+        way in. That conversion reads the buffer, so it has to run on the
+        stream that filled it and the ready event every consumer waits on has
+        to cover it -- otherwise compute could read a half-converted weight.
+        """
+        writer = self.comm_stream if (self.dp_size > 1 and self.dp_group is not None) else self.copy_stream
+
+        def build() -> list[torch.Tensor]:
+            values: list[torch.Tensor] = []
+            for _target, dtype, offset, numel, shape, stride in self._cached_repoint:
+                value = torch.as_strided(
                     gpu_weights[dtype][offset : offset + numel],
                     size=shape,
                     stride=stride,
-                ),
-            )
+                )
+                if cast_fn is not None:
+                    cast = cast_fn(value)
+                    if cast is not None:
+                        value = cast
+                values.append(value)
+            return values
+
+        cast_fn = self._nz_cast_fn
+
+        # Re-point using cached metadata (avoids per-layer dict lookups).
+        if cast_fn is None:
+            for (target, *_rest), value in zip(self._cached_repoint, build(), strict=True):
+                set_tensor_storage(target, value)
+            return
+
+        with current_omni_platform.stream(writer):
+            values = build()
+            cast_event = current_omni_platform.Event()
+            cast_event.record(writer)
+
+        for (target, *_rest), value in zip(self._cached_repoint, values, strict=True):
+            set_tensor_storage(target, value)
+
+        self.ready_events[slot] = cast_event
+        self._prefetch_done = cast_event
 
     def _wait_for_weights(self, slot: int) -> None:
         """Wait until the slot holding this block is ready for compute.
@@ -823,7 +897,7 @@ class PinnedResidentLayerGroup:
                     bufs,
                     tensor_transforms,
                 )
-                cpu_shards = {}
+                cpu_shards: dict[torch.dtype, torch.Tensor] = {}
             else:
                 cpu_shards, metadata = DistributedLayerwiseOffloadHook._shard_and_pin(
                     params,
@@ -1909,7 +1983,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         removal_error = run_cleanup_steps(
             (
                 "removing a distributed block hook",
-                lambda block=block: remove_distributed_block_hook(block),
+                partial(remove_distributed_block_hook, block),
             )
             for blocks in self._blocks
             for block in blocks
@@ -1917,7 +1991,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         encoder_error = run_cleanup_steps(
             (
                 "clearing distributed encoder state",
-                lambda module=module: clear_encoder_layerwise_state(module),
+                partial(clear_encoder_layerwise_state, module),
             )
             for module in self._encoder_modules
         )
