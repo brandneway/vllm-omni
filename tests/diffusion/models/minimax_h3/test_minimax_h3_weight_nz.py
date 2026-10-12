@@ -143,6 +143,34 @@ def test_bf16_weights_are_cast_to_nz(monkeypatch: pytest.MonkeyPatch, fake_torch
     assert fake_torch_npu.get_npu_format(first.weight) == _ACL_FORMAT_FRACTAL_NZ
 
 
+def test_int8_weight_is_eligible_on_the_offload_path(
+    monkeypatch: pytest.MonkeyPatch, fake_torch_npu: _FakeTorchNpu, on_device: None
+):
+    """int8 is where the win is, so the offload filter must not drop it.
+
+    The load-time sweep still would not reach an int8 layer (it requires an
+    unquantized method), so this calls the offload helper the way the layerwise
+    upload does.
+    """
+    monkeypatch.setenv(WEIGHT_NZ_ENV, "1")
+    weight = torch.zeros(8, 4, dtype=torch.int8)
+
+    cast = weight_nz.maybe_cast_weight_to_nz(weight)
+
+    assert cast is not None
+    assert fake_torch_npu.cast_formats == [_ACL_FORMAT_FRACTAL_NZ]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.int32])
+def test_other_dtypes_stay_nd_on_the_offload_path(
+    monkeypatch: pytest.MonkeyPatch, fake_torch_npu: _FakeTorchNpu, on_device: None, dtype: torch.dtype
+):
+    monkeypatch.setenv(WEIGHT_NZ_ENV, "1")
+
+    assert weight_nz.maybe_cast_weight_to_nz(torch.zeros(8, 4, dtype=dtype)) is None
+    assert fake_torch_npu.cast_formats == []
+
+
 def test_second_call_is_idempotent(monkeypatch: pytest.MonkeyPatch, fake_torch_npu: _FakeTorchNpu, on_device: None):
     monkeypatch.setenv(WEIGHT_NZ_ENV, "1")
     model = _model_with(_StubLinear(torch.bfloat16))

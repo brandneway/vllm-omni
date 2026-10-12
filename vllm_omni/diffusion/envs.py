@@ -107,10 +107,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Precision for the MiniMax-H3 video/audio VAEs ("fp32" default, or
     # "fp16"/"bf16" to roughly halve their residency on memory-tight cards).
     "VLLM_OMNI_MINIMAX_H3_VAE_DTYPE": lambda: os.environ.get("VLLM_OMNI_MINIMAX_H3_VAE_DTYPE", None),
-    # Set "1" to pre-convert the MiniMax-H3 DiT's bf16/fp16 linear weights from
-    # ND to FRACTAL_NZ after load, so each denoising step's matmul reads an NZ
-    # weight. Values are unchanged (bit-identical); skipped under any CPU
-    # offload backend, which relocates the parameters.
+    # Set "1" to give the MiniMax-H3 DiT's linear weights the FRACTAL_NZ
+    # layout: once after load when they are device-resident, or on every
+    # layerwise upload when an offload backend owns them. Values are unchanged
+    # (bit-identical). The quantized int8 weights gain 13-17% on their matmul;
+    # the dense bf16 ones net out flat.
     "VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ": lambda: os.environ.get("VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ", None),
 }
 

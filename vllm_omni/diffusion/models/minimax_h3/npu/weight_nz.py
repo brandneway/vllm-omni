@@ -14,9 +14,17 @@ transdata on the weight side every call.
 
 ``npu_format_cast`` only rewrites the storage layout; the values are untouched,
 so the matmul result is bit-identical to the ND path (measured maxdiff ``0.0``
-for bf16 on Ascend910). The win is shape dependent -- largest on the wide-M
-GEMMs the DiT issues, slightly negative on small-M calls -- so the switch is
-opt-in and off by default.
+for both bf16 and int8 on Ascend910).
+
+Two regimes, and they behave very differently:
+
+* **Quantized (int8)** -- uniformly better. The four DiT linears measured
+  0.834 / 0.865 / 0.826 / 0.861 against the real ``npu_quant_matmul`` call, all
+  bit-identical, with no shape regressing.
+* **Dense bf16** -- shape dependent, and it nets out flat: 0.764x on out_proj
+  and 0.902x on qkv, but 1.023x on fc1 and 1.144x on fc2.
+
+The switch is opt-in and off by default.
 
 Only the DiT is touched: the text encoder and the VAEs keep their ND weights.
 
@@ -26,8 +34,10 @@ Two prerequisites and one hazard are handled here:
   sets it for every NPU deployment (``platforms/npu/platform.py``); with it
   ``False``, ``npu_format_cast`` silently returns an ND tensor, so the cast is
   verified afterwards rather than assumed.
-* Quantized linears are skipped: their quant method owns the weight layout, and
-  mxfp4 already casts its own weights to NZ.
+* The load-time sweep only takes unquantized linears: a quantized layer's
+  method owns its weight layout, and mxfp4 casts its own weights to NZ. The
+  offload path has no such guard and instead keys off the dtype set, which is
+  why int8 reaches it there and not here.
 * Offloaded DiTs cannot be cast here. Every offload backend relocates the
   parameters after this hook -- the layerwise ones flatten them to pinned host
   memory, the sequential one moves whole modules -- and an internal-format
@@ -58,8 +68,20 @@ WEIGHT_NZ_ENV = "VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ"
 # ACL_FORMAT_FRACTAL_NZ, the format id ``torch_npu.npu_format_cast`` takes.
 _ACL_FORMAT_FRACTAL_NZ = 29
 
-# FRACTAL_NZ is a 16x16 fractal layout; fp32 has no NZ matmul path at all.
-_NZ_DTYPES = (torch.bfloat16, torch.float16)
+# FRACTAL_NZ is a fractal layout (16x16 blocks; 16 elements per block row for
+# bf16/fp16, 32 for int8). fp32 has no NZ matmul path at all.
+#
+# int8 is included because that is where the win actually is: measured on
+# Ascend910 with the real npu_quant_matmul call (dynamic-quant activations,
+# per-channel weight scale, bf16 output), the four DiT linears come out
+# bit-identical and 13-17% faster on an NZ weight -- 0.834 / 0.865 / 0.826 /
+# 0.861 -- uniformly, with no shape regressing. The bf16 dense path, by
+# contrast, swings between 0.76x and 1.14x and nets out flat.
+#
+# fp8 is deliberately NOT here yet: its online methods pack their own layout
+# (mxfp4 casts its weights itself), and no fp8 kernel has been checked against
+# an NZ weight on this stack.
+_NZ_DTYPES = (torch.bfloat16, torch.float16, torch.int8)
 
 
 def _weight_nz_env_enabled() -> bool:
@@ -76,9 +98,13 @@ def maybe_cast_weight_to_nz(weight: torch.Tensor) -> torch.Tensor | None:
 
     The eligibility filter is deliberately shape/dtype-only: the layerwise
     offload path re-points parameters from a flattened device buffer and has no
-    module handle, so it cannot consult ``quant_method``. Dtype does the same
-    job there -- quantized weights are int8/fp8 and the fp32 residents stay out
-    of ``_NZ_DTYPES`` -- and biases/norm scales are 1-D.
+    module handle, so it cannot consult ``quant_method``. The dtype set carries
+    that decision instead -- see ``_NZ_DTYPES`` -- and the 1-D bias/scale
+    tensors that travel in the same buffer fall out on the rank check.
+
+    Quantized weights need no special handling here: ``process_weights_after_loading``
+    has already put them in the layout the kernel wants (int8, ``(K, N)``), so
+    the NZ cast applies to that tensor exactly as it does to a dense one.
 
     No readback check here: this runs once per weight per offload upload, and
     the caller verifies the cast takes effect once at setup instead.
