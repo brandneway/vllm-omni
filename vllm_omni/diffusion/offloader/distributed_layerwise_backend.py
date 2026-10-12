@@ -148,7 +148,6 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         rank: int,
         copy_stream: Any | None = None,
         comm_stream: Any | None = None,
-        convert_stream: Any | None = None,
         pin_memory: bool = True,
         shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
         rank_local_mmap: bool = False,
@@ -179,7 +178,6 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         self.copy_stream = copy_stream or current_omni_platform.Stream()
         self.comm_stream = comm_stream or current_omni_platform.Stream()
-        self.convert_stream = convert_stream or current_omni_platform.Stream()
 
         # Opt-in FRACTAL_NZ weights. The load-time cast cannot survive this
         # backend (see weight_nz.py), so the conversion happens here instead,
@@ -650,11 +648,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         """Point this block's parameters at the buffer just filled for *slot*.
 
         With the NZ opt-in on, each 2-D bf16/fp16 weight is converted on the
-        way in. That conversion reads the filled buffer, so it waits on the
-        event recorded when the fill finished, and the event every consumer
-        waits on is re-recorded to cover it -- otherwise compute could read a
-        half-converted weight.
+        way in. That conversion reads the buffer, so it has to run on the
+        stream that filled it and the ready event every consumer waits on has
+        to cover it -- otherwise compute could read a half-converted weight.
         """
+        writer = self.comm_stream if (self.dp_size > 1 and self.dp_group is not None) else self.copy_stream
 
         def build() -> list[torch.Tensor]:
             values: list[torch.Tensor] = []
@@ -679,13 +677,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 set_tensor_storage(target, value)
             return
 
-        fill_event = self.ready_events[slot]
-        with current_omni_platform.stream(self.convert_stream):
-            if fill_event is not None:
-                self.convert_stream.wait_event(fill_event)
+        with current_omni_platform.stream(writer):
             values = build()
             cast_event = current_omni_platform.Event()
-            cast_event.record(self.convert_stream)
+            cast_event.record(writer)
 
         for (target, *_rest), value in zip(self._cached_repoint, values, strict=True):
             set_tensor_storage(target, value)
@@ -826,7 +821,6 @@ def apply_distributed_block_hook(
     rank: int,
     copy_stream: Any | None = None,
     comm_stream: Any | None = None,
-    convert_stream: Any | None = None,
     pin_memory: bool = True,
     shared_buffers: list[dict[torch.dtype, torch.Tensor] | None] | None = None,
     rank_local_mmap: bool = False,
@@ -844,7 +838,6 @@ def apply_distributed_block_hook(
         rank=rank,
         copy_stream=copy_stream,
         comm_stream=comm_stream,
-        convert_stream=convert_stream,
         pin_memory=pin_memory,
         shared_buffers=shared_buffers,
         rank_local_mmap=rank_local_mmap,
@@ -1100,14 +1093,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         self.copy_stream = current_omni_platform.Stream()
         self.comm_stream = current_omni_platform.Stream()
-        # The NZ conversion runs here rather than on the copy/comm stream it
-        # reads from. Those streams carry the *next* block's H2D and AllGather,
-        # so converting on them serializes the conversion in front of every
-        # subsequent transfer -- measured as +642 ms on hcom_allGather_ and
-        # +866 ms on allgatherAicpuKernel over one 4-step request. A dedicated
-        # stream that only waits on the fill event lets conversions pipeline
-        # behind the transfers instead of blocking them.
-        self.convert_stream = current_omni_platform.Stream()
         self.dp_group: torch.distributed.ProcessGroup | None = None
         self.dp_size = config.dp_size
         self.rank = 0
@@ -1559,7 +1544,6 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     group_rank,
                     self.copy_stream,
                     self.comm_stream,
-                    self.convert_stream,
                     self.config.pin_cpu_memory,
                     shared_buffers=[None, None],
                     rank_local_mmap=self._using_rank_local_mmap if use_dit_mmap else False,
