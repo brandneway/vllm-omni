@@ -271,3 +271,134 @@ def test_no_offload_config_still_casts(monkeypatch: pytest.MonkeyPatch, fake_tor
     monkeypatch.setenv(WEIGHT_NZ_ENV, "1")
 
     assert install_minimax_h3_dit_weight_nz(_model_with(_StubLinear(torch.bfloat16)), od_config=None) == 1
+
+
+# --------------------------------------------------------------------------- #
+#  Reactor: host-side pre-permutation + zero-copy re-interpretation           #
+# --------------------------------------------------------------------------- #
+#
+# The device half of the reactor cannot run here, but everything that decides
+# *what* gets permuted, and the permutation itself, is pure host arithmetic.
+
+
+class _FakeTorchNpuWithConstructors(_FakeTorchNpu):
+    """Adds the pointer-backed storage constructors the reactor needs."""
+
+    class _C:  # noqa: N801 - mirrors the real attribute path
+        @staticmethod
+        def _construct_storage_from_data_pointer(*_args, **_kw) -> object:
+            return object()
+
+        @staticmethod
+        def _construct_NPU_Tensor_From_Storage_And_Metadata(_metadata, _storage) -> torch.Tensor:
+            return torch.zeros(1)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, "reactor"),
+        ("", "reactor"),
+        ("reactor", "reactor"),
+        ("REACTOR", "reactor"),
+        ("cast", "cast"),
+        ("bogus", "reactor"),
+    ],
+)
+def test_nz_mode_defaults_to_the_transdata_free_path(monkeypatch: pytest.MonkeyPatch, value: str | None, expected: str):
+    if value is None:
+        monkeypatch.delenv(weight_nz.NZ_MODE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(weight_nz.NZ_MODE_ENV, value)
+
+    assert weight_nz.nz_mode() == expected
+
+
+@pytest.mark.parametrize(
+    ("shape", "block", "expected"),
+    [
+        ((16, 16), 16, 256),
+        ((32, 48), 16, 1536),
+        ((17, 16), 16, 512),  # 17 rows pad to 32
+        ((16, 17), 16, 512),
+    ],
+)
+def test_nz_padded_numel_rounds_each_axis_up_to_the_block(shape, block, expected):
+    assert weight_nz.nz_padded_numel(shape, block) == expected
+
+
+@pytest.mark.parametrize(
+    ("shape", "stride", "dtype", "expected"),
+    [
+        ((16, 16), (16, 1), torch.bfloat16, True),
+        ((4096, 4096), (4096, 1), torch.float16, True),
+        ((17, 16), (16, 1), torch.bfloat16, False),  # padded footprint exceeds the slot
+        ((16, 16), (16, 1), torch.float32, False),  # no NZ block size
+        ((16, 16), (16, 1), torch.int8, False),  # 16x32 blocking, not measured
+        ((16, 16), (32, 2), torch.bfloat16, False),  # not the plain layout
+        ((64,), (1,), torch.bfloat16, False),  # not 2-D
+    ],
+)
+def test_nz_reactor_can_hold_matches_the_slot_the_nd_path_reserved(shape, stride, dtype, expected):
+    assert weight_nz.nz_reactor_can_hold(shape, stride, dtype) is expected
+
+
+def test_permute_host_weight_to_nz_moves_each_element_to_its_block_position():
+    """A [16, 32] weight has two K-blocks, so column 16 must move to flat 256."""
+    # fp16 keeps every value below 512 exact, so positions compare as integers
+    # rather than to a tolerance.
+    weight = torch.arange(16 * 32, dtype=torch.float16).reshape(16, 32)
+
+    flat = weight_nz.permute_host_weight_to_nz(weight)
+
+    assert tuple(flat.shape) == (16 * 32,)
+    # flat = [K1=2, N1=1, N0=16, K0=16]; (n, k) -> (k//16)*256 + n*16 + k%16
+    assert flat[0].item() == weight[0, 0].item()
+    assert flat[271].item() == weight[0, 31].item()  # k=31: second K-block, row 0, col 15
+    assert flat[256].item() == weight[0, 16].item()  # k=16 opens the second block
+    assert flat[511].item() == weight[15, 31].item()  # last element stays last
+
+
+def test_permute_host_weight_to_nz_round_trips():
+    """The inverse recovers the original, so the permutation is a bijection."""
+    weight = torch.randn(64, 48, dtype=torch.bfloat16)
+    n, k, block = 64, 48, 16
+
+    flat = weight_nz.permute_host_weight_to_nz(weight)
+    restored = flat.reshape(k // block, n // block, block, block).permute(1, 2, 0, 3).reshape(n, k)
+
+    assert torch.equal(restored.to(torch.bfloat16), weight)
+
+
+def test_reactor_probes_are_false_when_the_constructors_are_missing(
+    fake_torch_npu: _FakeTorchNpu,
+):
+    """Without the private pair the caller must fall back, not silently no-op."""
+    assert weight_nz.nz_reactor_available() is False
+    assert weight_nz.nz_reactor_takes_effect() is False
+
+
+def test_reactor_is_available_when_both_constructors_are_present(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setitem(sys.modules, "torch_npu", _FakeTorchNpuWithConstructors())
+
+    assert weight_nz.nz_reactor_available() is True
+
+
+def test_reactor_weight_names_follows_the_same_module_filter():
+    """Only unquantized linears' weights; a quantized or fp32 sibling is not one."""
+    model = nn.Module()
+    model.add_module("qkv", _StubLinear(torch.bfloat16))
+    model.add_module("quantized", _StubLinear(torch.bfloat16, quant_method=_QuantMethodStub()))
+    model.add_module("final", _StubLinear(torch.float32))
+    model.add_module("norm", nn.LayerNorm(4))
+
+    assert weight_nz.nz_reactor_weight_names(model) == {"qkv.weight"}
+
+
+def test_reactor_weight_names_uses_the_qualified_module_path():
+    model = nn.Module()
+    inner = nn.Module()
+    inner.add_module("out_proj", _StubLinear(torch.bfloat16))
+    model.add_module("blocks", inner)
+
+    assert weight_nz.nz_reactor_weight_names(model) == {"blocks.out_proj.weight"}

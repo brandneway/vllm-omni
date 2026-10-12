@@ -188,14 +188,42 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # encoder, and casting the encoder's weights reaches matmul shapes that
         # aclnnMatmulWeightNz rejects outright (measured: error 161002), so the
         # caller has to say which component it is installing.
+        #
+        # Two mechanisms, resolved once here. "reactor" pre-permutes on the host
+        # and only re-interprets the uploaded buffer, so the hot path emits no
+        # format op at all -- that transdata is what contends with sparse
+        # attention. "cast" is the earlier per-upload conversion, kept as the
+        # fallback (and for the dtypes and shapes the reactor cannot hold).
         self._nz_cast_fn: Callable[[torch.Tensor], torch.Tensor | None] | None = None
+        self._nz_permute_fn: Callable[[torch.Tensor], torch.Tensor] | None = None
+        self._nz_view_fn: Callable[..., torch.Tensor] | None = None
+        self._nz_names: frozenset[str] = frozenset()
+        # Strong reference to the buffer the NZ views point into.  They own
+        # nothing, and the caching allocator hands a freed address straight back
+        # out, so a view that outlives its buffer reads silently wrong data
+        # rather than raising.  gpu_buffers already holds this, but the
+        # invariant is worth stating where it is relied on.
+        self._nz_keepalive: dict[torch.dtype, torch.Tensor] | None = None
         if nz_cast_weights and _weight_nz_requested():
             from vllm_omni.diffusion.models.minimax_h3.npu.weight_nz import (
                 maybe_cast_weight_to_nz,
                 nz_cast_takes_effect,
+                nz_mode,
+                nz_reactor_available,
+                nz_reactor_takes_effect,
+                nz_view_over_buffer,
+                permute_host_weight_to_nz,
             )
 
-            if nz_cast_takes_effect():
+            if nz_mode() == "reactor" and nz_reactor_available() and nz_reactor_takes_effect():
+                self._nz_permute_fn = permute_host_weight_to_nz
+                self._nz_view_fn = nz_view_over_buffer
+                logger.info(
+                    "Layerwise offload will re-interpret DiT block weights as FRACTAL_NZ from "
+                    "host-permuted bytes (%s): no conversion on the upload path",
+                    _WEIGHT_NZ_ENV,
+                )
+            elif nz_cast_takes_effect():
                 self._nz_cast_fn = maybe_cast_weight_to_nz
                 logger.info(
                     "Layerwise offload will cast DiT block weights to FRACTAL_NZ on every upload "
@@ -204,7 +232,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 )
             else:
                 logger.warning(
-                    "%s is set but npu_format_cast does not produce NZ on this device "
+                    "%s is set but neither NZ path produces FRACTAL_NZ on this device "
                     "(torch.npu.config.allow_internal_format?); staying on ND",
                     _WEIGHT_NZ_ENV,
                 )
@@ -286,11 +314,14 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.next_block_parameters = dict(self.next_block.named_parameters())
         self.next_block_buffers = dict(self.next_block.named_buffers())
 
+        self._nz_names = self._resolve_nz_names()
+
         if self.rank_local_mmap:
             self.cpu_sources, self.metadata = self._collect_mmap_sources(
                 self.next_block_parameters,
                 self.next_block_buffers,
                 self.tensor_transforms,
+                self._nz_names,
             )
         else:
             # Shard next block's weights and store local shard in pinned CPU memory.
@@ -301,6 +332,8 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 self.rank,
                 self.pin_memory,
                 self.tensor_transforms,
+                self._nz_names,
+                self._nz_permute_fn,
             )
 
         # Allocate device buffers only if not using shared buffers from backend
@@ -318,6 +351,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 m["numel"],
                 m["shape"],
                 m["stride"],
+                bool(m.get("nz")),
             )
             for dtype, metas in self.metadata.items()
             for m in metas
@@ -336,11 +370,45 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         return module
 
+    def _resolve_nz_names(self) -> frozenset[str]:
+        """Parameter names this hook may pre-permute, or empty when NZ is off.
+
+        Filtered twice: ``nz_reactor_weight_names`` applies the same module test
+        the load-time installer uses (an offload buffer holds scales and other
+        2-D tensors that would otherwise look like weights), and the layout
+        check here drops anything whose padded fractal footprint would not fit
+        the slot the ND path reserved for it.
+        """
+        if self._nz_permute_fn is None:
+            return frozenset()
+
+        from vllm_omni.diffusion.models.minimax_h3.npu.weight_nz import (
+            nz_reactor_can_hold,
+            nz_reactor_weight_names,
+        )
+
+        candidates = nz_reactor_weight_names(self.next_block)
+        if not candidates:
+            return frozenset()
+
+        kept: set[str] = set()
+        for name, target in self.next_block_parameters.items():
+            if name not in candidates:
+                continue
+            value = target.to_local() if hasattr(target, "to_local") else target
+            transform = self.tensor_transforms.get(id(target))
+            if callable(transform):
+                value = transform(value)
+            if nz_reactor_can_hold(tuple(value.shape), tuple(value.stride()), value.dtype):
+                kept.add(name)
+        return frozenset(kept)
+
     @staticmethod
     def _collect_mmap_sources(
         params: dict[str, nn.Parameter],
         bufs: dict[str, torch.Tensor],
         tensor_transforms: dict[int, Any] | None = None,
+        nz_names: frozenset[str] = frozenset(),
     ) -> tuple[dict[torch.dtype, list[dict[str, Any]]], dict[torch.dtype, list[dict[str, Any]]]]:
         """Retain file-backed tensors and describe their runtime layout.
 
@@ -382,15 +450,19 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     "transform": transform,
                 }
             )
-            metadata.setdefault(dtype, []).append(
-                {
-                    "name": name,
-                    "offset": offset,
-                    "numel": storage_numel,
-                    "shape": runtime_source.shape,
-                    "stride": stride,
-                }
-            )
+            entry = {
+                "name": name,
+                "offset": offset,
+                "numel": storage_numel,
+                "shape": runtime_source.shape,
+                "stride": stride,
+            }
+            if name in nz_names:
+                # Marks the slot as holding FRACTAL_NZ bytes: packed in that
+                # order on the way in, re-interpreted rather than cast on the
+                # way out. Absent means ND, so ND metadata is unchanged.
+                entry["nz"] = True
+            metadata.setdefault(dtype, []).append(entry)
             offsets[dtype] = offset + storage_numel
 
         return cpu_sources, metadata
@@ -403,11 +475,18 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         rank: int,
         pin_memory: bool,
         tensor_transforms: dict[int, Any] | None = None,
+        nz_names: frozenset[str] = frozenset(),
+        nz_permute_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> tuple[dict[torch.dtype, torch.Tensor], dict[torch.dtype, list[dict[str, Any]]]]:
         """Flatten params+buffers by dtype, split into DP shards, store local shard.
 
         Each rank stores only ``1/dp_size`` of the total weights. The full
         tensor is reconstructed at runtime via AllGather.
+
+        Tensors named in ``nz_names`` are permuted into FRACTAL_NZ order before
+        being split, so the shard (and the AllGather output it lands in) already
+        carries NZ bytes. The permutation commutes with the split because it is
+        applied to the whole tensor before slicing.
         """
         dtype_metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
         cpu_shards: dict[torch.dtype, torch.Tensor] = {}
@@ -436,13 +515,20 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             for spec in specs:
                 # Offsets remain relative to the FULL flattened buffer
                 # (needed for correct AllGather reconstruction).
-                dtype_metadata.setdefault(dtype, []).append(tensor_storage_metadata(spec, current_offset))
+                entry = tensor_storage_metadata(spec, current_offset)
+                is_nz = spec.name in nz_names and nz_permute_fn is not None
+                if is_nz:
+                    entry["nz"] = True
+                dtype_metadata.setdefault(dtype, []).append(entry)
 
                 # Copy ONLY the portion within [shard_start, shard_end)
                 overlap_start = max(current_offset, shard_start)
                 overlap_end = min(current_offset + spec.storage_numel, shard_end)
                 if overlap_start < overlap_end:
-                    flat_storage = flatten_physical_storage(spec.value, spec.storage_numel)
+                    if is_nz and nz_permute_fn is not None:
+                        flat_storage = nz_permute_fn(spec.value)
+                    else:
+                        flat_storage = flatten_physical_storage(spec.value, spec.storage_numel)
                     src_start = overlap_start - current_offset
                     src_end = overlap_end - current_offset
                     dst_start = overlap_start - shard_start
@@ -503,6 +589,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         cpu_sources: dict[torch.dtype, list[dict[str, Any]]],
         metadata: dict[torch.dtype, list[dict[str, Any]]],
         slot_buffers: dict[torch.dtype, torch.Tensor],
+        nz_permute_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> dict[torch.dtype, torch.Tensor]:
         staged: dict[torch.dtype, torch.Tensor] = {}
         for dtype, metas in metadata.items():
@@ -513,7 +600,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 source = DistributedLayerwiseOffloadHook._resolve_mmap_source(source_info, meta, dtype)
                 start = meta["offset"]
                 physical_storage = destination[start : start + meta["numel"]]
-                if source.is_contiguous():
+                if meta.get("nz") and nz_permute_fn is not None:
+                    # Permute the mmap view as it is staged; the checkpoint
+                    # itself is never rewritten.
+                    physical_storage.copy_(nz_permute_fn(source))
+                elif source.is_contiguous():
                     physical_storage.copy_(source.flatten())
                 else:
                     torch.as_strided(
@@ -540,7 +631,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         slot_buffers = self.cpu_staging_buffers[slot]
         if slot_buffers is None:
             raise RuntimeError(f"cpu_staging_buffers[{slot}] was not allocated")
-        return self._pack_mmap_sources(self.cpu_sources, self.metadata, slot_buffers)
+        return self._pack_mmap_sources(self.cpu_sources, self.metadata, slot_buffers, self._nz_permute_fn)
 
     @staticmethod
     def _copy_mmap_sources_to_device(
@@ -549,6 +640,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         gpu_buffers: dict[torch.dtype, torch.Tensor],
         *,
         non_blocking: bool,
+        nz_permute_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
         """Copy registered source views directly into flattened device buffers."""
         for dtype, metas in metadata.items():
@@ -558,6 +650,12 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 source = DistributedLayerwiseOffloadHook._resolve_mmap_source(source_info, meta, dtype)
                 start = meta["offset"]
                 physical_storage = destination[start : start + meta["numel"]]
+                if meta.get("nz") and nz_permute_fn is not None:
+                    # The permuted form is materialised on the host, so this
+                    # cannot ride the pinned-source async path; it is still one
+                    # contiguous H2D either way.
+                    physical_storage.copy_(nz_permute_fn(source))
+                    continue
                 async_copy = non_blocking and source.is_pinned()
                 if source.is_contiguous():
                     physical_storage.copy_(source.flatten(), non_blocking=async_copy)
@@ -590,6 +688,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                         self.metadata,
                         gpu_weights,
                         non_blocking=non_blocking,
+                        nz_permute_fn=self._nz_permute_fn,
                     )
                     evt.record(self.copy_stream)
             else:
@@ -651,12 +750,24 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         way in. That conversion reads the buffer, so it has to run on the
         stream that filled it and the ready event every consumer waits on has
         to cover it -- otherwise compute could read a half-converted weight.
+
+        Slots flagged ``nz`` skip that entirely: they were packed in NZ order,
+        so re-pointing is re-labelling, with nothing to schedule or wait for.
         """
         writer = self.comm_stream if (self.dp_size > 1 and self.dp_group is not None) else self.copy_stream
 
+        cast_fn = self._nz_cast_fn
+        view_fn = self._nz_view_fn
+
         def build() -> list[torch.Tensor]:
             values: list[torch.Tensor] = []
-            for _target, dtype, offset, numel, shape, stride in self._cached_repoint:
+            for _target, dtype, offset, numel, shape, stride, is_nz in self._cached_repoint:
+                if is_nz and view_fn is not None:
+                    # The slot already holds FRACTAL_NZ bytes, so this only
+                    # re-labels it: no kernel, nothing to synchronise, no
+                    # transdata for sparse attention to contend with.
+                    values.append(view_fn(gpu_weights[dtype], offset, shape, dtype))
+                    continue
                 value = torch.as_strided(
                     gpu_weights[dtype][offset : offset + numel],
                     size=shape,
@@ -669,11 +780,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 values.append(value)
             return values
 
-        cast_fn = self._nz_cast_fn
-
         # Re-point using cached metadata (avoids per-layer dict lookups).
         if cast_fn is None:
-            for (target, *_rest), value in zip(self._cached_repoint, build(), strict=True):
+            values = build()
+            self._nz_keepalive = gpu_weights
+            for (target, *_rest), value in zip(self._cached_repoint, values, strict=True):
                 set_tensor_storage(target, value)
             return
 

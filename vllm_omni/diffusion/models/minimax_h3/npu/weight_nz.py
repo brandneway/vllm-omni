@@ -54,6 +54,7 @@ Two prerequisites and one hazard are handled here:
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -65,8 +66,31 @@ logger = init_logger(__name__)
 
 WEIGHT_NZ_ENV = "VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ"
 
+# Selects how a weight becomes NZ.
+#
+#   reactor (default) -- permute the checkpoint bytes on the host, carry them
+#       through the offload transport unchanged, and re-interpret the buffer
+#       slot as FRACTAL_NZ at re-point time. No device-side format op exists on
+#       the hot path, which is the entire point: the ND->NZ transdata an
+#       offload upload used to emit contends with sparse attention and degrades
+#       it.
+#   cast -- the previous behaviour, one ``empty_with_format`` + ``copy_`` (a
+#       transdata) per weight per upload. Kept because it also covers int8 and
+#       misaligned shapes, and as the fallback when the pointer-backed storage
+#       constructors are unavailable.
+NZ_MODE_ENV = "VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ_MODE"
+
 # ACL_FORMAT_FRACTAL_NZ, the format id ``torch_npu.npu_format_cast`` takes.
 _ACL_FORMAT_FRACTAL_NZ = 29
+
+# Fractal block width per dtype, for the host-side permutation. Only the 2-byte
+# dtypes are listed: their 16x16 blocking is verified byte-identical to
+# ``npu_format_cast``. int8 blocks 16x32 instead and its padded footprint has
+# not been measured, so int8 stays on the ``cast`` path for now.
+_NZ_BLOCK = {
+    torch.bfloat16: 16,
+    torch.float16: 16,
+}
 
 # FRACTAL_NZ is a fractal layout (16x16 blocks; 16 elements per block row for
 # bf16/fp16, 32 for int8). fp32 has no NZ matmul path at all.
@@ -133,6 +157,159 @@ def maybe_cast_weight_to_nz(weight: torch.Tensor) -> torch.Tensor | None:
     except Exception as exc:
         logger.warning("MiniMax-H3 weight NZ: could not transpose %s, keeping ND: %s", tuple(weight.shape), exc)
         return None
+
+
+# --------------------------------------------------------------------------- #
+#  Reactor: pre-permuted weights carried through the offload transport        #
+# --------------------------------------------------------------------------- #
+#
+# ``maybe_cast_weight_to_nz`` above pays a device-side transdata per upload
+# because the offload buffer holds ND bytes. The alternative is to permute once
+# on the host, ship the permuted bytes, and only *reinterpret* the buffer at
+# re-point time. That needs a tensor whose storage descriptor says FRACTAL_NZ
+# while pointing at a slice of somebody else's buffer -- which is what the two
+# private constructors below do. They are not documented, but they are not a
+# hack either: torch_npu rebuilds tensors out of its own ACLGraph memory pool
+# with exactly this pair (``dynamo/npugraph_ex/_acl_concrete_graph/utils.py``).
+#
+# Measured on Ascend910 (2026-10-12): the permuted bytes are byte-identical to
+# ``npu_format_cast(w, 29)`` for every shape measured, the matmul result is
+# bit-identical to both the ND and the device-cast path, and a profile of the
+# hot path shows ``trans_TransData_0`` dropping to zero while the NZ matmul
+# (``aclnnMatmulWeightNz``) is still selected.
+
+
+def nz_reactor_available() -> bool:
+    """Whether this torch_npu exposes the pointer-backed storage constructors."""
+    try:
+        import torch_npu
+
+        return hasattr(torch_npu._C, "_construct_storage_from_data_pointer") and hasattr(
+            torch_npu._C, "_construct_NPU_Tensor_From_Storage_And_Metadata"
+        )
+    except Exception:
+        return False
+
+
+def nz_mode() -> str:
+    """Resolve the requested mechanism, defaulting to the transdata-free one."""
+    requested = os.environ.get(NZ_MODE_ENV, "").strip().lower()
+    if requested in ("cast", "reactor"):
+        return requested
+    if requested:
+        logger.warning("%s=%r is not one of cast|reactor; using reactor", NZ_MODE_ENV, requested)
+    return "reactor"
+
+
+def nz_padded_numel(shape: tuple[int, int], block: int) -> int:
+    """Elements an NZ storage needs for ``shape``."""
+    n, k = shape
+    return ((n + block - 1) // block * block) * ((k + block - 1) // block * block)
+
+
+def nz_reactor_can_hold(shape: Sequence[int], stride: Sequence[int], dtype: torch.dtype) -> bool:
+    """Whether pre-permuting ``shape``/``stride`` fits the slot it would replace.
+
+    The transport is left untouched by this feature, so the permuted bytes have
+    to occupy exactly the elements the ND layout used. That holds only for a
+    plain contiguous 2-D weight whose padded fractal footprint equals ``N*K``.
+    Every DiT linear in H3 satisfies it (all dims are multiples of 16); the
+    guard is what keeps a future misaligned shape on the ``cast`` path instead
+    of silently corrupting the buffer.
+    """
+    block = _NZ_BLOCK.get(dtype)
+    if block is None or len(shape) != 2:
+        return False
+    n, k = shape
+    if tuple(stride) != (k, 1):
+        return False
+    return nz_padded_numel((n, k), block) == n * k
+
+
+def permute_host_weight_to_nz(weight: torch.Tensor) -> torch.Tensor:
+    """Reorder a host ``[N, K]`` weight into FRACTAL_NZ order.
+
+    ``[N, K] -> [K1, N1, N0, K0]``. Runs on the checkpoint bytes while they are
+    still in host memory, so it is off the critical path entirely.
+    """
+    block = _NZ_BLOCK[weight.dtype]
+    n, k = weight.shape
+    n1, k1 = n // block, k // block
+    return weight.reshape(n1, block, k1, block).permute(2, 0, 1, 3).contiguous().reshape(-1)
+
+
+def nz_view_over_buffer(
+    buffer: torch.Tensor,
+    offset: int,
+    shape: tuple[int, int],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """View ``buffer[offset:offset+numel]`` as a zero-copy FRACTAL_NZ tensor.
+
+    The result shares the buffer's memory and owns nothing: destroying it frees
+    nothing, and it must not outlive ``buffer`` (measured -- once the buffer is
+    released the caching allocator hands the address out again and the view
+    reads whatever lands there, without raising).
+
+    The base pointer is advanced instead of using ``storage_offset``: the
+    constructors validate ``storage_offset * itemsize + required storage``
+    against ``nbytes``, which an offset into a shared buffer fails.
+    """
+    import torch_npu
+
+    n, k = shape
+    metadata = {
+        "size": (n, k),
+        "stride": (k, 1),
+        "nbytes": n * k * dtype.itemsize,
+        "dtype": dtype,
+        "data_ptr": buffer.data_ptr() + offset * dtype.itemsize,
+        "storage_offset": 0,
+        "device": buffer.device,
+        "npu_format": _ACL_FORMAT_FRACTAL_NZ,
+        "layout": torch.strided,
+        "requires_grad": False,
+    }
+    storage = torch_npu._C._construct_storage_from_data_pointer(
+        metadata["data_ptr"], metadata["device"], metadata["nbytes"]
+    )
+    return torch_npu._C._construct_NPU_Tensor_From_Storage_And_Metadata(metadata, storage)
+
+
+def nz_reactor_takes_effect() -> bool:
+    """Probe once that a buffer slice really re-reads as FRACTAL_NZ.
+
+    Same reason as ``nz_cast_takes_effect``: without
+    ``torch.npu.config.allow_internal_format`` the result would be an ordinary
+    ND tensor, and the caller would measure no change and blame the feature.
+    """
+    try:
+        shape = (16, 16)
+        dtype = torch.bfloat16
+        scratch = torch.zeros(shape[0] * shape[1], dtype=dtype, device="npu")
+        return _npu_format(nz_view_over_buffer(scratch, 0, shape, dtype)) == _ACL_FORMAT_FRACTAL_NZ
+    except Exception:
+        return False
+
+
+def nz_reactor_weight_names(model: nn.Module) -> set[str]:
+    """Names of ``model``'s parameters the reactor may pre-permute.
+
+    Mirrors ``install_minimax_h3_dit_weight_nz``'s module filter, which the
+    offload path cannot apply on its own: an offload buffer carries parameters
+    and buffers of every kind, and a 2-D bf16 per-channel scale would otherwise
+    look exactly like a weight.
+    """
+    names: set[str] = set()
+    for module_name, module in model.named_modules():
+        if not _is_eligible_linear(module):
+            continue
+        weight = getattr(module, "weight", None)
+        if weight is None or weight.dtype not in _NZ_BLOCK:
+            continue
+        prefix = f"{module_name}." if module_name else ""
+        names.add(f"{prefix}weight")
+    return names
 
 
 def nz_cast_takes_effect() -> bool:
@@ -256,9 +433,18 @@ def install_minimax_h3_dit_weight_nz(model: nn.Module, od_config: Any | None = N
 
 
 __all__ = [
+    "NZ_MODE_ENV",
     "WEIGHT_NZ_ENV",
     "install_minimax_h3_dit_weight_nz",
     "maybe_cast_weight_to_nz",
     "nz_cast_takes_effect",
+    "nz_mode",
+    "nz_padded_numel",
+    "nz_reactor_available",
+    "nz_reactor_can_hold",
+    "nz_reactor_takes_effect",
+    "nz_reactor_weight_names",
+    "nz_view_over_buffer",
+    "permute_host_weight_to_nz",
     "weight_nz_enabled",
 ]

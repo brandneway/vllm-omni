@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     VLLM_OMNI_MINIMAX_H3_UNLOCK_SHORT_EDGE: str | None = None
     VLLM_OMNI_MINIMAX_H3_VAE_DTYPE: str | None = None
     VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ: str | None = None
+    VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ_MODE: str | None = None
     VLLM_OMNI_RAINFUSION_ESTIMATE_CDF: str | None = None
     VLLM_OMNI_RAINFUSION_ESTIMATE_PROTECT: str | None = None
     VLLM_OMNI_RAINFUSION_MASK_ALGO: str | None = None
@@ -113,6 +114,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (bit-identical). The quantized int8 weights gain 13-17% on their matmul;
     # the dense bf16 ones net out flat.
     "VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ": lambda: os.environ.get("VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ", None),
+    # How the NZ layout is reached. "reactor" (default) permutes the
+    # checkpoint bytes on the host and only re-labels the uploaded
+    # buffer, so no transdata is issued on the upload path; "cast"
+    # converts per upload instead (the earlier behaviour, and the
+    # fallback for dtypes and shapes the reactor cannot hold).
+    "VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ_MODE": lambda: os.environ.get("VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ_MODE", None),
 }
 
 
