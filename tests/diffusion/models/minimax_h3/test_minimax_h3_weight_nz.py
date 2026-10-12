@@ -66,7 +66,9 @@ class _StubLinear(LinearBase):
 
     def __init__(self, dtype: torch.dtype, quant_method: object | None = None, shape=(8, 4)) -> None:
         nn.Module.__init__(self)
-        self.weight = nn.Parameter(torch.zeros(*shape, dtype=dtype))
+        # Integer weights are not trainable in vLLM either; nn.Parameter would
+        # otherwise reject an int8 tensor outright.
+        self.weight = nn.Parameter(torch.zeros(*shape, dtype=dtype), requires_grad=dtype.is_floating_point)
         self.quant_method = UnquantizedLinearMethod() if quant_method is None else quant_method
 
 
@@ -317,10 +319,13 @@ def test_nz_mode_defaults_to_the_transdata_free_path(monkeypatch: pytest.MonkeyP
 @pytest.mark.parametrize(
     ("shape", "block", "expected"),
     [
-        ((16, 16), 16, 256),
-        ((32, 48), 16, 1536),
-        ((17, 16), 16, 512),  # 17 rows pad to 32
-        ((16, 17), 16, 512),
+        ((16, 16), (16, 16), 256),
+        ((32, 48), (16, 16), 1536),
+        ((17, 16), (16, 16), 512),  # 17 rows pad to 32
+        ((16, 17), (16, 16), 512),
+        ((16, 16), (16, 32), 512),  # int8: K pads to 32
+        ((48, 48), (16, 32), 3072),  # 48 x 64, the measured int8 footprint
+        ((300, 200), (16, 32), 68096),  # 304 x 224, measured against the device
     ],
 )
 def test_nz_padded_numel_rounds_each_axis_up_to_the_block(shape, block, expected):
@@ -332,9 +337,11 @@ def test_nz_padded_numel_rounds_each_axis_up_to_the_block(shape, block, expected
     [
         ((16, 16), (16, 1), torch.bfloat16, True),
         ((4096, 4096), (4096, 1), torch.float16, True),
-        ((17, 16), (16, 1), torch.bfloat16, False),  # padded footprint exceeds the slot
+        ((17, 16), (16, 1), torch.bfloat16, False),  # row pads to 32, slot holds 17
+        ((16, 32), (32, 1), torch.int8, True),  # int8 blocks 16x32, so this fits exactly
+        ((5376, 14336), (14336, 1), torch.int8, True),  # the real H3 int8 weight
+        ((48, 48), (48, 1), torch.int8, False),  # K pads 48 -> 64
         ((16, 16), (16, 1), torch.float32, False),  # no NZ block size
-        ((16, 16), (16, 1), torch.int8, False),  # 16x32 blocking, not measured
         ((16, 16), (32, 2), torch.bfloat16, False),  # not the plain layout
         ((64,), (1,), torch.bfloat16, False),  # not 2-D
     ],
@@ -384,15 +391,19 @@ def test_reactor_is_available_when_both_constructors_are_present(monkeypatch: py
     assert weight_nz.nz_reactor_available() is True
 
 
-def test_reactor_weight_names_follows_the_same_module_filter():
-    """Only unquantized linears' weights; a quantized or fp32 sibling is not one."""
+def test_reactor_weight_names_is_not_gated_on_quant_method():
+    """A quantized linear is in scope -- int8 is the dtype that gains on an NZ weight.
+
+    Unlike the load-time sweep, the offload path has no layout owner to defer
+    to: the weight arrives already in the layout its kernel wants.
+    """
     model = nn.Module()
     model.add_module("qkv", _StubLinear(torch.bfloat16))
-    model.add_module("quantized", _StubLinear(torch.bfloat16, quant_method=_QuantMethodStub()))
-    model.add_module("final", _StubLinear(torch.float32))
-    model.add_module("norm", nn.LayerNorm(4))
+    model.add_module("quantized", _StubLinear(torch.int8, quant_method=_QuantMethodStub()))
+    model.add_module("final", _StubLinear(torch.float32))  # fp32 has no NZ matmul
+    model.add_module("norm", nn.LayerNorm(4))  # not a LinearBase
 
-    assert weight_nz.nz_reactor_weight_names(model) == {"qkv.weight"}
+    assert weight_nz.nz_reactor_weight_names(model) == {"qkv.weight", "quantized.weight"}
 
 
 def test_reactor_weight_names_uses_the_qualified_module_path():
@@ -402,3 +413,26 @@ def test_reactor_weight_names_uses_the_qualified_module_path():
     model.add_module("blocks", inner)
 
     assert weight_nz.nz_reactor_weight_names(model) == {"blocks.out_proj.weight"}
+
+
+def test_permute_host_weight_to_nz_uses_the_int8_block_shape():
+    """int8 blocks 16x32, so [16, 64] is two K-blocks and column 32 moves to 512."""
+    weight = torch.arange(16 * 64, dtype=torch.int8).reshape(16, 64)
+
+    flat = weight_nz.permute_host_weight_to_nz(weight)
+
+    # flat = [K1=2, N1=1, N0=16, K0=32]; (n, k) -> (k//32)*512 + n*32 + k%32
+    assert flat[0].item() == weight[0, 0].item()
+    assert flat[512].item() == weight[0, 32].item()
+    assert flat[1023].item() == weight[15, 63].item()
+
+
+def test_permute_host_weight_to_nz_round_trips_for_int8():
+    """96 columns is three int8 K-blocks; the inverse must recover the original."""
+    weight = torch.randint(-128, 127, (64, 96), dtype=torch.int8)
+    n, k, block_n, block_k = 64, 96, 16, 32
+
+    flat = weight_nz.permute_host_weight_to_nz(weight)
+    restored = flat.reshape(k // block_k, n // block_n, block_n, block_k).permute(1, 2, 0, 3).reshape(n, k)
+
+    assert torch.equal(restored, weight)

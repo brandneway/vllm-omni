@@ -38,6 +38,11 @@ Two prerequisites and one hazard are handled here:
   method owns its weight layout, and mxfp4 casts its own weights to NZ. The
   offload path has no such guard and instead keys off the dtype set, which is
   why int8 reaches it there and not here.
+* The offload path has two mechanisms (``NZ_MODE_ENV``). The default one
+  permutes the checkpoint bytes on the host and re-interprets the uploaded
+  buffer, so no format op runs on the upload path at all -- see the reactor
+  section below. It covers bf16/fp16 and int8, whose fractal blocks are 16x16
+  and 16x32 respectively.
 * Offloaded DiTs cannot be cast here. Every offload backend relocates the
   parameters after this hook -- the layerwise ones flatten them to pinned host
   memory, the sequential one moves whole modules -- and an internal-format
@@ -75,21 +80,24 @@ WEIGHT_NZ_ENV = "VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ"
 #       offload upload used to emit contends with sparse attention and degrades
 #       it.
 #   cast -- the previous behaviour, one ``empty_with_format`` + ``copy_`` (a
-#       transdata) per weight per upload. Kept because it also covers int8 and
-#       misaligned shapes, and as the fallback when the pointer-backed storage
-#       constructors are unavailable.
+#       transdata) per weight per upload. Kept as the fallback when the
+#       pointer-backed storage constructors are unavailable, and for any weight
+#       the reactor declines (a shape whose padded fractal footprint would not
+#       fit the slot the ND layout reserved).
 NZ_MODE_ENV = "VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ_MODE"
 
 # ACL_FORMAT_FRACTAL_NZ, the format id ``torch_npu.npu_format_cast`` takes.
 _ACL_FORMAT_FRACTAL_NZ = 29
 
-# Fractal block width per dtype, for the host-side permutation. Only the 2-byte
-# dtypes are listed: their 16x16 blocking is verified byte-identical to
-# ``npu_format_cast``. int8 blocks 16x32 instead and its padded footprint has
-# not been measured, so int8 stays on the ``cast`` path for now.
+# Fractal block size per dtype, as (N0, K0), for the host-side permutation.
+# Measured against ``npu_format_cast`` on Ascend910: 16x16 for the 2-byte
+# dtypes, 16x32 for int8. The paddings differ too -- bf16 rounds both axes to
+# 16, int8 rounds N to 16 and K to 32 -- which is why this is a pair and not a
+# single width.
 _NZ_BLOCK = {
-    torch.bfloat16: 16,
-    torch.float16: 16,
+    torch.bfloat16: (16, 16),
+    torch.float16: (16, 16),
+    torch.int8: (16, 32),
 }
 
 # FRACTAL_NZ is a fractal layout (16x16 blocks; 16 elements per block row for
@@ -201,10 +209,11 @@ def nz_mode() -> str:
     return "reactor"
 
 
-def nz_padded_numel(shape: tuple[int, int], block: int) -> int:
-    """Elements an NZ storage needs for ``shape``."""
+def nz_padded_numel(shape: tuple[int, int], block: tuple[int, int]) -> int:
+    """Elements an NZ storage needs for ``shape``, rounded up per axis."""
     n, k = shape
-    return ((n + block - 1) // block * block) * ((k + block - 1) // block * block)
+    block_n, block_k = block
+    return ((n + block_n - 1) // block_n * block_n) * ((k + block_k - 1) // block_k * block_k)
 
 
 def nz_reactor_can_hold(shape: Sequence[int], stride: Sequence[int], dtype: torch.dtype) -> bool:
@@ -229,13 +238,18 @@ def nz_reactor_can_hold(shape: Sequence[int], stride: Sequence[int], dtype: torc
 def permute_host_weight_to_nz(weight: torch.Tensor) -> torch.Tensor:
     """Reorder a host ``[N, K]`` weight into FRACTAL_NZ order.
 
-    ``[N, K] -> [K1, N1, N0, K0]``. Runs on the checkpoint bytes while they are
-    still in host memory, so it is off the critical path entirely.
+    ``[N, K] -> [K1, N1, N0, K0]``, with ``(N0, K0)`` the dtype's fractal block.
+    Runs on the checkpoint bytes while they are still in host memory, so it is
+    off the critical path entirely.
+
+    Both axes must divide evenly by their block, which ``nz_reactor_can_hold``
+    has already established; there is deliberately no padding branch here,
+    because a padded tensor would not fit the slot the ND layout reserved.
     """
-    block = _NZ_BLOCK[weight.dtype]
+    block_n, block_k = _NZ_BLOCK[weight.dtype]
     n, k = weight.shape
-    n1, k1 = n // block, k // block
-    return weight.reshape(n1, block, k1, block).permute(2, 0, 1, 3).contiguous().reshape(-1)
+    n1, k1 = n // block_n, k // block_k
+    return weight.reshape(n1, block_n, k1, block_k).permute(2, 0, 1, 3).contiguous().reshape(-1)
 
 
 def nz_view_over_buffer(
@@ -292,20 +306,32 @@ def nz_reactor_takes_effect() -> bool:
         return False
 
 
-def nz_reactor_weight_names(model: nn.Module) -> set[str]:
-    """Names of ``model``'s parameters the reactor may pre-permute.
+def _reactor_weight(module: nn.Module) -> torch.Tensor | None:
+    """``module``'s weight when the reactor knows how to pre-permute it.
 
-    Mirrors ``install_minimax_h3_dit_weight_nz``'s module filter, which the
-    offload path cannot apply on its own: an offload buffer carries parameters
-    and buffers of every kind, and a 2-D bf16 per-channel scale would otherwise
-    look exactly like a weight.
+    Deliberately broader than ``_is_eligible_linear``: that filter exists to
+    keep the load-time sweep away from quantized layers, whose method owns the
+    weight layout. An offloaded weight has no such owner -- it arrives already
+    in the layout the kernel asked for, and int8 is exactly the case worth
+    covering, since that is the dtype an NZ weight actually gains on.
+
+    Requiring ``LinearBase`` is what keeps the per-channel scales out: they are
+    parameters of the same module, not modules of their own, so they are never
+    visited here.
     """
+    if not isinstance(module, LinearBase):
+        return None
+    weight = getattr(module, "weight", None)
+    if weight is None or weight.dtype not in _NZ_BLOCK:
+        return None
+    return weight
+
+
+def nz_reactor_weight_names(model: nn.Module) -> set[str]:
+    """Names of ``model``'s parameters the reactor may pre-permute."""
     names: set[str] = set()
     for module_name, module in model.named_modules():
-        if not _is_eligible_linear(module):
-            continue
-        weight = getattr(module, "weight", None)
-        if weight is None or weight.dtype not in _NZ_BLOCK:
+        if _reactor_weight(module) is None:
             continue
         prefix = f"{module_name}." if module_name else ""
         names.add(f"{prefix}weight")
