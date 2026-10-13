@@ -167,6 +167,13 @@ class VideoTokenLayout:
     Ref2VA layout instead publishes ``used_len`` and every physical video
     span, so audio and image rows between videos remain dense.
 
+    ``pre_rearranged`` asserts that the model already holds its rows in the
+    backend's own sparse order, having applied the block-sparse row permutation
+    to its row-indexed metadata up front. A backend that supports it then skips
+    its per-call reorder and reads the rows as they arrive; the spans stay in
+    their pre-reorder coordinates, since only their shapes are needed to rebuild
+    the block plan.
+
     Plain ints, so reading it never forces a device-to-host sync.
     """
 
@@ -174,6 +181,7 @@ class VideoTokenLayout:
     latent_grid: tuple[int, int, int] | None = None
     used_len: int | None = None
     video_spans: tuple[VideoTokenSpan, ...] = ()
+    pre_rearranged: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -9,11 +9,15 @@ rows stay pinned to their noised step-0 anchors.
 
 from __future__ import annotations
 
+import functools
+import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
+from dataclasses import replace
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.forward_context import (
@@ -36,6 +40,39 @@ MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
 # (24 * 1 * 2 * 2 = 96); audio rows carry the 32-dim audio latent.
 MINIMAX_H3_VIDEO_ROW_WIDTH = 96
 MINIMAX_H3_AUDIO_ROW_WIDTH = 32
+
+logger = init_logger(__name__)
+
+# Row-reorder hoist. The block-sparse kernel needs video rows grouped into
+# 128-token spatial tiles and normally reorders them itself on every attention
+# call -- 50 layers x ~38 sparse steps, repeated on every rank. That reorder is
+# a pure function of the two span grids, so the branch can hold its rows in that
+# order from the start and let the kernel skip the reorder entirely.
+_RF_HOIST_ENV = "VLLM_OMNI_MINIMAX_H3_RF_HOIST_REORDER"
+_RF_BLOCK_SIZE = 128
+
+
+def _rf_hoist_enabled() -> bool:
+    """Whether the packed row reorder is hoisted out of the attention call."""
+    return os.environ.get(_RF_HOIST_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+@functools.cache
+def _mindiesd_accepts_pre_rearranged() -> bool:
+    """Whether the installed MindIE-SD can be told its rows are already reordered.
+
+    An older release would take the flag through ``**kwargs`` and ignore it,
+    reordering rows that are already in rf order -- silently wrong output rather
+    than a missed optimisation -- so the hoist is refused instead of assumed.
+    """
+    try:
+        from inspect import signature
+
+        from mindiesd import sparse_attention
+
+        return "pre_rearranged" in signature(sparse_attention).parameters
+    except Exception:
+        return False
 
 
 def minimax_h3_publish_denoise_progress(
@@ -155,12 +192,102 @@ class MiniMaxH3DenoiseBranch:
             # FastH3-specific prefix geometry belongs to MiniMax-H3's packed
             # attention contract, not the shared VideoTokenLayout interface.
             self.static_kwargs["packed_seq_params"]["vsa_prefix_segments"] = tuple(prefix_segments)
+            # Relabel the packed rows into the sparse order once here, instead of
+            # letting every attention layer reorder its own Q/K/V; see
+            # _hoist_rf_row_reorder for why the branch's metadata is enough.
+            if self._hoist_rf_row_reorder(spans):
+                self.static_kwargs["video_token_layout"] = replace(
+                    self.static_kwargs["video_token_layout"],
+                    pre_rearranged=True,
+                )
+                # VSA-H3 routes tiles from the pre-reorder prefix geometry, which
+                # no longer describes these rows. Drop the key so that backend
+                # fails loudly rather than routing tiles by stale offsets.
+                self.static_kwargs["packed_seq_params"].pop("vsa_prefix_segments", None)
         else:
             grid = packed["latent_grid"].tolist()
             self.static_kwargs["video_token_layout"] = VideoTokenLayout(
                 prefix_len=int(packed["video_row_start"]),
                 latent_grid=(int(grid[0]), int(grid[1]), int(grid[2])),
             )
+
+    def _hoist_rf_row_reorder(self, spans: tuple[VideoTokenSpan, ...]) -> bool:
+        """Relabel this branch's rows into the block-sparse order, once per request.
+
+        The kernel needs each clip's rows in spatial tile order. It computes that
+        permutation itself, on every attention call, on every rank; this applies
+        the very same permutation to the row-indexed metadata the DiT reads --
+        the packed RoPE table, the token tags, and the per-modality row lists.
+
+        Moving the rows is enough because nothing downstream carries an explicit
+        notion of "row 3 is the third video token": the embedding stage scatters
+        rows by those lists, block selection and output selection read the same
+        lists, and the condition masks are indexed per video/audio token rather
+        than per packed row. So permuting the lists permutes the whole block
+        stack, and no inverse is needed on the way out.
+
+        Returns whether the rows were relabelled.
+        """
+        if not _rf_hoist_enabled():
+            return False
+        if not _mindiesd_accepts_pre_rearranged():
+            logger.warning_once(
+                "MiniMax-H3 row-reorder hoist was requested (%s) but the installed MindIE-SD "
+                "sparse_attention does not accept pre_rearranged=; keeping the per-layer reorder.",
+                _RF_HOIST_ENV,
+            )
+            return False
+        try:
+            from mindiesd.layers.flash_attn.sparse_flash_attn_rf_v2 import rf_multi_span_permutation
+
+            permutation, inverse = rf_multi_span_permutation(
+                [{"start": span.start, "latent_shape": list(span.latent_grid)} for span in spans],
+                self.used_len,
+                _RF_BLOCK_SIZE,
+                "BSND",
+                torch.device("cpu"),
+            )
+        except Exception as exc:  # noqa: BLE001 - any refusal keeps the per-layer path
+            logger.warning_once(
+                "MiniMax-H3 row-reorder hoist is unavailable for this layout (%s); "
+                "keeping the per-layer reorder.",
+                exc,
+            )
+            return False
+
+        # The reorder speaks only for the real rows. The padding tail keeps its
+        # own order so the [real, pad] document split is unchanged.
+        if self.seq_len > self.used_len:
+            tail = torch.arange(self.used_len, self.seq_len, dtype=torch.long)
+            permutation = torch.cat([permutation, tail])
+            inverse = torch.cat([inverse, tail])
+
+        self.img_pos = inverse.index_select(0, self.img_pos)
+        self.audio_pos = inverse.index_select(0, self.audio_pos)
+        permuted_rows = permutation.to(self.device)
+        inverse_rows = inverse.to(self.device)
+        self.img_position_ids_dev = self.img_position_ids_dev.index_select(0, permuted_rows)
+        self.token_tags_dev = self.token_tags_dev.index_select(0, permuted_rows)
+        # text positions only ever exist on the device here. Like img/audio_pos
+        # they are a per-token list of packed rows -- look each old row up in the
+        # inverse, do not feed the whole permutation in as the index.
+        self.text_pos_dev = inverse_rows.index_select(0, self.text_pos_dev)
+
+        self.img_pos_dev = self.img_pos.to(self.device)
+        self.audio_pos_dev = self.audio_pos.to(self.device)
+        self.static_kwargs["img_position_ids"] = self.img_position_ids_dev[None]
+        self.static_kwargs["token_tags"] = self.token_tags_dev
+        self.static_kwargs["img_pos_info"] = {"position_ids": self.img_pos_dev}
+        self.static_kwargs["audio_pos_info"] = {"position_ids": self.audio_pos_dev}
+        self.static_kwargs["text_pos_info"] = {"position_ids": self.text_pos_dev}
+        self.static_kwargs["img_pos_for_infer_output_info"] = {"position_ids": self.img_pos_dev}
+        logger.info_once(
+            "MiniMax-H3 pos rows: block-sparse row reorder hoisted out of the attention call "
+            "(%d real rows, %d spans).",
+            self.used_len,
+            len(spans),
+        )
+        return True
 
     def prepare_rope_table(self, model: Any) -> None:
         """Materialize the branch-local DiT RoPE table once per denoise run.

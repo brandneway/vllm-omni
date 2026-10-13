@@ -98,6 +98,23 @@ def _mindiesd_supports_precision() -> bool:
         return False
 
 
+# Whether the installed mindiesd ``sparse_attention`` accepts ``pre_rearranged=``.
+# Releases without it take the kwarg through ``**kwargs`` and silently ignore it,
+# which would run the reorder a second time on rows that are already in rf order
+# -- silently wrong output, not a perf regression -- so this must be checked
+# rather than assumed. Cached because forwards run per layer per denoise step.
+@functools.cache
+def _mindiesd_supports_pre_rearranged() -> bool:
+    try:
+        from inspect import signature
+
+        from mindiesd import sparse_attention
+
+        return "pre_rearranged" in signature(sparse_attention).parameters
+    except Exception:
+        return False
+
+
 def _try_extract_layer_index(prefix: str) -> int | None:
     if not prefix:
         return None
@@ -249,6 +266,9 @@ class RainFusionPlan:
     prefix_len: int | None = None
     latent_shape: list[int] | None = None
     video_spans: list[dict[str, object]] | None = None
+    # The model already applied the rf row permutation to its own metadata, so
+    # the kernel must read the rows as they arrive instead of reordering them.
+    pre_rearranged: bool = False
 
 
 class RainFusionAttentionBackend(AttentionBackend):
@@ -591,7 +611,11 @@ class RainFusionAttentionImpl(AttentionImpl):
             dense_context_seqlen,
             int(used_len),
         )
-        return RainFusionPlan(used_len=int(used_len), video_spans=spans)
+        return RainFusionPlan(
+            used_len=int(used_len),
+            video_spans=spans,
+            pre_rearranged=bool(layout.pre_rearranged),
+        )
 
     def _estimate_mask_eligible(
         self, query: torch.Tensor, key: torch.Tensor, plan: RainFusionPlan
@@ -799,12 +823,21 @@ class RainFusionAttentionImpl(AttentionImpl):
             "precision": precision,
         }
         if plan.video_spans is not None:
+            if plan.pre_rearranged and not _mindiesd_supports_pre_rearranged():
+                # Running the reorder on rows that are already in rf order would
+                # silently corrupt the output, so refuse rather than guess.
+                raise ValueError(
+                    "this forward declares pre_rearranged rows but the installed MindIE-SD "
+                    "sparse_attention does not accept pre_rearranged=; upgrade MindIE-SD or "
+                    "disable the row reorder hoist."
+                )
             out = sparse_attention(
                 q,
                 k,
                 v,
                 sparse_type="rf_v2",
                 video_spans=plan.video_spans,
+                pre_rearranged=plan.pre_rearranged,
                 **common_kwargs,
             )
         else:
