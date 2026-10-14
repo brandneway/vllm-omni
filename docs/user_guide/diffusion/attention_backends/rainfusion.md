@@ -19,6 +19,7 @@ globally.
 | `start_step` | integer, `>= 0` | Number of early denoise steps kept dense |
 | `end_step` | integer, `>= 0` | Number of final denoise steps kept dense (tail fallback) |
 | `precision` | `"bf16"`, `"fp8"`, `"mix"` | Kernel precision mode; default `"bf16"`. Requires MindIE-SD with `sparse_attention(precision=...)` |
+| `exec_kernel` | `"rainfusion"`, `"eagle_bsa"` | Which kernel executes the rf_v2 pattern; unset lets MindIE-SD decide (the CANN RainFusion operator). Requires MindIE-SD with `sparse_attention(exec_kernel=...)` |
 | `skip_layers` | selector such as `"0-3,38"` | DiT blocks kept dense |
 
 ```bash
@@ -55,10 +56,27 @@ the kernel needs the complete key sequence for ranking; use Ulysses sequence
 parallelism with `ring_degree=1`.
 
 The `precision` knob requires a MindIE-SD release whose `sparse_attention`
-accepts `precision=`; older releases accept it through `**kwargs` but
+accepts `precision=`; older releases otherwise accept it through `**kwargs` but
 silently ignore it and run the BF16 path. `RAINFUSION_ATTN` raises at runtime
 when a non-`bf16` precision is requested without that support, so pin a
 compatible MindIE-SD release when using `precision="mix"` or `"fp8"`.
+
+`exec_kernel` behaves the same way: MindIE-SD must expose
+`sparse_attention(exec_kernel=...)`, or `RAINFUSION_ATTN` raises rather than
+running the default operator under an explicit request for another one.
+Switching the executor does not change the sparse pattern, the spatial
+reorder, or the inverse reorder — both routes execute the mask rf_v2 already
+computed — so the choice trades performance, not output semantics. Measure the
+two kernels on the workload at hand before pinning one: `eagle_bsa` is
+MindIE-SD's in-repo `eagle_block_sparse_attention` kernel, built for
+`ascend910b`/`ascend910_93` with fp16/bf16 queries, and it is not uniformly
+faster than the CANN RainFusion operator it replaces.
+
+```bash
+vllm-omni serve MiniMaxAI/MiniMax-H3 \
+  --diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN",\
+    "block_sparse":{"sparsity":0.8,"start_step":0,"exec_kernel":"eagle_bsa"}}}'
+```
 
 ## Geometry handling
 

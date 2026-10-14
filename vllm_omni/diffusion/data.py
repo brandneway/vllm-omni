@@ -1426,7 +1426,6 @@ class OmniDiffusionConfig:
             )
         )
 
-
     def _propagate_quantization_from_tf_config(self, tf_config: "TransformerConfig") -> None:
         if tf_config.quant_config is None:
             return
@@ -1964,6 +1963,21 @@ class RainFusionPrecision(str, Enum):
     MIX = "mix"
 
 
+class RainFusionExecKernel(str, Enum):
+    """Which kernel executes the rf_v2 sparse pattern on A2/A3.
+
+    Both kernels consume the identical rf_v2 pattern, spatial reorder and inverse
+    reorder, so this selects performance, not semantics.
+
+    ``rainfusion``: the CANN RainFusion operator (MindIE-SD default).
+    ``eagle_bsa``: MindIE-SD's in-repo ``eagle_block_sparse_attention`` kernel,
+        built for ascend910b / ascend910_93 with fp16/bf16 queries.
+    """
+
+    RAINFUSION = "rainfusion"
+    EAGLE_BSA = "eagle_bsa"
+
+
 @dataclass
 class BlockSparseSpec:
     """User-facing controls shared by block-sparse attention backends.
@@ -1973,12 +1987,15 @@ class BlockSparseSpec:
     index selector such as "0-3,38") exempts individual DiT blocks. Those two are
     the accuracy knobs to trade back quality at a fixed ``sparsity``.
     ``precision`` selects the kernel precision mode (see ``RainFusionPrecision``).
+    ``exec_kernel`` selects the rf_v2 executor (see ``RainFusionExecKernel``);
+    left unset, MindIE-SD decides, which is the RainFusion operator.
     """
 
     sparsity: float = 0.8
     start_step: int = 0
     end_step: int = 0
     precision: str = RainFusionPrecision.BF16.value
+    exec_kernel: str | None = None
     skip_layers: str | list[int] | None = None
     skip_layer_indices: set[int] | None = field(default=None, repr=False)
 
@@ -1993,6 +2010,16 @@ class BlockSparseSpec:
         if precision not in valid:
             raise ValueError(f"block_sparse.precision must be one of {sorted(valid)}; got {self.precision!r}.")
         self.precision = precision
+        if self.exec_kernel is not None:
+            exec_kernel = (
+                self.exec_kernel.value if isinstance(self.exec_kernel, RainFusionExecKernel) else self.exec_kernel
+            )
+            kernels = {member.value for member in RainFusionExecKernel}
+            if exec_kernel not in kernels:
+                raise ValueError(
+                    f"block_sparse.exec_kernel must be one of {sorted(kernels)} or unset; got {self.exec_kernel!r}."
+                )
+            self.exec_kernel = exec_kernel
         self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
 
 
@@ -2078,6 +2105,8 @@ class AttentionSpec:
             kw["start_step"] = bs.start_step
             kw["end_step"] = bs.end_step
             kw["precision"] = bs.precision
+            if bs.exec_kernel is not None:
+                kw["exec_kernel"] = bs.exec_kernel
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
 

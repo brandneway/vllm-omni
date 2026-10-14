@@ -35,6 +35,7 @@ from vllm_omni.diffusion.data import (
     AttentionConfig,
     AttentionSpec,
     OmniDiffusionConfig,
+    RainFusionExecKernel,
     build_attention_config,
     parse_attention_config,
 )
@@ -150,7 +151,13 @@ class TestAttentionSpec:
 
     @pytest.mark.parametrize(
         "block_sparse",
-        [{"sparsity": 1.5}, {"start_step": -1}, {"end_step": -1}, {"precision": "bogus"}],
+        [
+            {"sparsity": 1.5},
+            {"start_step": -1},
+            {"end_step": -1},
+            {"precision": "bogus"},
+            {"exec_kernel": "bogus"},
+        ],
     )
     def test_block_sparse_invalid_values(self, block_sparse):
         with pytest.raises(ValueError):
@@ -187,6 +194,26 @@ class TestAttentionSpec:
         cfg = RainFusionConfig.from_backend_kwargs(kwargs)
         assert cfg.precision == "mix"
         assert type(cfg.precision) is str
+
+    def test_block_sparse_exec_kernel_unset_by_default(self):
+        """Unset must stay absent from the kwargs: MindIE-SD decides the executor."""
+        spec = AttentionSpec(backend="RAINFUSION_ATTN")
+        assert spec.block_sparse.exec_kernel is None
+        assert "exec_kernel" not in spec.backend_kwargs()
+
+    @pytest.mark.parametrize("exec_kernel", ["rainfusion", "eagle_bsa", RainFusionExecKernel.EAGLE_BSA])
+    def test_block_sparse_exec_kernel_forwarded(self, exec_kernel):
+        from vllm_omni.diffusion.attention.backends.rainfusion_attn import RainFusionConfig
+
+        spec = AttentionSpec(
+            backend="RAINFUSION_ATTN",
+            block_sparse={"sparsity": 0.8, "exec_kernel": exec_kernel},
+        )
+        expected = exec_kernel.value if isinstance(exec_kernel, RainFusionExecKernel) else exec_kernel
+        kwargs = spec.backend_kwargs()
+        assert kwargs["exec_kernel"] == expected
+        assert type(kwargs["exec_kernel"]) is str
+        assert RainFusionConfig.from_backend_kwargs(kwargs).exec_kernel == expected
 
 
 class TestAttentionConfig:

@@ -341,3 +341,57 @@ def test_precision_non_bf16_passes_gate_when_supported():
             # The gate must pass; the fake mindiesd returns None so no crash.
             out = impl._forward_sparse_npu(q, q, q, plan)
             assert out is None
+
+
+# exec_kernel capability gate: a mindiesd without sparse_attention(exec_kernel=)
+# must fail fast instead of silently running the CANN RainFusion operator.
+
+
+def test_exec_kernel_requires_mindiesd_support():
+    """An explicitly requested executor must exist, or the forward fails."""
+    impl = make_impl(exec_kernel="eagle_bsa")
+    with mock.patch.dict(sys.modules, {"mindiesd": _fake_mindiesd_module()}):
+        with mock.patch.object(rainfusion_attn, "_mindiesd_supports_exec_kernel", return_value=False):
+            with pytest.raises(ValueError, match="does not accept exec_kernel="):
+                impl._forward_sparse_npu(
+                    None, None, None, RainFusionPlan(prefix_len=0, used_len=8, latent_shape=[2, 2, 2])
+                )
+
+
+def test_exec_kernel_is_forwarded_to_mindiesd():
+    """The requested executor reaches MindIE-SD instead of being dropped."""
+    seen = {}
+
+    def sparse_attention(query, key, value, **kwargs):
+        seen.update(kwargs)
+        return query
+
+    fake = _fake_mindiesd_module()
+    fake.sparse_attention = sparse_attention
+    impl = make_impl(exec_kernel="eagle_bsa")
+    with mock.patch.dict(sys.modules, {"mindiesd": fake}):
+        with mock.patch.object(rainfusion_attn, "_mindiesd_supports_exec_kernel", return_value=True):
+            q = torch.randn(1, 8, 4, 128)
+            plan = RainFusionPlan(prefix_len=0, used_len=8, latent_shape=[2, 2, 2])
+            impl._forward_sparse_npu(q, q, q, plan)
+
+    assert seen["exec_kernel"] == "eagle_bsa"
+
+
+def test_exec_kernel_unset_is_not_forwarded():
+    """Left unset, MindIE-SD picks the executor; vLLM-Omni must not pin one."""
+    seen = {}
+
+    def sparse_attention(query, key, value, **kwargs):
+        seen.update(kwargs)
+        return query
+
+    fake = _fake_mindiesd_module()
+    fake.sparse_attention = sparse_attention
+    impl = make_impl()
+    with mock.patch.dict(sys.modules, {"mindiesd": fake}):
+        q = torch.randn(1, 8, 4, 128)
+        plan = RainFusionPlan(prefix_len=0, used_len=8, latent_shape=[2, 2, 2])
+        impl._forward_sparse_npu(q, q, q, plan)
+
+    assert "exec_kernel" not in seen

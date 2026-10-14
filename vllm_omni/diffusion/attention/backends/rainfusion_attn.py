@@ -115,6 +115,23 @@ def _mindiesd_supports_pre_rearranged() -> bool:
         return False
 
 
+# Whether the installed mindiesd ``sparse_attention`` accepts ``exec_kernel=``.
+# Releases without it swallow the kwarg through ``**kwargs`` and run the CANN
+# RainFusion operator regardless, which would quietly ignore an explicit
+# request for the Eagle kernel -- a perf choice, but one the user asked for by
+# name, so it is checked rather than assumed. Cached like the probes above.
+@functools.cache
+def _mindiesd_supports_exec_kernel() -> bool:
+    try:
+        from inspect import signature
+
+        from mindiesd import sparse_attention
+
+        return "exec_kernel" in signature(sparse_attention).parameters
+    except Exception:
+        return False
+
+
 def _try_extract_layer_index(prefix: str) -> int | None:
     if not prefix:
         return None
@@ -195,9 +212,7 @@ def _estimate_protected_token_ranges(plan: RainFusionPlan) -> list[tuple[int, in
     return [(0, int(plan.prefix_len) + h * w)]
 
 
-def _apply_estimate_protections(
-    mask: torch.Tensor, token_ranges: list[tuple[int, int]]
-) -> torch.Tensor:
+def _apply_estimate_protections(mask: torch.Tensor, token_ranges: list[tuple[int, int]]) -> torch.Tensor:
     """Force the protected block rows/columns to 1 on the trimmed estimate mask.
 
     Token ranges are widened to whole 128-token blocks (a range straddling a
@@ -205,11 +220,7 @@ def _apply_estimate_protections(
     the same trade the rf_v2 boundary-dense layout makes by construction.
     """
     n_blocks = mask.shape[-1]
-    block_ranges = sorted(
-        (start // _BLOCK_SIZE, -(-end // _BLOCK_SIZE))
-        for start, end in token_ranges
-        if end > start
-    )
+    block_ranges = sorted((start // _BLOCK_SIZE, -(-end // _BLOCK_SIZE)) for start, end in token_ranges if end > start)
     merged: list[list[int]] = []
     for lo, hi in block_ranges:
         if merged and lo <= merged[-1][1]:
@@ -234,12 +245,16 @@ class RainFusionConfig:
     The realized sparsity is lower because rf_v2 always keeps the prefix rows and
     the first-frame blocks. ``start_step`` and ``skip_layers`` are the accuracy
     knobs: early denoise steps and specific DiT blocks stay dense.
+    ``exec_kernel`` names the rf_v2 executor on A2/A3 (the CANN RainFusion
+    operator or MindIE-SD's in-repo Eagle block-sparse kernel); it is a perf
+    knob, since both execute the same sparse pattern.
     """
 
     sparsity: float = 0.0
     start_step: int = 0
     end_step: int = 0
     precision: str = "bf16"
+    exec_kernel: str | None = None
     skip_layers: frozenset[int] = frozenset()
 
     @classmethod
@@ -250,6 +265,7 @@ class RainFusionConfig:
             start_step=int(bk.get("start_step", 0)),
             end_step=int(bk.get("end_step", 0)),
             precision=str(bk.get("precision", "bf16")),
+            exec_kernel=bk.get("exec_kernel"),
             skip_layers=frozenset(bk.get("skip_layers") or ()),
         )
 
@@ -617,9 +633,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             pre_rearranged=bool(layout.pre_rearranged),
         )
 
-    def _estimate_mask_eligible(
-        self, query: torch.Tensor, key: torch.Tensor, plan: RainFusionPlan
-    ) -> bool:
+    def _estimate_mask_eligible(self, query: torch.Tensor, key: torch.Tensor, plan: RainFusionPlan) -> bool:
         """Gate the estimate-mask experiment on the A5 kernel's hard contract.
 
         sparse_block_estimate only implements BNSD fp16/bf16 with head_dim 128,
@@ -679,7 +693,6 @@ class RainFusionAttentionImpl(AttentionImpl):
         eagle_quant_block_sparse_attention.
         """
         import torch_npu
-
         from mindiesd.layers.flash_attn.sparse_flash_attn_ada_bsa import get_estimate_mask
         from mindiesd.layers.flash_attn.sparse_flash_attn_rf_v3 import _eagle_qbsa_quant_qkv
 
@@ -728,9 +741,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             # throttles prompt conditioning.
             mask = _apply_estimate_protections(mask, _estimate_protected_token_ranges(plan))
 
-        q_q, k_q, v_q, q_scales, k_scales, v_scales = _eagle_qbsa_quant_qkv(
-            q, k, v, block_size_q=64, layout="BNSD"
-        )
+        q_q, k_q, v_q, q_scales, k_scales, v_scales = _eagle_qbsa_quant_qkv(q, k, v, block_size_q=64, layout="BNSD")
         seq_lens = [used] * batch
         out, _ = torch.ops.mindiesd.eagle_quant_block_sparse_attention(
             query=q_q,
@@ -803,7 +814,21 @@ class RainFusionAttentionImpl(AttentionImpl):
                 "MindIE-SD, or disable attention quantization. Automatic precision fallback is not performed."
             )
 
-        logger.info_once("RainFusion uses MindIE-SD sparse attention, precision=%s.", precision)
+        if self.rainfusion.exec_kernel is not None and not _mindiesd_supports_exec_kernel():
+            # Older MindIE-SD releases accept the kwarg through **kwargs and
+            # silently run the RainFusion operator. That is a correct output but
+            # not the kernel that was asked for, so refuse instead of pretending.
+            raise ValueError(
+                f"block_sparse.exec_kernel={self.rainfusion.exec_kernel!r} was requested but the installed "
+                "MindIE-SD sparse_attention does not accept exec_kernel=; upgrade MindIE-SD or drop the setting. "
+                "Automatic fallback is not performed."
+            )
+
+        logger.info_once(
+            "RainFusion uses MindIE-SD sparse attention, precision=%s, exec_kernel=%s.",
+            precision,
+            self.rainfusion.exec_kernel or "mindiesd-default",
+        )
         used = plan.used_len
         # Split query once: the valid prefix drives the kernel, the padding
         # tail is reused verbatim as the output padding below. All views,
@@ -822,6 +847,8 @@ class RainFusionAttentionImpl(AttentionImpl):
             "sparsity": self.rainfusion.sparsity,
             "precision": precision,
         }
+        if self.rainfusion.exec_kernel is not None:
+            common_kwargs["exec_kernel"] = self.rainfusion.exec_kernel
         if plan.video_spans is not None:
             if plan.pre_rearranged and not _mindiesd_supports_pre_rearranged():
                 # Running the reorder on rows that are already in rf order would
