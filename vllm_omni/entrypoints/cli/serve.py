@@ -904,6 +904,15 @@ class OmniServeCommand(CLISubcommand):
             help="Compatibility option; use layer_options.dit.resident_layers in new configurations.",
         )
         omni_config_group.add_argument(
+            "--dlo-order-allgather-after-attn-a2a",
+            action="store_true",
+            default=False,
+            help="Hold each DiT block's distributed-layerwise-offload weight AllGather until "
+            "that block's QKV all-to-all is on the compute stream. Without it the background "
+            "gather is submitted at block entry and can take the HCCL links ahead of the "
+            "critical-path all-to-all. Only affects DiT blocks; the text encoder is unchanged.",
+        )
+        omni_config_group.add_argument(
             "--host-weight-runtime-mode",
             choices=("disabled", "preferred", "required"),
             default="disabled",

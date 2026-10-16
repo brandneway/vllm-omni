@@ -265,6 +265,11 @@ class Attention(nn.Module):
         # Local strategy when SP is intentionally inactive outside sharded regions.
         self._no_parallel_strategy = NoParallelAttention()
 
+        # Optional cross-module rendezvous (see distributed/collective_gate.py).
+        # Installed by the DLO backend when it must keep its background weight
+        # AllGather from taking the links ahead of this layer's QKV AllToAll.
+        self._collective_gate = None
+
         self.layer_idx: int | None = _try_extract_layer_index(prefix)
 
         self._kv_cache_dtype: str | None = None
@@ -442,6 +447,12 @@ class Attention(nn.Module):
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
+
+        # The QKV AllToAll is now enqueued on this stream. Release any gather
+        # that was deferred to give this collective the links first.
+        gate = self._collective_gate
+        if gate is not None:
+            gate.signal()
 
         # Scheduler rows describe the logical sequence, while strict Ulysses
         # may append synthetic tokens solely to make the image shard divisible.

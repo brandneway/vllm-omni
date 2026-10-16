@@ -32,6 +32,7 @@ import torch.distributed
 from torch import nn
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.distributed.collective_gate import QKVAllToAllBarrier
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
@@ -154,6 +155,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         tensor_transforms: dict[int, Any] | None = None,
         materialization_probe_tensor: torch.Tensor | None = None,
         nz_cast_weights: bool = False,
+        order_allgather_after_attn_a2a: bool = False,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
         if type(dp_size) is not int or dp_size < 1:
@@ -294,6 +296,19 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         # Per-block synchronization primitive: set after H2D copy completes.
         self._prefetch_done: Any | None = None
 
+        # Optional ordering: hold the background weight AllGather until the
+        # block's QKV AllToAll is on the compute stream. See
+        # distributed/collective_gate.py. Off by default; the attention layer
+        # inside this block is handed the same barrier at install time.
+        self._a2a_barrier: QKVAllToAllBarrier | None = None
+        self._a2a_event: Any | None = None
+        # ``(slot, gpu_shards, gpu_weights, evt)`` of a gather armed but not yet
+        # issued, so ``post_forward`` can flush it if the attention never ran.
+        self._deferred_allgather: tuple[int, dict, dict, Any] | None = None
+        if order_allgather_after_attn_a2a:
+            self._a2a_event = current_omni_platform.Event()
+            self._a2a_barrier = QKVAllToAllBarrier(self._allgather_after_attn_a2a)
+
         # Shared shard (AllGather input) buffers — assigned by backend.
         self.gpu_shard_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
 
@@ -401,6 +416,24 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 value = transform(value)
             if nz_reactor_can_hold(tuple(value.shape), tuple(value.stride()), value.dtype):
                 kept.add(name)
+
+        # The point of this path is that no conversion shows up to be measured,
+        # so a silent fallback to ND would look exactly like "NZ ran, no gain".
+        # Say what was actually taken, per block.
+        if candidates:
+            logger.info(
+                "MiniMax-H3 weight NZ: pre-permuting %d/%d candidate linear weights in %s",
+                len(kept),
+                len(candidates),
+                type(self.next_block).__name__,
+            )
+            if not kept:
+                logger.warning(
+                    "MiniMax-H3 weight NZ: %s has %d eligible linears but none fit their buffer "
+                    "slot; this block stays on ND",
+                    type(self.next_block).__name__,
+                    len(candidates),
+                )
         return frozenset(kept)
 
     @staticmethod
@@ -713,24 +746,17 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     gpu_shard.copy_(cpu_shard, non_blocking=non_blocking)
                     gpu_shards[dtype] = gpu_shard
 
-            self.comm_stream.wait_stream(self.copy_stream)
-            with current_omni_platform.stream(self.comm_stream):
-                for dtype, local_shard in gpu_shards.items():
-                    # Slice the shared (max-sized) output buffer down to this
-                    # block's actual AllGather output size. The buffers are
-                    # sized to the *largest* block across all groups, so for any
-                    # smaller block the full buffer would violate the
-                    # all_gather_into_tensor contract
-                    # (output.numel() == world_size * input.numel()).
-                    # Repoint offsets are relative to the block's flattened
-                    # buffer, so a prefix slice is safe.
-                    gw = gpu_weights[dtype][: self._ag_output_sizes[dtype]]
-                    torch.distributed.all_gather_into_tensor(
-                        gw,
-                        local_shard,
-                        group=self.dp_group,
-                    )
-                evt.record(self.comm_stream)
+            if self._a2a_barrier is not None and non_blocking and self._nz_cast_fn is None:
+                # Hold the collective until the block's attention reports its
+                # QKV AllToAll, so the background gather cannot take the links
+                # ahead of the critical-path all-to-all. The H2D above has
+                # already been enqueued; only the gather moves, so it still
+                # overlaps the rest of the block. Deferral needs a repoint that
+                # emits no stream work, hence the NZ-cast guard.
+                self._deferred_allgather = (slot, gpu_shards, gpu_weights, evt)
+                self._a2a_barrier.arm()
+            else:
+                self._issue_allgather(slot, gpu_shards, gpu_weights, evt)
 
         self.ready_events[slot] = evt
         self._prefetch_done = evt
@@ -742,6 +768,73 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             self._shared_slot_group[slot] = self._group_id
 
         self._repoint_block(gpu_weights, slot)
+
+    def _issue_allgather(
+        self,
+        slot: int,
+        gpu_shards: dict[torch.dtype, torch.Tensor],
+        gpu_weights: dict[torch.dtype, torch.Tensor],
+        evt: Any,
+        *,
+        gated: bool = False,
+    ) -> None:
+        """Submit this block's weight AllGather on ``comm_stream``.
+
+        ``gated`` additionally waits on the QKV AllToAll barrier event recorded
+        by the block's attention, so the foreground collective gets the links
+        first and this gather queues behind it.
+        """
+        self.comm_stream.wait_stream(self.copy_stream)
+        if gated:
+            self.comm_stream.wait_event(self._a2a_event)
+        with current_omni_platform.stream(self.comm_stream):
+            for dtype, local_shard in gpu_shards.items():
+                # Slice the shared (max-sized) output buffer down to this
+                # block's actual AllGather output size. The buffers are
+                # sized to the *largest* block across all groups, so for any
+                # smaller block the full buffer would violate the
+                # all_gather_into_tensor contract
+                # (output.numel() == world_size * input.numel()).
+                # Repoint offsets are relative to the block's flattened
+                # buffer, so a prefix slice is safe.
+                gw = gpu_weights[dtype][: self._ag_output_sizes[dtype]]
+                torch.distributed.all_gather_into_tensor(
+                    gw,
+                    local_shard,
+                    group=self.dp_group,
+                )
+            evt.record(self.comm_stream)
+
+    def _allgather_after_attn_a2a(self) -> None:
+        """Barrier callback: the block's QKV AllToAll is now enqueued.
+
+        Recording on the compute stream here (rather than at block entry) is
+        what makes the gate effective: an event wait snapshots the records
+        enqueued before it, so the wait must be enqueued *after* the all-to-all.
+        """
+        deferred = self._deferred_allgather
+        if deferred is None:
+            return
+        self._deferred_allgather = None
+        self._a2a_event.record(current_omni_platform.current_stream())
+        slot, gpu_shards, gpu_weights, evt = deferred
+        self._issue_allgather(slot, gpu_shards, gpu_weights, evt, gated=True)
+
+    def _flush_deferred_allgather(self) -> None:
+        """Issue a deferred gather whose attention never signalled.
+
+        Keeps the double buffer live: a block whose attention is skipped
+        (cache-dit, an all-resident stage) still needs its weights, so the
+        gather is submitted ungated at the end of that block's forward.
+        """
+        deferred = self._deferred_allgather
+        if deferred is None:
+            return
+        self._deferred_allgather = None
+        if self._a2a_barrier is not None:
+            self._a2a_barrier.disarm()
+        slot, gpu_shards, gpu_weights, evt = deferred
+        self._issue_allgather(slot, gpu_shards, gpu_weights, evt)
 
     def _repoint_block(self, gpu_weights: dict[torch.dtype, torch.Tensor], slot: int) -> None:
         """Point this block's parameters at the buffer just filled for *slot*.
@@ -914,6 +1007,10 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         return args, kwargs
 
     def post_forward(self, module: nn.Module, output: Any) -> Any:
+        # Pair with pre_forward: if the block's attention never signalled the
+        # gate, the deferred gather must still go out before this block's
+        # storage is released (offload_layer waits on _prefetch_done).
+        self._flush_deferred_allgather()
         self.offload_layer()
         return output
 
@@ -938,6 +1035,7 @@ def apply_distributed_block_hook(
     tensor_transforms: dict[int, Any] | None = None,
     materialization_probe_tensor: torch.Tensor | None = None,
     nz_cast_weights: bool = False,
+    order_allgather_after_attn_a2a: bool = False,
 ) -> DistributedLayerwiseOffloadHook:
     """Register a DistributedLayerwiseOffloadHook on *module*."""
     registry = HookRegistry.get_or_create(module)
@@ -955,9 +1053,30 @@ def apply_distributed_block_hook(
         tensor_transforms=tensor_transforms,
         materialization_probe_tensor=materialization_probe_tensor,
         nz_cast_weights=nz_cast_weights,
+        order_allgather_after_attn_a2a=order_allgather_after_attn_a2a,
     )
     registry.register_hook(DistributedLayerwiseOffloadHook._HOOK_NAME, hook)
     return hook
+
+
+def attach_collective_gate(block: nn.Module, hook: DistributedLayerwiseOffloadHook) -> int:
+    """Hand ``hook``'s barrier to every Attention layer inside *block*.
+
+    The attention signals the barrier right after its QKV AllToAll. The import
+    is local to keep this module independent of the attention package at import
+    time.
+
+    Returns the number of attention layers wired (0 means the hook will rely on
+    the ``post_forward`` flush instead).
+    """
+    from vllm_omni.diffusion.attention.layer import Attention
+
+    attached = 0
+    for module in block.modules():
+        if isinstance(module, Attention):
+            module._collective_gate = hook._a2a_barrier
+            attached += 1
+    return attached
 
 
 def remove_distributed_block_hook(module: nn.Module) -> None:
@@ -1640,29 +1759,45 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._all_hook_groups.append(hooks)
         self._blocks.append(block_list)
         probes = {id(block): module_materialization_probe(block) for block in block_list}
+        # Only the DiT blocks issue a QKV AllToAll the gather can queue behind.
+        order_gate = bool(getattr(self.config, "dlo_order_allgather_after_attn_a2a", False)) and (
+            component == DIT_COMPONENT
+        )
+        if order_gate and not getattr(self, "_collective_gate_logged", False):
+            self._collective_gate_logged = True
+            logger.info(
+                "Distributed layerwise offload will hold each DiT block's weight AllGather "
+                "until that block's QKV AllToAll is on the compute stream"
+            )
         for block, next_block in zip(
             chain((block_list[-1],), block_list[:-1]),
             block_list,
             strict=True,
         ):
-            hooks.append(
-                apply_distributed_block_hook(
-                    block,
-                    next_block,
-                    self.device,
-                    group,
-                    group_size,
-                    group_rank,
-                    self.copy_stream,
-                    self.comm_stream,
-                    self.config.pin_cpu_memory,
-                    shared_buffers=[None, None],
-                    rank_local_mmap=self._using_rank_local_mmap if use_dit_mmap else False,
-                    tensor_transforms=self._mmap_transforms_by_tensor_id if use_dit_mmap else None,
-                    materialization_probe_tensor=probes[id(block)],
-                    nz_cast_weights=component == DIT_COMPONENT,
-                )
+            hook = apply_distributed_block_hook(
+                block,
+                next_block,
+                self.device,
+                group,
+                group_size,
+                group_rank,
+                self.copy_stream,
+                self.comm_stream,
+                self.config.pin_cpu_memory,
+                shared_buffers=[None, None],
+                rank_local_mmap=self._using_rank_local_mmap if use_dit_mmap else False,
+                tensor_transforms=self._mmap_transforms_by_tensor_id if use_dit_mmap else None,
+                materialization_probe_tensor=probes[id(block)],
+                nz_cast_weights=component == DIT_COMPONENT,
+                order_allgather_after_attn_a2a=order_gate,
             )
+            if hook._a2a_barrier is not None and attach_collective_gate(block, hook) == 0:
+                logger.warning(
+                    "DLO AllGather ordering is enabled but block %s exposes no Attention layer; "
+                    "its gather will fall back to the ungated path",
+                    block.__class__.__name__,
+                )
+            hooks.append(hook)
 
         # hooks = [last -> first, block0 -> block1, ...]. Alternating slots
         # keep a prefetch from overwriting the current block for any ring size.
