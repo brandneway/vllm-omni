@@ -1019,6 +1019,16 @@ class OmniServeCommand(CLISubcommand):
             "--diffusion-attn-*-chunk flags and of any fp8 KV dtype.",
         )
         omni_config_group.add_argument(
+            "--diffusion-attn-head-overlap-graph",
+            action="store_true",
+            default=False,
+            help="Capture the head-split ping-pong region as an NPUGraph. The eager split adds "
+            "~4*N launches per attention call, which is what makes it slower than not splitting; "
+            "capture replays that skeleton as one launch while the streams still overlap. "
+            "Requires a fixed shape. A capture failure falls back to the eager split for the "
+            "rest of the process rather than failing the request.",
+        )
+        omni_config_group.add_argument(
             "--cfg-parallel-size",
             type=int,
             default=1,

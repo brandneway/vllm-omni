@@ -296,6 +296,23 @@ class Attention(nn.Module):
         self._head_overlap_stream_cache = None
         self._head_overlap_events_cache: dict | None = None
         self._head_overlap_debug_left = _head_overlap_debug_budget()
+        # Capture the ping-pong region as an NPUGraph: the split's extra
+        # collectives are pure launch overhead, which is what makes the eager
+        # split slower than no split at all.
+        self._head_overlap_graph = None
+        if self._head_overlap_groups > 1 and bool(getattr(config, "diffusion_attn_head_overlap_graph", False)):
+            from .head_overlap_graph import get_shared_cache
+            from .rf_capture_patch import ensure_rf_capture_patch
+
+            # MindIE-SD's multi-video preprocessing has two constructs capture
+            # refuses; patch them while capture is on. No-op if it cannot be
+            # applied safely -- the multi-video path just stays uncapturable.
+            ensure_rf_capture_patch()
+            # Process-wide on purpose: the region holds no weights and every
+            # block presents the same shapes and metadata values, so one graph
+            # replays for all of them. A graph per layer is what OOM'd on A3.
+            self._head_overlap_graph = get_shared_cache()
+
         self.layer_idx: int | None = _try_extract_layer_index(prefix)
 
         self._kv_cache_dtype: str | None = None
@@ -601,6 +618,24 @@ class Attention(nn.Module):
         )
         if self._head_overlap_debug_left:
             self._head_overlap_debug_compare(query, key, value, attn_metadata, strategy, groups)
+        cache = self._head_overlap_graph
+        if cache is not None:
+            # Key on the exact signature plus the sparse/dense phase: the
+            # backend picks its kernel from the denoise step, so a graph is only
+            # valid for the phase that produced it. A negative phase means the
+            # backend has declared that phase uncapturable.
+            phase = self._head_overlap_phase(attn_metadata)
+            if phase >= 0:
+                graph_key = (tuple(query.shape), str(query.dtype), groups, phase)
+                replayed = cache.run(
+                    graph_key,
+                    (query, key, value),
+                    lambda inputs: self._run_head_overlap_region(
+                        inputs[0], inputs[1], inputs[2], attn_metadata, strategy, groups
+                    ),
+                )
+                if replayed is not None:
+                    return replayed
         return self._run_head_overlap_region(query, key, value, attn_metadata, strategy, groups)
 
     def _head_overlap_debug_compare(self, query, key, value, attn_metadata, strategy, groups: int):

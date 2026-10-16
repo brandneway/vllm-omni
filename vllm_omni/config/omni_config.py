@@ -875,6 +875,7 @@ class _DiffusionConfigProjection:
     # Head-split Ulysses pipeline (no fp8 requirement; see
     # vllm_omni/diffusion/attention/layer.py). 0/1 = off.
     diffusion_attn_head_overlap: int = 0
+    diffusion_attn_head_overlap_graph: bool = False
     moe_backend: str = "auto"
     force_cutlass_fp8: bool = False
     enable_diffusion_pipeline_profiler: bool = False

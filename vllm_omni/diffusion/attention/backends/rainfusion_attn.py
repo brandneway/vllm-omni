@@ -432,6 +432,25 @@ class RainFusionAttentionImpl(AttentionImpl):
             raise ValueError("RainFusion video geometry must fit identical full-sequence BSND Q/K/V tensors.")
         return self._forward_sparse_npu(query, key, value, plan, attn_metadata)
 
+    def graph_phase(self, attn_metadata: AttentionMetadata | None) -> int:
+        """1 for the rf_v2 sparse phase; -1 (uncapturable) for the dense one.
+
+        ``_resolve_plan`` reads the denoise step index, so the sparse/dense
+        choice flips mid-request at ``start_step``/``end_step``. A captured graph
+        is only valid for the phase that produced it, so the phase is part of the
+        graph key rather than an assumption about the run.
+
+        The sparse phase is capturable because the rf_v2 path reads nothing but
+        shape-derived Python scalars off the metadata -- no tensor, so the
+        captured op sequence is bound to no address but its own inputs. The dense
+        fallback is FlashAttention's NPU varlen path, which consumes the
+        ``cu_seqlens`` tensor from ``extra``; a graph would bake that tensor's
+        address, and cu_seqlens is rebuilt per forward. Until it is made
+        address-stable (or copied into a static input), the dense phase is
+        declared uncapturable and takes the eager path.
+        """
+        return 1 if self._resolve_plan(attn_metadata) is not None else -1
+
     def _resolve_plan(self, attn_metadata: AttentionMetadata | None) -> RainFusionPlan | None:
         """Return the rf_v2 geometry, or None when this forward must stay dense."""
         rf = self.rainfusion

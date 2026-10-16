@@ -1087,6 +1087,11 @@ class OmniDiffusionConfig:
     # requirement); needs MHA and a head count divisible by groups * Ulysses
     # degree, otherwise the plain path is used. 0/1 = off.
     diffusion_attn_head_overlap: int = 0
+    # Capture the head-overlap ping-pong region as an NPUGraph. The split's
+    # extra collectives are launch overhead, which is what makes the eager split
+    # slower than no split; capture removes it. Requires a fixed shape and is
+    # keyed per sparse/dense phase.
+    diffusion_attn_head_overlap_graph: bool = False
 
     # Diffusion pipeline Profiling config
     enable_diffusion_pipeline_profiler: bool = False
