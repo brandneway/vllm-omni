@@ -1008,6 +1008,17 @@ class OmniServeCommand(CLISubcommand):
             "Tuned on Ascend 950PR long-video workloads.",
         )
         omni_config_group.add_argument(
+            "--diffusion-attn-head-overlap",
+            type=int,
+            default=0,
+            help="Head-split Ulysses pipeline: cut the QKV all-to-all into N per-head-group "
+            "collectives and run each group's attention behind its own completion event, so "
+            "group N's attention overlaps group N+1's all-to-all. 0/1 = off. Needs MHA and a "
+            "head count divisible by N times the Ulysses degree (56 heads at --usp 8 allows "
+            "only N=7); otherwise the plain serial path is used. Independent of the "
+            "--diffusion-attn-*-chunk flags and of any fp8 KV dtype.",
+        )
+        omni_config_group.add_argument(
             "--cfg-parallel-size",
             type=int,
             default=1,

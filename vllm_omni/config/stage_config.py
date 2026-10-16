@@ -480,6 +480,8 @@ class StageDeployConfig:
     diffusion_attn_q_chunk: int | None = None
     diffusion_attn_head_chunk: int | None = None
     diffusion_attn_head_chunk_min_kv: int | None = None
+    # Head-split Ulysses pipeline; independent of the chunking knobs above.
+    diffusion_attn_head_overlap: int | None = None
     auxiliary_text_encoder: str | None = None
 
     # Runtime optimizations used by diffusion loading/execution.

@@ -612,6 +612,9 @@ class OrchestratorArgs:
     diffusion_attn_q_chunk: int = 1
     diffusion_attn_head_chunk: int = 0
     diffusion_attn_head_chunk_min_kv: int = 50000
+    # Head-split Ulysses pipeline; independent of the chunking knobs (no fp8
+    # requirement). See vllm_omni/diffusion/attention/layer.py.
+    diffusion_attn_head_overlap: int = 0
     cfg_parallel_size: int = 1
     vae_patch_parallel_size: int = 1
     vae_parallel_mode: str = "tile"

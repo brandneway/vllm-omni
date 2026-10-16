@@ -872,6 +872,9 @@ class _DiffusionConfigProjection:
     diffusion_attn_q_chunk: int = 1
     diffusion_attn_head_chunk: int = 0
     diffusion_attn_head_chunk_min_kv: int = 50000
+    # Head-split Ulysses pipeline (no fp8 requirement; see
+    # vllm_omni/diffusion/attention/layer.py). 0/1 = off.
+    diffusion_attn_head_overlap: int = 0
     moe_backend: str = "auto"
     force_cutlass_fp8: bool = False
     enable_diffusion_pipeline_profiler: bool = False

@@ -1081,6 +1081,12 @@ class OmniDiffusionConfig:
     diffusion_attn_q_chunk: int = 1
     diffusion_attn_head_chunk: int = 0
     diffusion_attn_head_chunk_min_kv: int = 50000
+    # Head-split Ulysses pipeline: cut the QKV all-to-all into this many
+    # per-head-group collectives and overlap each group's attention with the
+    # next group's all-to-all. Independent of the chunking knobs above (no fp8
+    # requirement); needs MHA and a head count divisible by groups * Ulysses
+    # degree, otherwise the plain path is used. 0/1 = off.
+    diffusion_attn_head_overlap: int = 0
 
     # Diffusion pipeline Profiling config
     enable_diffusion_pipeline_profiler: bool = False
@@ -1357,6 +1363,11 @@ class OmniDiffusionConfig:
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
         self._validate_attn_chunking()
+        if self.diffusion_attn_head_overlap < 0:
+            raise ValueError(
+                f"diffusion_attn_head_overlap must be >= 0, got {self.diffusion_attn_head_overlap}"
+            )
+
 
         if self.max_cpu_loras is None:
             self.max_cpu_loras = 1
