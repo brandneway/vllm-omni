@@ -55,6 +55,10 @@ MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "
 # edge but 768 and every frame rate but 24.
 MINIMAX_H3_UNLOCK_SHORT_EDGE_ENV = "VLLM_OMNI_MINIMAX_H3_UNLOCK_SHORT_EDGE"
 MINIMAX_H3_UNLOCK_FPS_ENV = "VLLM_OMNI_MINIMAX_H3_UNLOCK_FPS"
+# Deployment-side reference-image budget. Leave unset to keep the official
+# 2048-short-edge canvas; a smaller value cuts the vision-token count that the
+# text encoder and the DiT have to carry.
+MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV = "VLLM_OMNI_MINIMAX_H3_REF_SHORT_EDGE"
 
 
 def _align_multiple(value: float, multiple: int = 32) -> int:
@@ -160,15 +164,32 @@ def resolve_minimax_h3_aspect_ratio(
     return numeric_value
 
 
+def _reference_image_short_edge() -> int:
+    """Reference-image short edge, overridable per deployment.
+
+    Unset keeps the official 2048. A smaller value lets a deployment trade
+    reference detail for a smaller vision-token count; values below the
+    32-pixel alignment or unparsable values fall back to the official value.
+    """
+    raw = os.environ.get(MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV, "")
+    if not raw:
+        return MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE
+    try:
+        value = int(raw)
+    except ValueError:
+        return MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE
+    return value if value >= 32 else MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE
+
+
 def resolve_minimax_h3_reference_image_shape(image: Image.Image) -> tuple[int, int]:
-    """Resize an H3 reference image to the official 2048-short-edge canvas."""
+    """Resize an H3 reference image to the configured short-edge canvas."""
     width, height = image.size
     ratio = width / height
     if not 0.4 <= ratio <= 2.5:
         raise OmniClientError(f"reference image aspect ratio must be in [0.4, 2.5], got {width}x{height}")
     if min(width, height) < 256 or max(width, height) > 5760:
         raise OmniClientError(f"reference image dimensions must be in [256, 5760] pixels, got {width}x{height}")
-    scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(width, height)
+    scale = _reference_image_short_edge() / min(width, height)
     return (
         _align_multiple(width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
         _align_multiple(height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
