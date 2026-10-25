@@ -66,7 +66,7 @@ compatible MindIE-SD release when using `precision="mix"` or `"fp8"`.
 running its default operator under an explicit request for another one.
 Switching the executor does not change the sparse pattern, the spatial
 reorder, or the inverse reorder -- both routes execute the mask rf_v2 already
-computed -- so the choice trades performance, not output semantics. Measure
+computed -- so the choice is about the implementation, not the pattern. Measure
 the two kernels on the workload at hand before pinning one: `eagle_bsa` is
 MindIE-SD's in-repo `eagle_block_sparse_attention` kernel, built for
 `ascend910b`/`ascend910_93` with fp16/bf16 queries, and it is not uniformly
@@ -75,6 +75,12 @@ faster than the CANN RainFusion operator it replaces.
 `exec_kernel` only applies to the bf16 rf_v2 path. A non-`bf16` precision
 selects rf_v3, and the hybrid reference-KV path runs `hybrid_attention`; both
 raise if `exec_kernel` is set instead of silently ignoring it.
+
+The two executors consume the same mask and reorder but are different kernels,
+and they are not bit-identical. On our Ascend 910 T2VA workload (int8, 50
+steps) the Eagle output measured 34.7 dB PSNR against the RainFusion operator,
+below our 45 dB gate, so treat this as a measurement knob rather than an
+assumption of equivalent output.
 
 ```bash
 vllm-omni serve MiniMaxAI/MiniMax-H3 \
