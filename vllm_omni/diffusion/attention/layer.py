@@ -384,6 +384,22 @@ class Attention(nn.Module):
         self._head_overlap_stream_cache = None
         self._head_overlap_events_cache: dict | None = None
         self._head_overlap_debug_left = _head_overlap_debug_budget()
+        # Capture the ping-pong region as an NPUGraph: the split's extra
+        # collectives are pure launch overhead, which is what makes the eager
+        # split slower than no split at all.
+        self._head_overlap_graph = None
+        if self._head_overlap_groups > 1 and bool(getattr(self.attn_spec, "head_overlap_graph", False)):
+            from .head_overlap_graph import get_shared_cache
+            from .rf_capture_patch import ensure_rf_capture_patch
+
+            # MindIE-SD's multi-video preprocessing has two constructs capture
+            # refuses; patch them while capture is on. No-op if it cannot be
+            # applied safely -- the multi-video path just stays uncapturable.
+            ensure_rf_capture_patch()
+            # Process-wide on purpose: the region holds no weights and every
+            # block presents the same shapes and metadata values, so one graph
+            # replays for all of them. A graph per layer is what OOM'd on A3.
+            self._head_overlap_graph = get_shared_cache()
 
         self._kv_cache_dtype: str | None = None
         self._kv_cache_skip_steps: set[int] | None = None
@@ -803,7 +819,55 @@ class Attention(nn.Module):
         )
         if self._head_overlap_debug_left:
             self._head_overlap_debug_compare(query, key, value, attn_metadata, strategy, groups)
+        cache = self._head_overlap_graph
+        # The DLO collective gate is a Python callback that submits the weight
+        # AllGather; a captured graph cannot replay it, so gate-aware runs stay
+        # on the eager ping-pong.
+        if cache is not None and getattr(self, "_collective_gate", None) is None:
+            # Key on the exact signature, the request geometry, and the
+            # sparse/dense phase: the backend picks its kernel from the denoise
+            # step, and the captured region bakes the metadata values it reads.
+            phase = self._head_overlap_phase(attn_metadata)
+            if phase >= 0:
+                graph_key = self._head_overlap_graph_key(query, key, value, attn_metadata, groups, phase)
+                replayed = cache.run(
+                    graph_key,
+                    (query, key, value),
+                    lambda inputs: self._run_head_overlap_region(
+                        inputs[0], inputs[1], inputs[2], attn_metadata, strategy, groups
+                    ),
+                )
+                if replayed is not None:
+                    return replayed
         return self._run_head_overlap_region(query, key, value, attn_metadata, strategy, groups)
+
+    @staticmethod
+    def _head_overlap_graph_key(query, key, value, attn_metadata, groups: int, phase: int) -> tuple:
+        """Everything the captured region reads besides its Q/K/V inputs."""
+        layout = getattr(attn_metadata, "video_layout", None) if attn_metadata is not None else None
+        extra = attn_metadata.extra if attn_metadata is not None else {}
+        spans: tuple[tuple[int, tuple[int, ...], str], ...] = ()
+        if layout is not None:
+            spans = tuple(
+                (int(span.start), tuple(int(dim) for dim in span.latent_grid), str(span.role))
+                for span in getattr(layout, "video_spans", ())
+            )
+        return (
+            tuple(query.shape),
+            tuple(key.shape),
+            tuple(value.shape),
+            str(query.dtype),
+            groups,
+            phase,
+            getattr(layout, "used_len", None),
+            getattr(layout, "prefix_len", None),
+            getattr(layout, "latent_grid", None),
+            getattr(layout, "pre_rearranged", False),
+            spans,
+            extra.get("max_seqlen_q"),
+            extra.get("kv_seq_len"),
+            str(extra.get("kv_cache_dtype", "")),
+        )
 
     def _head_overlap_debug_compare(self, query, key, value, attn_metadata, strategy, groups: int):
         """One-shot: does the head split reproduce the unsplit path, per group?
