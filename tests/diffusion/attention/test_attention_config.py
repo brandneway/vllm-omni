@@ -1530,3 +1530,20 @@ def test_head_overlap_rejects_negative_values():
 
 def test_head_overlap_defaults_to_off():
     assert AttentionSpec(backend="RAINFUSION_ATTN").head_overlap == 0
+
+
+def test_head_overlap_graph_is_a_valid_spec_key():
+    from vllm_omni.diffusion.data import parse_attention_config
+
+    config = parse_attention_config(
+        {"default": {"backend": "RAINFUSION_ATTN", "head_overlap": 7, "head_overlap_graph": True}}
+    )
+
+    assert config.default is not None
+    assert config.default.head_overlap == 7
+    assert config.default.head_overlap_graph is True
+
+
+def test_head_overlap_graph_requires_a_boolean():
+    with pytest.raises(ValueError, match="head_overlap_graph"):
+        AttentionSpec(backend="RAINFUSION_ATTN", head_overlap_graph=1)  # type: ignore[arg-type]
