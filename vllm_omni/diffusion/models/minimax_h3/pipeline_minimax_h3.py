@@ -527,6 +527,140 @@ def _minimax_h3_output_seeds(seed: int, num_outputs: int) -> list[int]:
     return [int(seed) + output_index for output_index in range(int(num_outputs))]
 
 
+_REQUEST_LOG_ENV = "VLLM_OMNI_MINIMAX_H3_REQUEST_LOG"
+
+# Caller-facing fields that decide what an H3 run produces. The rest of
+# OmniDiffusionSamplingParams is either shared plumbing or held in tensors,
+# which the resolved-context record below reports by shape instead.
+_MINIMAX_H3_REQUEST_LOG_FIELDS = (
+    "num_inference_steps",
+    "guidance_scale",
+    "guidance_scale_2",
+    "guidance_rescale",
+    "true_cfg_scale",
+    "seed",
+    "num_outputs_per_prompt",
+    "height",
+    "width",
+    "num_frames",
+    "fps",
+    "frame_rate",
+    "quality",
+    "output_type",
+    "max_sequence_length",
+    "timesteps",
+    "sigmas",
+    "decode_timestep",
+    "decode_noise_scale",
+    "lora_scale",
+    "lora_request",
+    "profile",
+    "return_trajectory_latents",
+    "return_trajectory_decoded",
+    "save_output",
+)
+
+# The resolved context carries the values the pipeline actually runs with,
+# including the shapes the encoder stage computed rather than the caller
+# passing them.
+_MINIMAX_H3_CONTEXT_LOG_FIELDS = (
+    "task",
+    "height",
+    "width",
+    "num_frames",
+    "latent_t",
+    "latent_h",
+    "latent_w",
+    "audio_t",
+    "num_steps",
+    "seed",
+    "sampler",
+    "num_outputs",
+    "video_shift",
+    "audio_shift",
+    "pad_seq_len",
+    "preencode_mp4",
+    "latent_upscale",
+    "latent_refine",
+    "continuation",
+    "keyframe_frame_indices",
+    "visual_condition_shapes",
+    "audio_condition_lengths",
+    "text_embeddings",
+    "visual_condition",
+    "audio_condition",
+    "ref_blocks",
+    "locked_audio_rows",
+    "video_edit_clean_rows",
+    "audio_edit_clean_rows",
+)
+
+
+def _minimax_h3_request_log_enabled() -> bool:
+    """Whether to dump request fields to the server log (``VLLM_OMNI_MINIMAX_H3_REQUEST_LOG``)."""
+    return os.environ.get(_REQUEST_LOG_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _summarize_log_value(value: Any) -> str:
+    """Render one request field without reading device tensors.
+
+    Tensors and arrays are reduced to shape/dtype/device: their contents are
+    either model inputs too large for a log line or conditioning already
+    described by their shape. Containers recurse so prompt dictionaries and
+    ``extra_args`` stay readable.
+    """
+    if isinstance(value, torch.Tensor):
+        return f"<tensor shape={tuple(value.shape)} dtype={value.dtype} device={value.device}>"
+    if isinstance(value, np.ndarray):
+        return f"<ndarray shape={value.shape} dtype={value.dtype}>"
+    if isinstance(value, Image.Image):
+        return f"<PIL.Image mode={value.mode} size={value.size}>"
+    if isinstance(value, (bytes, bytearray)):
+        return f"<{type(value).__name__} len={len(value)}>"
+    if isinstance(value, Mapping):
+        return "{" + ", ".join(f"{key!r}: {_summarize_log_value(item)}" for key, item in value.items()) + "}"
+    if isinstance(value, list):
+        return "[" + ", ".join(_summarize_log_value(item) for item in value) + "]"
+    if isinstance(value, tuple):
+        return "(" + ", ".join(_summarize_log_value(item) for item in value) + ")"
+    return repr(value)
+
+
+def _log_minimax_h3_request(request: DiffusionRequestBatch) -> None:
+    """Log the caller-facing fields of an H3 request batch."""
+    try:
+        _, rank, world = _dit_rank_world()
+        lines = [f"MiniMax H3 request received (rank {rank}/{world}):"]
+        for index, req in enumerate(request.requests):
+            sampling = req.sampling_params
+            prefix = f"requests[{index}]"
+            lines.append(f"  {prefix}.request_id={req.request_id!r}")
+            lines.append(f"  {prefix}.prompt={_summarize_log_value(req.prompt)}")
+            for name in _MINIMAX_H3_REQUEST_LOG_FIELDS:
+                lines.append(f"  {prefix}.sampling_params.{name}={_summarize_log_value(getattr(sampling, name, None))}")
+            lines.append(
+                f"  {prefix}.sampling_params.extra_args={_summarize_log_value(getattr(sampling, 'extra_args', None))}"
+            )
+            if req.kv_sender_info is not None:
+                lines.append(f"  {prefix}.kv_sender_info={_summarize_log_value(req.kv_sender_info)}")
+        logger.info("\n".join(lines))
+    except Exception:
+        # Diagnostics must never fail a request.
+        logger.exception("Failed to log the MiniMax H3 request")
+
+
+def _log_minimax_h3_context(context: Mapping[str, Any]) -> None:
+    """Log the request fields the H3 pipeline resolved before denoising."""
+    try:
+        _, rank, world = _dit_rank_world()
+        lines = [f"MiniMax H3 resolved request context (rank {rank}/{world}):"]
+        lines.extend(f"  {name}={_summarize_log_value(context.get(name))}" for name in _MINIMAX_H3_CONTEXT_LOG_FIELDS)
+        logger.info("\n".join(lines))
+    except Exception:
+        # Diagnostics must never fail a request.
+        logger.exception("Failed to log the MiniMax H3 request context")
+
+
 def _dit_rank_world() -> tuple[Any, int, int]:
     if not dist.is_initialized():
         return None, 0, 1
@@ -3311,10 +3445,15 @@ class MiniMaxH3Pipeline(
         if len(request.prompts) != 1:
             raise OmniClientError("MiniMax H3 supports one request at a time")
         check_request_cancellation()
+        log_request = _minimax_h3_request_log_enabled()
+        if log_request:
+            _log_minimax_h3_request(request)
         context = self._prepare_request_inputs(
             request.prompts[0],
             request.sampling_params,
         )
+        if log_request:
+            _log_minimax_h3_context(context)
         check_request_cancellation()
         denoise_kwargs = self._denoise_kwargs(context)
         num_outputs = context["num_outputs"]
