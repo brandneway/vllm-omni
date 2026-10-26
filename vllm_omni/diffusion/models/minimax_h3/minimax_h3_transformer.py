@@ -56,6 +56,14 @@ from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelCont
 from vllm_omni.diffusion.models.minimax_h3.packed_sequence import _packed_dump_enabled
 from vllm_omni.platforms import current_omni_platform
 
+from .eagle_fused import (
+    indexed_gate_norm_modulate,
+    indexed_gate_norm_modulate_available,
+    indexed_gate_norm_modulate_compatible,
+    split_norm_rope,
+    split_norm_rope_available,
+    split_norm_rope_compatible,
+)
 from .fasth3 import _resolve_native_target
 
 if TYPE_CHECKING:
@@ -443,6 +451,9 @@ class MiniMaxH3Attention(nn.Module):
         self.rot_dim = 6 * arch.rope_inv_freq_len
         self.q_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
+        # Resolved once: the env switch and the installed MindIE-SD build are
+        # both fixed for the lifetime of the model.
+        self._eagle_split_norm_rope = split_norm_rope_available()
         self.rope = RotaryEmbedding(is_neox_style=True, half_head_dim=False)
         self.out_proj = RowParallelLinear(
             inner_dim,
@@ -671,22 +682,50 @@ class MiniMaxH3Attention(nn.Module):
         qkv, _ = self.qkv_proj(x)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
-        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
-        q = q.view(total, self.num_heads, self.head_dim)
-        k = k.view(total, self.num_kv_heads, self.head_dim)
-        v = v.view(total, self.num_kv_heads, self.head_dim)
-        if rope_table is None:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-        else:
-            q, k = fused_qk_norm_rope(
-                q,
-                k,
+        if (
+            self._eagle_split_norm_rope
+            and rope_table is not None
+            and split_norm_rope_compatible(
+                qkv,
                 self.q_norm.weight,
                 self.k_norm.weight,
                 rope_table,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rot_dim,
+            )
+        ):
+            # One AscendC call: split the packed projection, RMSNorm Q/K, rotate
+            # their first rot_dim features, and keep V untouched.
+            q, k, v = split_norm_rope(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                rope_table,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rot_dim,
                 self.q_norm.variance_epsilon,
             )
+        else:
+            q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+            q = q.view(total, self.num_heads, self.head_dim)
+            k = k.view(total, self.num_kv_heads, self.head_dim)
+            v = v.view(total, self.num_kv_heads, self.head_dim)
+            if rope_table is None:
+                q = self.q_norm(q)
+                k = self.k_norm(k)
+            else:
+                q, k = fused_qk_norm_rope(
+                    q,
+                    k,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    rope_table,
+                    self.q_norm.variance_epsilon,
+                )
 
         # The gate is projected from the same local rows as Q. Pure Ulysses
         # reshards it alongside Q/K/V in UlyssesParallelAttention so each VSA
@@ -918,6 +957,9 @@ class MiniMaxH3DiTBlock(nn.Module):
             modality_num=MINIMAX_H3_ADALN_MODALITY_NUM,
             prefix=f"{prefix}.adaln_proj",
         )
+        # Resolved once: the env switch and the installed MindIE-SD build are
+        # both fixed for the lifetime of the model.
+        self._eagle_indexed_gate_norm_modulate = indexed_gate_norm_modulate_available()
 
     def forward(
         self,
@@ -970,16 +1012,38 @@ class MiniMaxH3DiTBlock(nn.Module):
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
         )
-        x, h = indexed_gate_rms_norm_scale_shift(
+        if self._eagle_indexed_gate_norm_modulate and indexed_gate_norm_modulate_compatible(
             residual,
             gate_msa,
             h,
-            self.norm2.weight,
             shift_mlp,
             scale_mlp,
             combined_indices,
-            self.norm2.variance_epsilon,
-        )
+            self.norm2.weight,
+        ):
+            # One AscendC call: gated residual update, RMSNorm with norm2's
+            # weight, then the AdaLN affine transform.
+            x, h = indexed_gate_norm_modulate(
+                residual,
+                gate_msa,
+                h,
+                shift_mlp,
+                scale_mlp,
+                combined_indices,
+                self.norm2.weight,
+                self.norm2.variance_epsilon,
+            )
+        else:
+            x, h = indexed_gate_rms_norm_scale_shift(
+                residual,
+                gate_msa,
+                h,
+                self.norm2.weight,
+                shift_mlp,
+                scale_mlp,
+                combined_indices,
+                self.norm2.variance_epsilon,
+            )
         residual = x
         h = self.mlp(h)
         return indexed_gate(residual, gate_mlp, h, combined_indices)
