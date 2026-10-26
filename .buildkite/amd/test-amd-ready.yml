@@ -396,7 +396,7 @@ steps:
     # The preflight prevents marker drift; verbose output and JUnit retain the
     # nodes that actually ran on each shard.
     - >-
-      bash .buildkite/amd/scripts/assert-pytest-collection.sh 1400
+      bash .buildkite/amd/scripts/assert-pytest-collection.sh 1416
       tests/model_executor/
       -m 'core_model and rocm and MI325 and not nvidia_only and not
       (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
