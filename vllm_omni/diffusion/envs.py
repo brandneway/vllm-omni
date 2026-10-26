@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     LOCAL_RANK: int = 0
     VLLM_OMNI_DIFFUSION_SKIP_POST_LOAD_EMPTY_CACHE: str | None = None
     VLLM_OMNI_MINIMAX_H3_AUDIO_TCONV_CONV1D: str | None = None
+    VLLM_OMNI_MINIMAX_H3_EAGLE_INDEXED_GATE_NORM_MODULATE: str | None = None
+    VLLM_OMNI_MINIMAX_H3_EAGLE_SPLIT_NORM_ROPE: str | None = None
     VLLM_OMNI_MINIMAX_H3_STAGED_COMPONENTS: str | None = None
     VLLM_OMNI_MINIMAX_H3_TAEH3: str | None = None
     VLLM_OMNI_MINIMAX_H3_TAEH3_CHECKPOINT: str | None = None
@@ -94,6 +96,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ``startup_mem_snapshots`` under the serving working directory.
     "VLLM_OMNI_DIFFUSION_STARTUP_MEM_SNAPSHOT_DIR": lambda: os.environ.get(
         "VLLM_OMNI_DIFFUSION_STARTUP_MEM_SNAPSHOT_DIR", None
+    ),
+    # Set "1" to run each MiniMax-H3 attention layer's packed-QKV split, Q/K
+    # RMSNorm and Q/K RoPE through MindIE-SD EagleSplitNormRopeConcat instead
+    # of the split + fused_qk_norm_rope chain. Requires a MindIE-SD build that
+    # registers the operator; otherwise the layer keeps its existing path.
+    "VLLM_OMNI_MINIMAX_H3_EAGLE_SPLIT_NORM_ROPE": lambda: os.environ.get(
+        "VLLM_OMNI_MINIMAX_H3_EAGLE_SPLIT_NORM_ROPE", None
+    ),
+    # Set "1" to run each MiniMax-H3 DiT block's gated residual update, second
+    # RMSNorm and AdaLN affine through MindIE-SD EagleIndexedGateNormModulate
+    # instead of the Triton indexed-modulation kernel. Requires a MindIE-SD
+    # build that registers the operator; otherwise the block keeps its
+    # existing path.
+    "VLLM_OMNI_MINIMAX_H3_EAGLE_INDEXED_GATE_NORM_MODULATE": lambda: os.environ.get(
+        "VLLM_OMNI_MINIMAX_H3_EAGLE_INDEXED_GATE_NORM_MODULATE", None
     ),
     # Comma-separated MiniMax-H3 components ("te", "vae") that wait in host
     # memory and only reach the device inside the pipeline phase using them;
