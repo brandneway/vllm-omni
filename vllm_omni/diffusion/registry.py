@@ -545,11 +545,15 @@ def initialize_model(
             model.vae.set_parallel_size(vae_pp_size, mode=vae_mode)
 
         vae = getattr(model, "vae", None)
-        if od_config.vae_tile_size is not None or od_config.vae_tile_overlap is not None:
+        # Configs assembled outside OmniDiffusionConfig (tests, adapters) may
+        # omit the optional geometry overrides entirely.
+        tile_size = getattr(od_config, "vae_tile_size", None)
+        tile_overlap = getattr(od_config, "vae_tile_overlap", None)
+        if tile_size is not None or tile_overlap is not None:
             tiling_setter = getattr(vae, "set_tiling_config", None)
             if not callable(tiling_setter):
                 raise ValueError("This VAE does not support vae_tile_size or vae_tile_overlap")
-            tiling_setter(tile_size=od_config.vae_tile_size, tile_overlap=od_config.vae_tile_overlap)
+            tiling_setter(tile_size=tile_size, tile_overlap=tile_overlap)
         if vae is not None:
             tile_batch_setter = getattr(vae, "set_tile_batch_size", None)
             if callable(tile_batch_setter):
