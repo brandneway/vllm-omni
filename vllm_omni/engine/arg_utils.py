@@ -706,6 +706,12 @@ class OrchestratorArgs:
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    # The H3 tile geometry overrides must be declared here, not only as an
+    # argparse flag: ``_global_stage_cli_fields()`` is derived from this
+    # dataclass, so an undeclared field is silently dropped before it can
+    # reach the diffusion stage config.
+    vae_tile_size: int | None = None
+    vae_tile_overlap: int | None = None
     vae_tile_batch_size: int | None = None
     vae_fast_path: str = "lossless"
     vae_encode_fast_path: str = "lossless"
