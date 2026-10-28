@@ -61,6 +61,24 @@ Before edits through `.data` or external storage aliases, explicitly call
 Such writes can bypass PyTorch's version counter. Set the cache flag to `0`
 and restart to retain temporal cropping without caching.
 
+## NPU image-encoder GroupNorm and SiLU fusion (experimental)
+
+Set `VLLM_OMNI_H3_NPU_IMAGE_GN_SILU=1` before starting the worker to fuse
+GroupNorm followed by SiLU in the H3 video VAE's **image** input path, using
+`torch_npu.npu_group_norm_silu`. This is disabled by default and independent
+of temporal-convolution optimizations. Set the variable to `0` and restart
+to disable it. The decoder and video input path are unchanged.
+
+The fused path requires inference-only, contiguous FP32 NPU tensors with
+one frame, affine GroupNorm, no conditioning, and the validated checkpoint
+normalization implementation. Training, compilation, multi-frame or
+noncontiguous inputs, spatial-parallel normalization, normalization hooks,
+custom forwards, unknown remote code, and a missing fused API use the
+original implementation. A checkpoint configured to use its separate
+`FusedGroupNorm3D` wrapper also retains its original path. Fusion does not
+change HF32, transformer quantization, or offload settings, and stores no
+derived weights. It is not a guarantee of end-to-end acceleration.
+
 For component comparisons, run the checked-in benchmark in fresh processes
 with the same physical cards and reference image order. First unset the flag
 for the baseline, then set it to `1` for the candidate. Each arm uses one
@@ -71,6 +89,7 @@ keeps only the VAE encoder resident and does not measure DLO or E2E latency.
 
 ```bash
 export VLLM_OMNI_H3_NPU_IMAGE_T1_CONV=1
+export VLLM_OMNI_H3_NPU_IMAGE_GN_SILU=1
 torchrun --nproc-per-node=8 benchmarks/diffusion/bench_h3_npu_image_encode.py \
   --model "$MODEL/Ref2VA/video_vae" \
   --images ref-1.png ref-2.png ref-3.png ref-4.png ref-5.png ref-6.png \
