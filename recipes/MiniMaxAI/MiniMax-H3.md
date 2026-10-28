@@ -96,6 +96,19 @@ torchrun --nproc-per-node=8 benchmarks/diffusion/bench_h3_npu_image_encode.py \
   --height 480 --width 832 --warmup 1 --repeat 3 --output results/candidate
 ```
 
+## Optional LiteVAE video decoder
+
+To use the standard non-INT8 H3 Lite decoder, add:
+
+```bash
+--additional-config '{"lightvae_decoder_path":"/weights/lightvae-lite-h3-decoder.safetensors"}'
+```
+
+LiteVAE changes the video decoder while preserving the video encoder and audio
+VAE. Omit `video_vae_decoder` when selecting LiteVAE. See the
+[LiteVAE guide](../../docs/user_guide/diffusion/light_vae.md) for checkpoint
+requirements, decoder selection, and quality review.
+
 ## Prerequisites
 
 The checkpoint requires Hugging Face access approval. Authenticate once;
