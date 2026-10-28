@@ -717,6 +717,8 @@ class OrchestratorArgs:
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
+    dlo_vae_resident: bool = False
+    dlo_text_encoder_resident: bool = False
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0
     dlo_order_allgather_after_attn_a2a: bool = False
