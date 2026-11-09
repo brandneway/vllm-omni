@@ -567,3 +567,27 @@ def test_tp_accepts_checkpoint_supported_sizes():
     arch = MiniMaxH3DiTArchConfig()
     for tp_size in (1, 2, 4, 7):
         model._validate_tp_config(arch=arch, tp_size=tp_size)
+
+
+def test_ulysses_degree_must_divide_local_heads_in_strict_mode():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        _validate_ulysses_head_divisibility,
+    )
+
+    # MiniMax-H3 has 56 heads: degree 8 divides, degree 16 does not.
+    _validate_ulysses_head_divisibility(56, tp_size=1, ulysses_degree=8, ulysses_mode="strict")
+    with pytest.raises(ValueError, match="ulysses_mode='advanced_uaa'"):
+        _validate_ulysses_head_divisibility(56, tp_size=1, ulysses_degree=16, ulysses_mode="strict")
+
+
+def test_advanced_uaa_accepts_a_non_divisible_ulysses_degree():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        _validate_ulysses_head_divisibility,
+    )
+
+    # U16 pads 56 heads to 64 before the all-to-all, so it is legal under UAA.
+    _validate_ulysses_head_divisibility(56, tp_size=1, ulysses_degree=16, ulysses_mode="advanced_uaa")
+    # TP2 x U8 leaves 28 local heads, which 8 does not divide either.
+    _validate_ulysses_head_divisibility(56, tp_size=2, ulysses_degree=8, ulysses_mode="advanced_uaa")
+    # A divisible degree stays legal under both modes.
+    _validate_ulysses_head_divisibility(56, tp_size=1, ulysses_degree=8, ulysses_mode="advanced_uaa")
